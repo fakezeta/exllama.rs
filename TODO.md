@@ -5,6 +5,10 @@ checked off with a short note; open items are unchecked.
 
 > Legend: **P0** = blocks real-world use · **P1** = important · **P2** = nice-to-have · **P3** = exploration
 
+> **See also:** [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) — the reviewed,
+> phased plan (with acceptance criteria) that groups the open items below into
+> executable work. This file remains the per-item checklist.
+
 ---
 
 ## Validation & Correctness
@@ -44,6 +48,19 @@ checked off with a short note; open items are unchecked.
   Hadamard rows, shard-byte compaction after the linear pass, and a persistent
   worker pool replacing per-matmul thread spawning. Equivalence tests added;
   real-model throughput benchmark still optional.
+- [ ] **(P0) Make the core equivalence tests fresh-clone-safe.** See plan
+  Phase 0 #1: `quantized_matmul_matches_f32_dequant` silently skips when
+  `/tmp/unstable_*.bin` is absent, so the main correctness guarantee is a no-op
+  on CI. Build a committed synthetic EXL3 fixture and mark real-model tests
+  `#[ignore]`. Cover 3INST / MCG / MUL1.
+- [ ] **(P0) Numeric unit tests for decoder primitives.** See plan Phase 0 #2:
+  `model.rs` has one unit test; add golden tests for RMSNorm, partial RoPE,
+  q_proj interleaving, GQA, gate sigmoid, the DeltaNet step, and per-head
+  RMSNormGated. The forward math is verified correct against HF source — this
+  locks it in without a model download.
+- [ ] **(P1) Bounded request-line reading.** See plan Phase 1 #4: `read_request`
+  (`http.rs`) reads the request line with no cap; OOM vector with a long
+  newline-free line. Use `Read::take` on both request line and headers.
 
 ### Resolved during real-model validation (for the record)
 
@@ -89,6 +106,16 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 - [ ] **(P2) Batched / continuous inference.** `Engine.model` is a `Mutex<Model>` and serializes all requests. Add a request queue, or support `n > 1` by expanding the prompt batch.
 - [ ] **(P2) KV cache quantization.** Cache is f32 `(ctx, heads, head_dim)`; f16 or int8 could double context within the same RAM.
 - [x] **(P2) Precompute RoPE cos/sin tables.** Done — tables built once at load; DeltaNet per-head scratch is also reused.
+- [ ] **(P1) Guard the global threadpool against concurrent `run()` calls.** See
+  plan Phase 1 #5: `threadpool::run()` shares one pool and a per-call barrier;
+  interleaved sends from two callers can deadlock. Serialize dispatch (or give
+  each call disjoint workers) and add a concurrency stress test.
+- [ ] **(P1) Catch dimension mismatches in `tensor::dot()`.** See plan Phase 1
+  #6: `a.len().min(b.len())` silently masks a wrong-length input. Assert equal
+  lengths (or add a checked variant) without slowing the hot loop.
+- [ ] **(P2) Reuse post-prefill state for `n > 1`.** See plan Phase 2 #10: each
+  choice currently re-prefills the whole prompt; snapshot/restore after prefill
+  so `n=8` is not 8x the work.
 
 ---
 
@@ -116,6 +143,15 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
   logit of already-generated tokens by the penalty (positive logits) / multiplies
   (negative), with HashSet dedup so repeated history doesn't stack. Breaks
   greedy repetition loops when set > 1. Unit test added.
+- [ ] **(P1) Align SSE streaming with OpenAI.** See plan Phase 1 #7: emit the
+  `logprobs` delta in the same chunk as (or after) the content delta, not
+  before it; give `/v1/completions` a final empty-choices `usage` chunk like
+  chat does; stream indexed `tool_calls` deltas instead of XML-as-content.
+- [ ] **(P1) Generation deadline / hard output cap.** See plan Phase 1 #8: a
+  slow client can hold the mutex-guarded model indefinitely within the 600 s
+  read timeout. Reject `repetition_penalty <= 0` (currently `0` silently
+  disables it) and decide/document whether reasoning delimiters count toward
+  `completion_tokens`.
 - [ ] **(P3) Anthropic-compatible API** (`/v1/messages`) as a secondary endpoint.
 
 ---
@@ -126,12 +162,17 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 - [ ] **(P2) `chat_template` from tokenizer.json.** Template is hard-coded in `chat.rs`; read/interpret it (or at least verify it matches).
 - [x] **(P2) Added tokens from `added_tokens_decoder`.** Done — ids found only in the sibling `tokenizer_config.json` are loaded and protected.
 - [ ] **(P2) Byte-fallback / BPE edge cases.** Fuzz `bpe_encode_word` against Python `tokenizers` with random UTF-8.
+- [ ] **(P1) Bound regex quantifier allocations / ReDoS.** See plan Phase 1 #9:
+  `Re::Quant` builds a `Vec<Vec<usize>>` per repetition up to
+  `text.len() + 1`; the shipped Qwen pattern is linear, but a crafted
+  `tokenizer.json` with nested quantifiers can blow up memory/time. Prefer
+  iterative end-set generation with a cap and validate untrusted patterns.
 
 ---
 
 ## Chat Template
 
-- [x] **(P1) Tool calling (non-streaming).** Done — OpenAI `tools` are rendered into the Qwen3.5 system preamble, assistant `tool_calls` into `<function=...>` XML, and generated `<tool_call>` blocks are parsed back into `tool_calls` with `finish_reason: "tool_calls"`. **Still open:** proper SSE `tool_calls` deltas (streaming currently emits the XML as content).
+- [x] **(P1) Tool calling (non-streaming).** Done — OpenAI `tools` are rendered into the Qwen3.5 system preamble, assistant `tool_calls` into `<function=...>` XML, and generated `<tool_call>` blocks are parsed back into `tool_calls` with `finish_reason: "tool_calls"`. **Still open:** proper SSE `tool_calls` deltas (streaming currently emits the XML as content) — see plan Phase 1 #7.
 - [x] **(P1) `enable_thinking` model-size defaults.** Done — see Model & Architecture Support above.
 - [ ] **(P2) Multi-modal content parts** (`content: [{type: "text", ...}]`) — currently only plain strings.
 - [x] **(P2) `reasoning_content` on responses.** Done (see API section); `Message` also accepts `reasoning_content` on input for multi-turn history.
@@ -161,12 +202,26 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 
 ## Suggested Next Steps (ordered)
 
-1. **Reduce embedding memory** — the f32 `embed_tokens` matrix is now the largest allocation. f16 storage + lazy row conversion is the next memory win.
-2. **Run the end-to-end benchmark** with a real model: `EXLLAMA_BENCH_MODEL=/path cargo test --release bench_generation_throughput -- --ignored --nocapture`.
-3. **Manual SSE validation** with a real OpenAI client / `curl -N` against a real model (automated framing tests already pass).
-4. **Streaming `tool_calls` deltas** instead of emitting the XML as text content.
-5. **Real-model validation on other sizes (2B / 4B / 9B) and MUL1 codebooks** — currently only the 0.8B 8-bpw MCG model has been exercised end to end.
-6. **Optional:** batching / continuous inference, KV-cache quantization, vision support.
+The authoritative phased plan (with acceptance criteria) is
+[`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md). Execute in this order:
+
+1. **Phase 0 — test/docs foundation.** Make the dequantization/matmul
+   equivalence tests fresh-clone-safe with a committed synthetic EXL3 fixture,
+   add golden tests for the decoder math primitives, and fix stale doc counts.
+2. **Phase 1 — robustness & streaming fidelity.** Bound the HTTP request line,
+   guard the global threadpool against concurrent `run()`, align SSE chunk
+   ordering / completion `usage` / tool-call deltas, add a generation deadline,
+   and bound regex quantifier allocations.
+3. **Phase 2 — performance (measure first).** Reuse post-prefill state for
+   `n > 1`, then batching, f16 KV cache / tied embeddings, GPU cache key fix.
+4. **Phase 3 — exploration.** Vision, other architectures, NFC / `chat_template`
+   loading, structured logging, Anthropic endpoint.
+5. **Manual validation still worth doing:** the end-to-end benchmark
+   (`EXLLAMA_BENCH_MODEL=/path cargo test --release bench_generation_throughput -- --ignored --nocapture`),
+   a real-client SSE smoke test (`curl -N`), and real-model runs on 2B/4B/9B
+   and MUL1 codebooks (only the 0.8B 8-bpw MCG model has been exercised).
+
+Commit only on explicit approval — see the status note in `IMPROVEMENT_PLAN.md`.
 
 ---
 
