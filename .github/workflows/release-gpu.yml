@@ -15,6 +15,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Headless runners have no GPU for nvidia-smi. candle-kernels (cudaforge) needs
+  # an explicit arch to generate PTX. sm_80 (Ampere) PTX is forward-compatible
+  # and JIT-compiles on newer NVIDIA GPUs at runtime.
+  CUDA_COMPUTE_CAP: '80'
 
 permissions:
   contents: write
@@ -27,7 +31,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # ubuntu-latest is now 26.04; CUDA 12.6 has no packages for that
+          # codename. Pin to 24.04 where the CUDA repo packages exist.
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive: exllama-server-linux-x86_64-gpu-cuda.tar.gz
           - os: windows-latest
