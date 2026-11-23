@@ -1,0 +1,105 @@
+name: Release (GPU builds)
+
+# Manually triggered: CUDA builds require the NVIDIA toolkit (nvcc) which stock
+# GitHub runners do not have. This workflow installs it and produces GPU-enabled
+# binaries for Linux x86_64 and Windows x86_64. macOS Metal is already enabled
+# in the main CI/release workflows (the framework ships with macOS).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach binaries to (e.g. v0.1.0). Leave empty to upload artifacts only.'
+        required: false
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build-gpu:
+    name: Build GPU (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: exllama-server-linux-x86_64-gpu-cuda.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: exllama-server-windows-x86_64-gpu-cuda.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install CUDA toolkit (nvcc) so candle-kernels / cudarc can compile.
+      - name: Install CUDA (Linux)
+        if: runner.os == 'Linux'
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.6.0'
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "nvrtc", "driver"]'
+
+      - name: Install CUDA (Windows)
+        if: runner.os == 'Windows'
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.6.0'
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "nvrtc"]'
+
+      - name: Verify nvcc
+        run: nvcc --version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-gpu-cuda
+
+      - name: Build release (gpu-cuda)
+        run: cargo build --release --target ${{ matrix.target }} --features gpu-cuda
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf ${{ github.workspace }}/${{ matrix.archive }} exllama-server
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/${{ matrix.target }}/release/exllama-server.exe `
+            -DestinationPath ${{ matrix.archive }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+
+  release:
+    name: Attach GPU binaries to release
+    needs: build-gpu
+    runs-on: ubuntu-latest
+    if: inputs.tag != ''
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload to existing release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ inputs.tag }}" dist/* --clobber

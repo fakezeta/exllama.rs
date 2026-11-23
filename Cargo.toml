@@ -1,0 +1,32 @@
+[package]
+name = "exllama-server"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal OpenAI-compatible inference server for ExLlamaV3 (EXL3) quantized models"
+
+[[bin]]
+name = "exllama-server"
+path = "src/main.rs"
+
+[dependencies]
+# SIMD-optimized sgemm kernel (the BLAS core used by ndarray). Pure Rust,
+# no external native libraries, builds on every CI target.
+matrixmultiply = "0.3"
+
+# Optional GPU backend. Features are opt-in so default/CI builds stay portable.
+candle-core = { version = "0.11", optional = true }
+
+[features]
+default = []
+# CPU BLAS is always compiled in (matrixmultiply is non-optional).
+# GPU: compile candle with the right vendor backend for your platform:
+#   macOS / Apple Silicon:  cargo build --release --features gpu-metal
+#   NVIDIA Linux/Windows:   cargo build --release --features gpu-cuda
+gpu = ["dep:candle-core"]
+gpu-metal = ["gpu", "candle-core/metal"]
+gpu-cuda = ["gpu", "candle-core/cuda"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
