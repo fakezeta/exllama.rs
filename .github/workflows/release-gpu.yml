@@ -129,6 +129,8 @@ jobs:
     runs-on: ubuntu-latest
     if: inputs.tag != ''
     steps:
+      # gh needs a git repo to infer the target repository.
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
