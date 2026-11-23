@@ -44,13 +44,25 @@ jobs:
       - uses: actions/checkout@v4
 
       # Install CUDA toolkit (nvcc) so candle-kernels / cudarc can compile.
-      - name: Install CUDA (Linux)
+      # The action's sub-packages input prepends "cuda-"; several 12.6 libs
+      # actually use a "lib" prefix, so install those explicitly below.
+      - name: Install CUDA repo + compiler (Linux)
         if: runner.os == 'Linux'
         uses: Jimver/cuda-toolkit@v0.2.21
         with:
           cuda: '12.6.0'
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "nvrtc", "driver"]'
+          sub-packages: '["nvcc", "cudart", "nvrtc"]'
+          log-file-suffix: '${{ matrix.os }}'
+
+      - name: Install CUDA libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install \
+            libcublas-12-6 libcublas-dev-12-6 \
+            libcurand-12-6 libcurand-dev-12-6 \
+            cuda-driver-dev-12-6
 
       - name: Install CUDA (Windows)
         if: runner.os == 'Windows'
@@ -59,6 +71,12 @@ jobs:
           cuda: '12.6.0'
           method: network
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "nvrtc"]'
+
+      # nvcc invokes the host compiler (cl.exe on MSVC). Headless runners have
+      # Visual Studio installed but not on PATH unless the dev cmd is sourced.
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Verify nvcc
         run: nvcc --version
