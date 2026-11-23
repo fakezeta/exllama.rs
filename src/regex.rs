@@ -54,9 +54,10 @@ enum Re {
     Class(Box<Class>),
     Alt(Vec<Re>),
     Seq(Vec<Re>),
-    Lookahead(Box<Re>, bool),             // (pattern, positive)
-    Quant(Box<Re>, usize, Option<usize>), // inner, min, max (None = unbounded)
-    Ci(Box<Re>),                          // case-insensitive group `(?i:...)`
+    Lookahead(Box<Re>, bool), // (pattern, positive)
+    /// inner, min, max (None = unbounded), lazy (prefer fewer repetitions).
+    Quant(Box<Re>, usize, Option<usize>, bool),
+    Ci(Box<Re>), // case-insensitive group `(?i:...)`
 }
 
 pub struct Regex {
@@ -85,7 +86,9 @@ impl Regex {
     }
 
     /// Split `text` into consecutive non-overlapping matches (pre-tokenize).
-    /// Positions that cannot be matched are emitted as single characters.
+    /// This implements HuggingFace `Split(behavior="isolated")`: matches are
+    /// kept and unmatched gaps are **dropped**. The Qwen3.5 pattern covers all
+    /// normal input, so this only affects unusual Unicode.
     pub fn pre_tokenize(&self, text: &str) -> Vec<String> {
         let chars: Vec<char> = text.chars().collect::<Vec<char>>();
         let mut words: Vec<String> = Vec::new();
@@ -96,10 +99,8 @@ impl Regex {
                     words.push(chars[pos..end].iter().collect());
                     pos = end;
                 }
-                _ => {
-                    words.push(chars[pos].to_string());
-                    pos += 1;
-                }
+                // Isolated split: skip the unmatched character entirely.
+                _ => pos += 1,
             }
         }
         words
@@ -107,17 +108,22 @@ impl Regex {
 }
 
 fn match_seq(items: &[Re], text: &[char], pos: usize, ci: bool) -> Option<usize> {
+    all_seq_ends(items, text, pos, ci).into_iter().next()
+}
+
+/// Every end position reachable by matching a whole sequence, in
+/// leftmost-first priority order. Returning only the *first* end here used to
+/// discard backtracking alternatives for grouped subexpressions (e.g.
+/// `(?:ab?|c)bb` on `"abb"` failed because the group never tried end=1).
+fn all_seq_ends(items: &[Re], text: &[char], pos: usize, ci: bool) -> Vec<usize> {
     if items.is_empty() {
-        return Some(pos);
+        return vec![pos];
     }
-    let first = &items[0];
-    let rest = &items[1..];
-    for end in possible_ends(first, text, pos, ci) {
-        if let Some(final_pos) = match_seq(rest, text, end, ci) {
-            return Some(final_pos);
-        }
+    let mut out = Vec::new();
+    for end in possible_ends(&items[0], text, pos, ci) {
+        out.extend(all_seq_ends(&items[1..], text, end, ci));
     }
-    None
+    out
 }
 
 /// All end positions reachable by matching `re` at `pos`, in greedy
@@ -145,9 +151,7 @@ fn possible_ends(re: &Re, text: &[char], pos: usize, ci: bool) -> Vec<usize> {
             }
             out
         }
-        Re::Seq(items) => match_seq(items, text, pos, ci)
-            .map(|e| vec![e])
-            .unwrap_or_default(),
+        Re::Seq(items) => all_seq_ends(items, text, pos, ci),
         Re::Lookahead(inner, positive) => {
             let matched = match_seq(&[(**inner).clone()], text, pos, ci).is_some();
             if matched == *positive {
@@ -157,7 +161,7 @@ fn possible_ends(re: &Re, text: &[char], pos: usize, ci: bool) -> Vec<usize> {
             }
         }
         Re::Ci(inner) => possible_ends(inner, text, pos, true),
-        Re::Quant(inner, min, max) => {
+        Re::Quant(inner, min, max, lazy) => {
             let min = *min;
             let max = *max;
             let inner_re = &**inner;
@@ -175,11 +179,18 @@ fn possible_ends(re: &Re, text: &[char], pos: usize, ci: bool) -> Vec<usize> {
                 }
                 reachable.push(next);
             }
-            // Greedy: try the largest count first.
             let hi = max_count.min(reachable.len() - 1);
             let mut out = Vec::new();
-            for k in (min..=hi).rev() {
-                out.extend(reachable[k].clone());
+            if *lazy {
+                // Lazy: try the smallest count first.
+                for entry in reachable.iter().take(hi + 1).skip(min) {
+                    out.extend(entry.clone());
+                }
+            } else {
+                // Greedy: try the largest count first.
+                for k in (min..=hi).rev() {
+                    out.extend(reachable[k].clone());
+                }
             }
             out
         }
@@ -326,32 +337,35 @@ impl Parser {
         match self.peek() {
             Some('*') => {
                 self.next();
-                self.consume_greediness();
-                Ok(Re::Quant(Box::new(re), 0, None))
+                let lazy = self.consume_greediness();
+                Ok(Re::Quant(Box::new(re), 0, None, lazy))
             }
             Some('+') => {
                 self.next();
-                self.consume_greediness();
-                Ok(Re::Quant(Box::new(re), 1, None))
+                let lazy = self.consume_greediness();
+                Ok(Re::Quant(Box::new(re), 1, None, lazy))
             }
             Some('?') => {
                 self.next();
-                self.consume_greediness();
-                Ok(Re::Quant(Box::new(re), 0, Some(1)))
+                let lazy = self.consume_greediness();
+                Ok(Re::Quant(Box::new(re), 0, Some(1), lazy))
             }
             Some('{') => {
                 let (min, max) = self.parse_braces()?;
-                self.consume_greediness();
-                Ok(Re::Quant(Box::new(re), min, max))
+                let lazy = self.consume_greediness();
+                Ok(Re::Quant(Box::new(re), min, max, lazy))
             }
             _ => Ok(re),
         }
     }
 
-    fn consume_greediness(&mut self) {
-        // Only greedy matching is implemented; consume a `?` marker if present.
+    /// Consume a trailing `?` quantifier modifier; returns true for lazy.
+    fn consume_greediness(&mut self) -> bool {
         if self.peek() == Some('?') {
             self.next();
+            true
+        } else {
+            false
         }
     }
 
@@ -599,6 +613,38 @@ mod tests {
             Some(2)
         );
         assert_eq!(re.match_at(&"a".chars().collect::<Vec<char>>(), 0), None);
+    }
+
+    #[test]
+    fn test_group_backtracking() {
+        // The group `(?:ab?|c)` must try `a` (end 1) after `ab` (end 2) fails.
+        let re = Regex::compile(r"(?:ab?|c)bb").unwrap();
+        let text: Vec<char> = "abb".chars().collect();
+        assert_eq!(re.match_at(&text, 0), Some(3));
+        let re = Regex::compile(r"(?:a|ab)c").unwrap();
+        let text: Vec<char> = "abc".chars().collect();
+        assert_eq!(re.match_at(&text, 0), Some(3));
+    }
+
+    #[test]
+    fn test_lazy_quantifier() {
+        let lazy = Regex::compile(r"a+?a").unwrap();
+        let greedy = Regex::compile(r"a+a").unwrap();
+        let text: Vec<char> = "aaa".chars().collect();
+        assert_eq!(lazy.match_at(&text, 0), Some(2), "lazy should match 'aa'");
+        assert_eq!(
+            greedy.match_at(&text, 0),
+            Some(3),
+            "greedy should match all"
+        );
+    }
+
+    #[test]
+    fn test_isolated_split_drops_gaps() {
+        let re = Regex::compile(r"a+").unwrap();
+        // `b` and `c` are unmatched gaps: HF isolated split discards them.
+        assert_eq!(re.pre_tokenize("baac"), vec!["aa"]);
+        assert_eq!(re.pre_tokenize("a--a"), vec!["a", "a"]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! OpenAI-compatible API handlers and the inference engine.
 
-use crate::chat::{apply_chat_template, Message};
+use crate::chat::{apply_chat_template, parse_tool_calls, tools_system_prompt, Message, ToolCall};
 use crate::http::{respond, Request, Streamer};
 use crate::model::Model;
 use crate::tokenizer::Tokenizer;
@@ -25,6 +25,8 @@ pub struct Params {
     /// Emit a final SSE chunk with usage (`stream_options.include_usage`).
     pub include_usage: bool,
     pub enable_thinking: bool,
+    /// OpenAI `tools` array, rendered into the system prompt by `run_chat`.
+    pub tools: Option<Json>,
 }
 
 impl Default for Params {
@@ -43,6 +45,7 @@ impl Default for Params {
             stop_tokens: Vec::new(),
             include_usage: false,
             enable_thinking: true, // Qwen3.5-9B / 4B default
+            tools: None,
         }
     }
 }
@@ -256,6 +259,8 @@ pub struct Engine {
     pub model_name: String,
     pub default_max_tokens: usize,
     pub threads: usize,
+    /// Model-size-aware default for chat requests that omit `enable_thinking`.
+    pub default_enable_thinking: bool,
 }
 
 impl Engine {
@@ -265,6 +270,7 @@ impl Engine {
         model_name: String,
         default_max_tokens: usize,
         threads: usize,
+        default_enable_thinking: bool,
     ) -> Self {
         Engine {
             model: Mutex::new(model),
@@ -272,6 +278,7 @@ impl Engine {
             model_name,
             default_max_tokens,
             threads,
+            default_enable_thinking,
         }
     }
 
@@ -453,7 +460,29 @@ impl Engine {
     where
         F: FnMut(&str, bool) -> bool,
     {
-        let prompt = apply_chat_template(messages, true, params.enable_thinking);
+        // With `tools`, Qwen3.5 injects a tool-definition preamble into the
+        // system turn (merged with any user-supplied system message).
+        let mut rendered: Vec<Message> = messages.to_vec();
+        if let Some(tools) = &params.tools {
+            let mut sys = tools_system_prompt(tools);
+            if rendered.first().is_some_and(|m| m.role == "system") {
+                let user_sys = rendered[0].content.trim();
+                if !user_sys.is_empty() {
+                    sys.push_str("\n\n");
+                    sys.push_str(user_sys);
+                }
+                rendered.remove(0);
+            }
+            rendered.insert(
+                0,
+                Message {
+                    role: "system".into(),
+                    content: sys,
+                    ..Default::default()
+                },
+            );
+        }
+        let prompt = apply_chat_template(&rendered, true, params.enable_thinking);
         let prompt_ids = self.tokenizer.encode(&prompt);
         self.generate(prompt_ids, params, true, params.enable_thinking, on_token)
     }
@@ -563,12 +592,14 @@ fn sample(logits: &[f32], params: &Params, rng: &mut Rng, history: &[u32]) -> u3
     // `exp` is monotonic, so logit order equals probability order. Two passes
     // over the candidates avoid a separate probability vector.
     let max = scores[0].1;
-    let sum: f32 = scores.iter().map(|&(_, s)| (s - max).exp()).sum();
-    let mass = sum * params.top_p.clamp(0.0, 1.0);
-    let target = rng.next_f64() as f32 * mass;
-    let mut cum = 0.0f32;
+    // Draw in f64: casting a near-1.0 f64 to f32 can round it up to exactly
+    // 1.0, making `target == mass` and biasing the last candidate.
+    let sum: f64 = scores.iter().map(|&(_, s)| (s - max).exp() as f64).sum();
+    let mass = sum * params.top_p.clamp(0.0, 1.0) as f64;
+    let target = rng.next_f64() * mass;
+    let mut cum = 0.0f64;
     for &(idx, s) in &scores {
-        cum += (s - max).exp();
+        cum += (s - max).exp() as f64;
         if cum >= target {
             return idx as u32;
         }
@@ -583,11 +614,11 @@ fn sample_softmax(logits: &[f32], temp: f32, rng: &mut Rng) -> u32 {
         return 0;
     }
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max) / temp;
-    let sum: f32 = logits.iter().map(|&l| (l / temp - max).exp()).sum();
-    let target = rng.next_f64() as f32 * sum;
-    let mut cum = 0.0f32;
+    let sum: f64 = logits.iter().map(|&l| (l / temp - max).exp() as f64).sum();
+    let target = rng.next_f64() * sum;
+    let mut cum = 0.0f64;
     for (i, &l) in logits.iter().enumerate() {
-        cum += (l / temp - max).exp();
+        cum += (l / temp - max).exp() as f64;
         if cum >= target {
             return i as u32;
         }
@@ -757,9 +788,12 @@ fn check_model(body: &Json, engine: &Engine) -> Result<(), (u16, String)> {
     Ok(())
 }
 
-fn parse_params(body: &Json) -> Result<Params, (u16, String)> {
+fn parse_params(body: &Json, engine: &Engine) -> Result<Params, (u16, String)> {
     let bad = |msg: &str| json_error(400, msg, "invalid_request_error");
-    let mut p = Params::default();
+    let mut p = Params {
+        enable_thinking: engine.default_enable_thinking,
+        ..Default::default()
+    };
 
     if let Some(v) = json_f32(body, "temperature")? {
         if v < 0.0 {
@@ -768,7 +802,7 @@ fn parse_params(body: &Json) -> Result<Params, (u16, String)> {
         p.temperature = v;
     }
     if let Some(v) = json_f32(body, "top_p")? {
-        if !(0.0..=1.0).contains(&v) {
+        if !(v > 0.0 && v <= 1.0) {
             return Err(bad("top_p must be in (0, 1]"));
         }
         p.top_p = v;
@@ -794,6 +828,9 @@ fn parse_params(body: &Json) -> Result<Params, (u16, String)> {
         p.max_tokens = v as usize;
     }
     if let Some(v) = json_int(body, "seed")? {
+        if v < 0 {
+            return Err(bad("seed must be a non-negative integer"));
+        }
         p.seed = Some(v as u64);
     }
     if let Some(v) = json_f32(body, "repetition_penalty")? {
@@ -825,6 +862,10 @@ fn parse_params(body: &Json) -> Result<Params, (u16, String)> {
     if let Some(Json::Bool(v)) = body.get("enable_thinking") {
         p.enable_thinking = *v;
     }
+    p.tools = body
+        .get("tools")
+        .and_then(|v| v.as_arr())
+        .map(|a| Json::Arr(a.to_vec()));
     Ok(p)
 }
 
@@ -853,12 +894,51 @@ fn parse_messages(body: &Json) -> Result<Vec<Message>, (u16, String)> {
             .and_then(|v| v.as_str())
             .ok_or_else(|| json_error(400, "message.role is required", "invalid_request_error"))?
             .to_string();
-        let content = m
-            .get("content")
+        let content = match m.get("content") {
+            Some(Json::Str(s)) => s.clone(),
+            // Text-only content parts are accepted; vision parts are ignored.
+            Some(Json::Arr(a)) => a
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        };
+        let reasoning_content = m
+            .get("reasoning_content")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        out.push(Message { role, content });
+            .map(str::to_string);
+        let name = m.get("name").and_then(|v| v.as_str()).map(str::to_string);
+        let tool_calls = m.get("tool_calls").and_then(|v| v.as_arr()).map(|arr| {
+            arr.iter()
+                .filter_map(|tc| {
+                    let func = tc.get("function").unwrap_or(tc);
+                    let name = func.get("name")?.as_str()?.to_string();
+                    let arguments = match func.get("arguments") {
+                        Some(Json::Str(s)) => s.clone(),
+                        Some(v @ Json::Obj(_)) => v.to_string(),
+                        _ => "{}".into(),
+                    };
+                    let id = tc
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some(ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        out.push(Message {
+            role,
+            content,
+            reasoning_content,
+            tool_calls,
+            name,
+        });
     }
     Ok(out)
 }
@@ -954,7 +1034,7 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
             return;
         }
     };
-    let params = match parse_params(&body) {
+    let params = match parse_params(&body, engine) {
         Ok(p) => p,
         Err(e) => {
             let (s, b) = e;
@@ -990,17 +1070,16 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
         match res {
             Ok(r) => {
                 let usage = params.include_usage.then(|| usage_json(&r));
+                // Tool-call deltas are not streamed separately; the XML text
+                // is emitted as content. At least report the correct reason.
+                let finish = if parse_tool_calls(&r.text).1.is_empty() {
+                    r.finish_reason.as_str()
+                } else {
+                    "tool_calls"
+                };
                 sse.write_chunk(&format!(
                     "data: {}\n\n",
-                    chat_chunk_json(
-                        &id,
-                        &model_name,
-                        None,
-                        None,
-                        None,
-                        Some(r.finish_reason.as_str()),
-                        usage
-                    )
+                    chat_chunk_json(&id, &model_name, None, None, None, Some(finish), usage)
                 ));
                 sse.write_chunk("data: [DONE]\n\n");
                 sse.end();
@@ -1018,14 +1097,39 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
         match res {
             Ok(r) => {
                 let usage = usage_json(&r);
+                let (clean_text, calls) = parse_tool_calls(&r.text);
+                let finish = if calls.is_empty() {
+                    r.finish_reason.clone()
+                } else {
+                    "tool_calls".to_string()
+                };
                 let mut message = vec![
                     ("role".into(), Json::Str("assistant".into())),
-                    ("content".into(), Json::Str(r.text)),
+                    ("content".into(), Json::Str(clean_text)),
                 ];
                 // Only include reasoning_content when there is a thinking trace,
                 // matching vLLM/SGLang behavior.
                 if !r.reasoning_content.is_empty() {
                     message.push(("reasoning_content".into(), Json::Str(r.reasoning_content)));
+                }
+                if !calls.is_empty() {
+                    let arr: Vec<Json> = calls
+                        .iter()
+                        .map(|c| {
+                            Json::Obj(vec![
+                                ("id".into(), Json::Str(c.id.clone())),
+                                ("type".into(), Json::Str("function".into())),
+                                (
+                                    "function".into(),
+                                    Json::Obj(vec![
+                                        ("name".into(), Json::Str(c.name.clone())),
+                                        ("arguments".into(), Json::Str(c.arguments.clone())),
+                                    ]),
+                                ),
+                            ])
+                        })
+                        .collect();
+                    message.push(("tool_calls".into(), Json::Arr(arr)));
                 }
                 let resp = Json::Obj(vec![
                     ("id".into(), Json::Str(id)),
@@ -1037,7 +1141,7 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
                         Json::Arr(vec![Json::Obj(vec![
                             ("index".into(), Json::Num(0.0)),
                             ("message".into(), Json::Obj(message)),
-                            ("finish_reason".into(), Json::Str(r.finish_reason)),
+                            ("finish_reason".into(), Json::Str(finish)),
                             ("logprobs".into(), Json::Null),
                         ])]),
                     ),
@@ -1086,7 +1190,7 @@ pub fn handle_completions(mut stream: TcpStream, req: Request, engine: &Arc<Engi
         respond(&mut stream, s, "application/json", &b);
         return;
     }
-    let params = match parse_params(&body) {
+    let params = match parse_params(&body, engine) {
         Ok(p) => p,
         Err(e) => {
             let (s, b) = e;
@@ -1207,14 +1311,19 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
 
-    fn start_server() -> SocketAddr {
-        let engine = Arc::new(Engine::new(
+    fn tiny_engine() -> Engine {
+        Engine::new(
             crate::model::Model::tiny(),
             Tokenizer::tiny(),
             "tiny-model".into(),
             64,
             1,
-        ));
+            true,
+        )
+    }
+
+    fn start_server() -> SocketAddr {
+        let engine = Arc::new(tiny_engine());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -1286,6 +1395,7 @@ mod tests {
             "tiny-model".into(),
             64,
             1,
+            true,
         );
         let params = Params {
             temperature: 0.0,
@@ -1296,6 +1406,7 @@ mod tests {
         let messages = vec![Message {
             role: "user".into(),
             content: "hi".into(),
+            ..Default::default()
         }];
         let res = engine.run_chat(&messages, &params, |_, _| true).unwrap();
         assert!(res.completion_tokens > 0);
@@ -1450,20 +1561,64 @@ mod tests {
             r#"{"temperature": -0.5}"#,
             r#"{"temperature": "hot"}"#,
             r#"{"top_p": 1.5}"#,
+            r#"{"top_p": 0}"#,
+            r#"{"seed": -1}"#,
             r#"{"repetition_penalty": -1}"#,
         ] {
             let j = crate::json::parse(body).unwrap();
-            assert!(parse_params(&j).is_err(), "body={}", body);
+            assert!(parse_params(&j, &tiny_engine()).is_err(), "body={}", body);
         }
         let j = crate::json::parse(r#"{"temperature":0.7,"top_p":0.9,"max_tokens":128}"#).unwrap();
-        let p = parse_params(&j).unwrap();
+        let p = parse_params(&j, &tiny_engine()).unwrap();
         assert_eq!(p.temperature, 0.7);
         assert_eq!(p.top_p, 0.9);
         assert_eq!(p.max_tokens, 128);
 
         // max_completion_tokens overrides max_tokens.
         let j = crate::json::parse(r#"{"max_tokens":0,"max_completion_tokens":64}"#).unwrap();
-        assert_eq!(parse_params(&j).unwrap().max_tokens, 64);
+        assert_eq!(parse_params(&j, &tiny_engine()).unwrap().max_tokens, 64);
+    }
+
+    #[test]
+    fn parse_messages_keeps_reasoning_names_and_tool_calls() {
+        let body = crate::json::parse(
+            r#"{"messages":[{"role":"assistant","content":"answer","reasoning_content":"why","name":"a","tool_calls":[{"id":"1","type":"function","function":{"name":"f","arguments":{"x":1}}}]}]}"#,
+        )
+        .unwrap();
+        let msgs = parse_messages(&body).unwrap();
+        assert_eq!(msgs[0].reasoning_content.as_deref(), Some("why"));
+        assert_eq!(msgs[0].name.as_deref(), Some("a"));
+        let calls = msgs[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(calls[0].arguments, r#"{"x":1}"#);
+
+        let parts = crate::json::parse(
+            r#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_messages(&parts).unwrap()[0].content, "hi");
+
+        let with_tools = crate::json::parse(r#"{"tools":[{"type":"function"}]}"#).unwrap();
+        assert!(parse_params(&with_tools, &tiny_engine())
+            .unwrap()
+            .tools
+            .is_some());
+    }
+
+    #[test]
+    fn parse_params_respects_model_thinking_default() {
+        let small = Engine::new(
+            crate::model::Model::tiny(),
+            Tokenizer::tiny(),
+            "small".into(),
+            64,
+            1,
+            false,
+        );
+        let empty = crate::json::parse("{}").unwrap();
+        assert!(!parse_params(&empty, &small).unwrap().enable_thinking);
+        let explicit = crate::json::parse(r#"{"enable_thinking":true}"#).unwrap();
+        assert!(parse_params(&explicit, &small).unwrap().enable_thinking);
     }
 
     /// The pre-Phase-1 sampling algorithm, kept as a reference for equivalence.
@@ -1620,7 +1775,7 @@ mod tests {
         let model = crate::model::Model::load(&dir, 4096, 4, "f32").unwrap();
         let tok_path = std::path::Path::new(&dir).join("tokenizer.json");
         let tokenizer = Tokenizer::load(&tok_path.to_string_lossy()).unwrap();
-        let engine = Engine::new(model, tokenizer, "bench".into(), 32, 4);
+        let engine = Engine::new(model, tokenizer, "bench".into(), 32, 4, true);
         let params = Params {
             temperature: 0.0,
             max_tokens: 32,
@@ -1630,6 +1785,7 @@ mod tests {
         let messages = vec![Message {
             role: "user".into(),
             content: "Count: 1, 2, 3, 4,".into(),
+            ..Default::default()
         }];
 
         let t0 = std::time::Instant::now();

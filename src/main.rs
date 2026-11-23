@@ -177,13 +177,19 @@ fn main() -> ExitCode {
             .unwrap_or(std::path::Path::new("."));
         parent.join("tokenizer.json").to_string_lossy().into_owned()
     });
-    let tokenizer = match tokenizer::Tokenizer::load(&tok_path) {
+    let mut tokenizer = match tokenizer::Tokenizer::load(&tok_path) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("error: failed to load tokenizer from {}: {}", tok_path, e);
             return ExitCode::FAILURE;
         }
     };
+    // config.json's eos_token_id is authoritative when present (the
+    // tokenizer.json fallback is chat-specific).
+    if let Some(id) = model.config().eos_token_id {
+        eprintln!("[init] eos_token_id from config: {}", id);
+        tokenizer.set_eos_id(id);
+    }
     eprintln!("[init] tokenizer loaded (vocab={})", tokenizer.vocab_size());
 
     let name = cli.name.unwrap_or_else(|| {
@@ -193,7 +199,15 @@ fn main() -> ExitCode {
             .unwrap_or_else(|| "model".into())
     });
 
-    let engine = Engine::new(model, tokenizer, name.clone(), cli.max_tokens, cli.threads);
+    let default_enable_thinking = model.config().default_enable_thinking();
+    let engine = Engine::new(
+        model,
+        tokenizer,
+        name.clone(),
+        cli.max_tokens,
+        cli.threads,
+        default_enable_thinking,
+    );
 
     let addr = format!("{}:{}", cli.host, cli.port);
     let listener = match addr

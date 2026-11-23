@@ -22,9 +22,10 @@ checked off with a short note; open items are unchecked.
   PyTorch `(conv_dim, 1, 4)` depthwise layout; confirmed on the real model.
 - [x] **(P1) Verify q_proj interleaving.** Done — per-head `[query, gate]`
   interleaving verified from HF source and by real-model output.
-- [x] **(P2) Golden-file test for chat prompts.** Done (partial) —
-  `tokenizer::tests` and `chat::prompt_debug` lock down token ids for canned
-  conversations, including added-token protection (special tokens are single ids).
+- [x] **(P2) Golden-file test for chat prompts.** Done — committed prompt
+  fixtures in `tests/golden/` are asserted by `chat::tests` (no `/tmp`
+  dependency); `tokenizer::tests` additionally verify added-token protection
+  against the real tokenizer when available.
 - [x] **(P2) Test streaming SSE end-to-end.** std-only HTTP tests in
   `server::tests` verify chunk framing, `[DONE]`, `reasoning_content` deltas,
   usage chunks, and CORS against a tiny synthetic model. Real-client
@@ -33,6 +34,11 @@ checked off with a short note; open items are unchecked.
   checked safetensors headers and trellis-width validation; context-budget
   clamping and empty-input rejection; single-decode of plain 2-D tensors;
   half-integer (MUL1) unpack reference test. Regression tests added.
+- [x] **(P1) Phase 1 fidelity.** Regex grouped backtracking + lazy quantifiers +
+  isolated split; f64 sampling draw, top_p/seed validation, collision-free RNG
+  seed 0; strict pre-tokenizer parsing and config added tokens; EOS/thinking
+  defaults from config; chat `reasoning_content` / tool-call round-trip and
+  committed golden prompts. Regression tests added.
 
 ### Resolved during real-model validation (for the record)
 
@@ -86,8 +92,8 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 
 - [x] **(P1) Support `tie_word_embeddings = true`.** Done — `Model::w()` aliases
   `lm_head` and falls back to `embed_tokens.weight`.
-- [ ] **(P1) Read `eos_token_id` from `config.json`** instead of relying on the tokenizer fallback. Use `text_config.eos_token_id` when present.
-- [ ] **(P2) Support other Qwen3.5 sizes (0.8B / 2B / 4B) explicitly.** They differ in `enable_thinking` default (off for 0.8B/2B) — detect size from config and set the default accordingly.
+- [x] **(P1) Read `eos_token_id` from `config.json`.** Done — `ModelConfig.eos_token_id` (top-level or `text_config`, scalar or first array element) overrides the tokenizer fallback at startup.
+- [x] **(P2) Support other Qwen3.5 sizes (0.8B / 2B / 4B) explicitly.** Done — `hidden_size >= 2560` selects the thinking-on default (9B/4B); smaller models default off. An explicit `enable_thinking` in config wins.
 - [ ] **(P2) Vision tower inference** for `Qwen3_5ForConditionalGeneration` with `image_url` / `video` content. Large effort; vision tensors currently skipped.
 - [ ] **(P3) Support other EXL3 architectures** (Llama, Qwen3, etc.) behind a generic config/weight abstraction.
 
@@ -114,15 +120,15 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 
 - [ ] **(P1) Unicode NFC normalization.** `normalizer: {"type": "NFC"}` is currently ignored. Implement via a small table or accept the limitation explicitly.
 - [ ] **(P2) `chat_template` from tokenizer.json.** Template is hard-coded in `chat.rs`; read/interpret it (or at least verify it matches).
-- [ ] **(P2) Added tokens from `added_tokens_decoder`** (ids 248070..248076 exist only in `tokenizer_config.json`). Load them when available.
+- [x] **(P2) Added tokens from `added_tokens_decoder`.** Done — ids found only in the sibling `tokenizer_config.json` are loaded and protected.
 - [ ] **(P2) Byte-fallback / BPE edge cases.** Fuzz `bpe_encode_word` against Python `tokenizers` with random UTF-8.
 
 ---
 
 ## Chat Template
 
-- [ ] **(P1) Tool calling.** Implement `<tool_call>` / `<tool_response>` rendering with function arguments, and parse model-generated tool calls back into `tool_calls` response fields.
-- [ ] **(P1) `enable_thinking` model-size defaults.** Detect 0.8B/2B from config and flip the default to false. Currently defaults to true (9B/4B behavior).
+- [x] **(P1) Tool calling (non-streaming).** Done — OpenAI `tools` are rendered into the Qwen3.5 system preamble, assistant `tool_calls` into `<function=...>` XML, and generated `<tool_call>` blocks are parsed back into `tool_calls` with `finish_reason: "tool_calls"`. **Still open:** proper SSE `tool_calls` deltas (streaming currently emits the XML as content).
+- [x] **(P1) `enable_thinking` model-size defaults.** Done — see Model & Architecture Support above.
 - [ ] **(P2) Multi-modal content parts** (`content: [{type: "text", ...}]`) — currently only plain strings.
 - [x] **(P2) `reasoning_content` on responses.** Done (see API section); the `Message` input struct still lacks a `reasoning_content` field for multi-turn history.
 - [ ] **(P3) Full Jinja2 subset** or a template engine (hard with zero deps; likely not worth it).

@@ -26,6 +26,18 @@ pub struct ModelConfig {
     pub rope_theta: f32,
     pub partial_rotary_factor: f32,
     pub tie_word_embeddings: bool,
+    /// From config.json / text_config (`eos_token_id`), when present.
+    pub eos_token_id: Option<u32>,
+    /// Explicit `enable_thinking` from config, when present.
+    pub enable_thinking: Option<bool>,
+}
+
+impl ModelConfig {
+    /// Qwen3.5 0.8B / 2B default to thinking off; 4B / 9B default to on.
+    /// Hidden size is a reliable proxy: 2048 for 2B, 4096 for 9B.
+    pub fn default_enable_thinking(&self) -> bool {
+        self.enable_thinking.unwrap_or(self.hidden_size >= 2560)
+    }
 }
 
 /// State for one full-attention layer: KV cache.
@@ -140,6 +152,21 @@ impl Model {
                 .get("tie_word_embeddings")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            eos_token_id: tc
+                .get("eos_token_id")
+                .or_else(|| cfg.get("eos_token_id"))
+                .and_then(|v| {
+                    v.as_usize().map(|x| x as u32).or_else(|| {
+                        v.as_arr()
+                            .and_then(|a| a.first())
+                            .and_then(|x| x.as_usize())
+                            .map(|x| x as u32)
+                    })
+                }),
+            enable_thinking: tc
+                .get("enable_thinking")
+                .or_else(|| cfg.get("enable_thinking"))
+                .and_then(|v| v.as_bool()),
         };
         if config.linear_conv_kernel_dim < 2 {
             return Err(format!(
@@ -791,6 +818,8 @@ impl Model {
             rope_theta: 1e4,
             partial_rotary_factor: 0.5,
             tie_word_embeddings: false,
+            eos_token_id: None,
+            enable_thinking: None,
         };
 
         let mut weights = HashMap::new();

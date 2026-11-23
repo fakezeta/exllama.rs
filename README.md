@@ -10,7 +10,8 @@ The JSON parser, HTTP server, tokenizer, regex engine, PRNG and EXL3 dequantizer
 - **OpenAI-compatible API** — `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`, with streaming SSE (`stream: true`).
 - **Qwen3.5 text decoder** — full attention (GQA + partial RoPE) and linear attention (Gated DeltaNet), SwiGLU MLP, zero-centered RMSNorm.
 - **Configurable context size** and thread count from the CLI.
-- **Thinking mode** — Qwen3.5 `<think>` blocks, configurable via `enable_thinking` in chat requests.
+- **Thinking mode** — Qwen3.5 `<think>` blocks, configurable via `enable_thinking` in chat requests (default follows model size: off for 0.8B/2B, on for 4B/9B).
+- **Tool calling** — OpenAI `tools` / assistant `tool_calls` are rendered into Qwen3.5's XML format; generated tool calls are parsed back into `tool_calls` response fields. Streaming emits tool-call text as content (no separate deltas yet).
 - **Cross-platform** — Linux, macOS, and Windows (see [CI](#continuous-integration)).
 
 ## Requirements
@@ -155,7 +156,7 @@ GET /v1/models
 GET /health   (or /)
 ```
 
-Supported request parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `max_completion_tokens`, `seed`, `stop`, `stop_token_ids`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `stream`, `stream_options.include_usage`, `enable_thinking`. The `model` field is validated against the server's `--name`.
+Supported request parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `max_completion_tokens`, `seed`, `stop`, `stop_token_ids`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `stream`, `stream_options.include_usage`, `enable_thinking`, `tools`. Assistant messages may carry `reasoning_content` and `tool_calls`; `content` may be a string or an array of text parts. The `model` field is validated against the server's `--name`.
 
 ## How it works
 
@@ -170,7 +171,7 @@ Supported request parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `m
 cargo test
 ```
 
-Tests cover JSON parsing, regex/pre-tokenizer behavior, chat-template rendering, tokenizer encoding against the real Qwen3.5 tokenizer, EXL3 codebook/tile-layout correctness against the reference implementation, sampling, and end-to-end HTTP/SSE behavior against a tiny synthetic model (no model download required). For throughput benchmarking with a real model, see `bench_generation_throughput` in `src/server.rs`.
+Tests cover JSON parsing, regex/pre-tokenizer behavior, chat-template rendering (including committed golden prompts in `tests/golden/`), tool-call parsing, tokenizer encoding against the real Qwen3.5 tokenizer, EXL3 codebook/tile-layout correctness against the reference implementation, sampling, and end-to-end HTTP/SSE behavior against a tiny synthetic model (no model download required). For throughput benchmarking with a real model, see `bench_generation_throughput` in `src/server.rs`.
 
 For manual end-to-end checks against a **running server**, see [`tests/README.md`](tests/README.md). It contains smoke-test and diagnostic shell scripts (`test_api.sh`, `test_diag.sh`, `test_sample.sh`, `test_prompts.sh`) that exercise the OpenAI-compatible endpoints with curl.
 

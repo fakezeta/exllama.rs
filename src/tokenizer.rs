@@ -9,40 +9,71 @@ use std::collections::{HashMap, HashSet};
 use crate::json::Json;
 use crate::regex::Regex;
 
-/// Extract the pre-tokenizer regex pattern from a `tokenizer.json` value.
+/// The `Split` pre-tokenizer pattern used by the tokenizer.
+struct PreTokenizerSpec {
+    pattern: String,
+}
+
+/// Extract the pre-tokenizer regex from a `tokenizer.json` value.
 ///
-/// Handles both a bare pre-tokenizer with a `pattern` field and a `Sequence`
-/// of sub-pre-tokenizers (taking the first `Split` member's pattern).
-/// Newer `tokenizers` versions renamed the sequence key from `pre_tokenizers`
-/// to `pretokenizers`.
-fn extract_pre_tokenizer_pattern(json: &Json) -> Option<String> {
-    let pt = json.get("pre_tokenizer")?;
+/// Handles a bare `Split` and a `Sequence` of sub-pre-tokenizers (taking the
+/// first `Split` member). Newer `tokenizers` versions renamed the sequence key
+/// from `pre_tokenizers` to `pretokenizers`. Unknown shapes are rejected: a
+/// silent fallback to `\s+` would corrupt every token id without any warning.
+fn extract_pre_tokenizer(json: &Json) -> Result<PreTokenizerSpec, String> {
+    let pt = json
+        .get("pre_tokenizer")
+        .ok_or("tokenizer.json missing pre_tokenizer")?;
     let ptype = pt.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    if ptype == "Sequence" {
+    let split = if ptype == "Sequence" {
         let subs = pt
             .get("pre_tokenizers")
             .or_else(|| pt.get("pretokenizers"))
-            .and_then(|v| v.as_arr())?;
-        for sub in subs {
-            if sub.get("type").and_then(|v| v.as_str()) == Some("Split") {
-                return pattern_field(sub);
-            }
-        }
-        None
+            .and_then(|v| v.as_arr())
+            .ok_or("pre_tokenizer Sequence has no sub-pre-tokenizers")?;
+        subs.iter()
+            .find(|s| s.get("type").and_then(|v| v.as_str()) == Some("Split"))
+            .ok_or("pre_tokenizer Sequence has no Split member")?
+    } else if ptype == "Split" {
+        pt
     } else {
-        pattern_field(pt)
+        return Err(format!(
+            "unsupported pre_tokenizer type '{}' (expected Split)",
+            ptype
+        ));
+    };
+    if let Some(behavior) = split.get("behavior").and_then(|v| v.as_str()) {
+        if behavior != "isolated" {
+            return Err(format!(
+                "unsupported Split behavior '{}' (only isolated is implemented)",
+                behavior
+            ));
+        }
     }
+    Ok(PreTokenizerSpec {
+        pattern: pattern_field(split)?,
+    })
 }
 
 /// Read a `pattern` field that may be `{"String": "..."}`, `{"Regex": "..."}`
-/// (newer format), or a bare string.
-fn pattern_field(obj: &Json) -> Option<String> {
-    let p = obj.get("pattern")?;
-    p.get("String")
-        .or_else(|| p.get("Regex"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| p.as_str().map(|s| s.to_string()))
+/// (newer format, with the regex either as a string or as `{"pattern": ...}`),
+/// or a bare string.
+fn pattern_field(obj: &Json) -> Result<String, String> {
+    let p = obj.get("pattern").ok_or("Split has no pattern")?;
+    if let Some(s) = p.as_str() {
+        return Ok(s.to_string());
+    }
+    for key in ["String", "Regex"] {
+        if let Some(v) = p.get(key) {
+            if let Some(s) = v.as_str() {
+                return Ok(s.to_string());
+            }
+            if let Some(s) = v.get("pattern").and_then(|v| v.as_str()) {
+                return Ok(s.to_string());
+            }
+        }
+    }
+    Err("unsupported Split pattern format".into())
 }
 
 /// Build the standard GPT-2 byte-level encoder/decoder map.
@@ -182,13 +213,50 @@ impl Tokenizer {
             }
         }
 
+        // Some added tokens (e.g. ids 248070+) exist only in the sibling
+        // `tokenizer_config.json`. Load them too when that file is present.
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let cfg_path = parent.join("tokenizer_config.json");
+            if let Ok(raw) = std::fs::read_to_string(&cfg_path) {
+                if let Ok(cfg) = crate::json::parse(&raw) {
+                    if let Some(decoder) = cfg.get("added_tokens_decoder").and_then(|v| v.as_obj())
+                    {
+                        for (id_str, entry) in decoder {
+                            let Ok(id) = id_str.parse::<u32>() else {
+                                continue;
+                            };
+                            let Some(content) = entry.get("content").and_then(|v| v.as_str())
+                            else {
+                                continue;
+                            };
+                            // tokenizer.json entries win on duplicate content.
+                            if !vocab.contains_key(content) {
+                                vocab.insert(content.to_string(), id);
+                                added_tokens.push((content.to_string(), id));
+                            }
+                            if entry
+                                .get("special")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                            {
+                                special_ids.insert(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Longest-first so that e.g. `<|im_start|>` matches before any prefix.
         added_tokens.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
 
-        // Build id_to_token.
+        // Build id_to_token in sorted id order. Iterating a HashMap directly
+        // made duplicate ids resolve differently between runs.
+        let mut pairs: Vec<(u32, &String)> = vocab.iter().map(|(t, &id)| (id, t)).collect();
+        pairs.sort();
         let mut id_to_token: HashMap<u32, String> = HashMap::new();
-        for (tok, &id) in &vocab {
-            id_to_token.insert(id, tok.clone());
+        for (id, tok) in pairs {
+            id_to_token.entry(id).or_insert_with(|| tok.clone());
         }
 
         // unk / eos ids.
@@ -214,9 +282,9 @@ impl Tokenizer {
         // (e.g. Qwen3.5: `Split` + `ByteLevel`). In the `Sequence` case we
         // take the pattern of the first `Split` member; the `ByteLevel`
         // member is handled by `bpe_encode_word` (byte-level conversion).
-        let pattern = extract_pre_tokenizer_pattern(&json).unwrap_or_else(|| r"\s+".to_string());
-        let pre_tokenizer =
-            Regex::compile(&pattern).map_err(|e| format!("compile pre-tokenizer regex: {}", e))?;
+        let spec = extract_pre_tokenizer(&json)?;
+        let pre_tokenizer = Regex::compile(&spec.pattern)
+            .map_err(|e| format!("compile pre-tokenizer regex: {}", e))?;
 
         // Chat template (stored for reference / chat.rs).
         let chat_template = json
@@ -250,6 +318,12 @@ impl Tokenizer {
         self.eos_id
     }
 
+    /// Override the EOS id from `config.json` (`eos_token_id`), which is more
+    /// authoritative than the tokenizer's fallback for raw completions.
+    pub fn set_eos_id(&mut self, id: u32) {
+        self.eos_id = Some(id);
+    }
+
     pub fn chat_template(&self) -> Option<&str> {
         self.chat_template.as_deref()
     }
@@ -269,6 +343,12 @@ impl Tokenizer {
         let bytes = text.as_bytes();
         let mut i = 0usize;
         while i < bytes.len() {
+            // Added tokens are ASCII today, but a non-ASCII one must not make
+            // `&text[text_start..i]` slice through a UTF-8 character.
+            if !text.is_char_boundary(i) {
+                i += 1;
+                continue;
+            }
             let mut matched: Option<(usize, u32)> = None;
             for (tok, id) in &self.added_tokens {
                 let tb = tok.as_bytes();
@@ -461,6 +541,50 @@ mod tests {
             let got = t.encode(text);
             assert_eq!(&got, expected, "encode({:?})", text);
         }
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("exllama-tok-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn rejects_unknown_pre_tokenizer_instead_of_falling_back() {
+        let dir = temp_dir("bad-pretok");
+        let path = dir.join("tokenizer.json");
+        std::fs::write(
+            &path,
+            r#"{"model":{"vocab":{"a":0},"merges":[]},"pre_tokenizer":{"type":"WhitespaceSplit"}}"#,
+        )
+        .unwrap();
+        let err = match Tokenizer::load(path.to_str().unwrap()) {
+            Ok(_) => panic!("unknown pre-tokenizer must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.contains("pre_tokenizer"), "{}", err);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loads_added_tokens_from_tokenizer_config() {
+        let dir = temp_dir("config-added");
+        let path = dir.join("tokenizer.json");
+        std::fs::write(
+            &path,
+            r#"{"model":{"vocab":{"a":0,"!":1},"merges":[]},"added_tokens":[],"pre_tokenizer":{"type":"Split","pattern":{"Regex":"\\s+"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"100":{"content":"<ext>","special":true}}}"#,
+        )
+        .unwrap();
+        let t = Tokenizer::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(t.encode("<ext>"), vec![100]);
+        assert!(t.is_special(100));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

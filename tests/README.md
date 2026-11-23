@@ -3,6 +3,8 @@
 Shell scripts for smoke-testing and diagnosing the running `exllama-server`.
 These are **manual** tests — start the server first, then run a script from this
 directory. They are not part of `cargo test` (which runs the Rust unit tests).
+The `golden/` directory holds committed chat-prompt fixtures asserted by
+`chat::tests::prompts_match_committed_golden_files` (no downloaded files needed).
 
 ## Prerequisites
 

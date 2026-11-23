@@ -92,35 +92,37 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 
 ### `src/regex.rs` — Minimal backtracking regex engine
 - `Regex::compile(pattern)` → `Regex` with `match_at` and `pre_tokenize` (isolated matches; used by tokenizer).
-- Supports: alternation (`|`), concat, groups `(?:...)`, lookaheads `(?=...)`, `(?!...)`, inline case-insensitive `(?i:...)`, quantifiers `* + ? {n} {n,m}`, character classes with ranges, escapes, `\s \d \w \S \D \W`, Unicode property classes `\p{L} \p{M} \p{N} \p{P} \p{S} \p{Z} \p{C}` (including inside `[...]`).
+- Supports: alternation (`|`), concat, groups `(?:...)`, lookaheads `(?=...)`, `(?!...)`, inline case-insensitive `(?i:...)`, greedy and lazy quantifiers (`* + ? {n} {n,m}`, each with optional trailing `?`), character classes with ranges, escapes, `\s \d \w \S \D \W`, Unicode property classes `\p{L} \p{M} \p{N} \p{P} \p{S} \p{Z} \p{C}` (including inside `[...]`).
 - `pre_tokenize()` implements **isolated** split behavior: matches are kept, gaps are dropped. This is exactly what the Qwen3.5 `Split` pre-tokenizer needs.
-- 6 tests, including `test_qwen_style` with the exact Qwen3.5 pattern and expected word lists.
+- Grouped subexpressions backtrack fully (`all_seq_ends`), so patterns like `(?:ab?|c)bb` match correctly.
+- 9 tests, including `test_qwen_style` with the exact Qwen3.5 pattern and expected word lists.
 
 ### `src/tokenizer.rs` — Byte-level BPE tokenizer
-- `Tokenizer::load(path)` — reads `tokenizer.json`: vocab, merges, byte_encoder, added_tokens, pre-tokenizer pattern.
+- `Tokenizer::load(path)` — reads `tokenizer.json`: vocab, merges, byte_encoder, added_tokens, pre-tokenizer pattern. Unknown pre-tokenizer shapes are rejected (no silent `\s+` fallback); added tokens from the sibling `tokenizer_config.json` (`added_tokens_decoder`) are merged; `id_to_token` is built in sorted-id order for deterministic decode.
 - `encode(&str) -> Vec<u32>`:
   1. **Added-token protection:** scans raw input for added tokens (plain substring, longest-first) and emits their ids directly, bypassing pre-tokenization.
   2. `encode_text()` on each remaining span: pre-tokenizer regex → `bpe_encode_word()` per word.
 - `bpe_encode_word()` — converts word bytes to byte-level chars via GPT-2 byte map, then repeatedly merges the lowest-rank adjacent pair.
 - `decode(&[u32], skip_special)` — maps token chars back to bytes, UTF-8 lossy decode.
-- **EOS fallback:** tokenizer.json has `eos_token: null`; code falls back to `<|im_end|>` (id 248046), then `<|endoftext|>` (248044). Critical for stopping generation.
+- **EOS fallback:** tokenizer.json has `eos_token: null`; code falls back to `<|im_end|>` (id 248046), then `<|endoftext|>` (248044). `config.json`'s `eos_token_id` (scalar or first array element, top-level or `text_config`) overrides the fallback at startup. Critical for stopping generation.
 - Qwen3.5 specifics: base vocab 248,044 (ids 0..248043), padded to 248,320; no BOS, no UNK; `add_prefix_space=false`.
 - Added tokens 248044..248069 (26 in tokenizer.json). `<think>`=248068, `</think>`=248069, `<|im_start|>`=248045, `<|im_end|>`=248046, `<tool_call>`=248058.
 - Tests verify encode + added-token protection against the real `/tmp/qwen35/tokenizer.json` (skipped if file absent).
 
 ### `src/chat.rs` — Qwen3.5 chat template
-- `Message { role, content }`.
+- `Message { role, content, reasoning_content, tool_calls, name }` plus `ToolCall { id, name, arguments }`.
 - `apply_chat_template(messages, add_generation_prompt, enable_thinking) -> String`.
 - Renders text-only subset of the Jinja template:
   - System first: `<|im_start|>system\n{trim}<|im_end|>\n`
   - User: `<|im_start|>user\n{trim}<|im_end|>\n`
-  - Assistant: splits reasoning from content if `</think>` present; if `idx > last_query_index` emits `<think>\n{reasoning}\n</think>\n\n{body}`.
+  - Assistant: prefers an explicit `reasoning_content`; otherwise splits reasoning from content if `</think>` present. If `idx > last_query_index` emits `<think>\n{reasoning}\n</think>\n\n{body}`. Assistant `tool_calls` render as Qwen3.5 XML (`<tool_call><function=...><parameter=...>...`).
   - Tool messages: grouped into one user turn with `<tool_response>` blocks.
+  - `tools_system_prompt()` builds the system preamble for OpenAI `tools`; `parse_tool_calls()` extracts generated `<tool_call>` blocks into response fields (streaming still emits the XML as content).
   - Generation prompt: `<|im_start|>assistant\n` + `<think>\n` (thinking on) or `<think>\n\n</think>\n\n` (off).
-- `enable_thinking` defaults true (9B/4B behavior); false gives 0.8B/2B behavior.
+- `enable_thinking` default is model-size-aware: `hidden_size >= 2560` → true (9B/4B), otherwise false (0.8B/2B); an explicit config value wins. `Params` seeds its default from `Engine.default_enable_thinking`.
 
 ### `src/server.rs` — Inference engine + API handlers
-- `Engine { model: Mutex<Model>, tokenizer, model_name, default_max_tokens, threads }`.
+- `Engine { model: Mutex<Model>, tokenizer, model_name, default_max_tokens, threads, default_enable_thinking }`.
 - `GenResult { text, reasoning_content, prompt_tokens, completion_tokens, finish_reason }`.
 - `generate()` — core loop:
   1. `model.reset()`, `logits = model.forward(&prompt_ids)` (prefill).
@@ -349,7 +351,7 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 | `exl3::tests::half_roundtrip` | fp16 conversion correctness |
 | `exl3::tests::tile_perm_matches_reference` | Tile permutation vs reference |
 
-Run `cargo test` — 52 pass, 4 ignored on the current state.
+Run `cargo test` — 66 pass, 4 ignored on the current state.
 
 ---
 
