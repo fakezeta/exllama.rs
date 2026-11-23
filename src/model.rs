@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::exl3::{Exl3Model, QuantLinear};
 use crate::json::Json;
-use crate::tensor::{dot, matmul_t, Matrix};
+use crate::tensor::{dot, matmul_t, F16Matrix, Matrix};
 
 pub struct ModelConfig {
     pub architecture: String,
@@ -59,6 +59,8 @@ pub struct Model {
     pub config: ModelConfig,
     prefix: String,
     weights: HashMap<String, Matrix>,
+    /// fp16 embedding tables (untied models); one row decoded per token.
+    embeddings_f16: HashMap<String, F16Matrix>,
     linears: HashMap<String, QuantLinear>,
     vectors: HashMap<String, Vec<f32>>,
     threads: usize,
@@ -230,6 +232,7 @@ impl Model {
             config,
             prefix,
             weights: ex.weights,
+            embeddings_f16: ex.embeddings_f16,
             linears: ex.linears,
             vectors: ex.vectors,
             threads,
@@ -694,19 +697,34 @@ impl Model {
         let layer_types = self.config.layer_types.clone();
         let intv = self.config.full_attention_interval;
 
-        // Embedding lookup.
-        let embed = self
-            .w("embed_tokens.weight")
-            .ok_or_else(|| "missing embedding tensor `embed_tokens.weight`".to_string())?;
-        let mut x = vec![0.0f32; hs];
+        // Embedding lookup. Untied models store the table as fp16 and decode
+        // just one row; tied models keep the f32 matrix (also used by lm_head).
         let id = token as usize;
-        if id >= embed.rows {
-            return Err(format!(
-                "token id {} is outside embedding range ({} rows)",
-                token, embed.rows
-            ));
-        }
-        x.copy_from_slice(embed.row(id));
+        let embed_name = format!("{}embed_tokens.weight", self.prefix);
+        let mut x = if let Some(emb) = self
+            .embeddings_f16
+            .get(&embed_name)
+            .or_else(|| self.embeddings_f16.get("model.embed_tokens.weight"))
+        {
+            if id >= emb.rows {
+                return Err(format!(
+                    "token id {} is outside embedding range ({} rows)",
+                    token, emb.rows
+                ));
+            }
+            emb.row_f32(id)
+        } else {
+            let embed = self
+                .w("embed_tokens.weight")
+                .ok_or_else(|| "missing embedding tensor `embed_tokens.weight`".to_string())?;
+            if id >= embed.rows {
+                return Err(format!(
+                    "token id {} is outside embedding range ({} rows)",
+                    token, embed.rows
+                ));
+            }
+            embed.row(id).to_vec()
+        };
 
         let pos = self.position;
         let mut full_idx = 0usize;
@@ -861,6 +879,7 @@ impl Model {
             config,
             prefix: "model.".into(),
             weights,
+            embeddings_f16: HashMap::new(),
             linears: HashMap::new(),
             vectors,
             threads: 1,

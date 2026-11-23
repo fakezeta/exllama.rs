@@ -76,8 +76,14 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 
 ### `src/tensor.rs` — Matrices + matmul
 - `Matrix { rows, cols, data: Vec<f32> }` — row-major. **Weights are stored `(out_features, in_features)`**; a linear computes `y = x @ W^T` via `matmul_t`.
-- `matmul_t(x, x_rows, x_cols, w, y, nthreads)` — splits work across scoped threads (over rows if many input rows, over output neurons otherwise).
-- **Rust 1.100 quirk:** `NonNull<f32>` and `*mut f32` are NOT `Send`. Workaround: `SharedPtr(*mut f32)` newtype with `unsafe impl Send`, `#[derive(Clone, Copy)]`, and a safe `write_at(offset, value)` method. Closures capture `SharedPtr` **by value** (Copy). Do not revert to raw pointers.
+- `F16Matrix { rows, cols, data: Vec<u16> }` — fp16 embedding storage; `row_f32(row)` decodes one row on lookup (used for untied models).
+- `matmul_t(x, x_rows, x_cols, w, y, nthreads)` — splits work over the persistent pool (over rows if many input rows, over output neurons otherwise).
+- **Rust 1.100 quirk:** `NonNull<f32>` and `*mut f32` are NOT `Send`. Workaround: `SharedPtr(*mut f32)` newtype with `unsafe impl Send`, `#[derive(Clone, Copy)]`, and a safe `write_at(offset, value)` method. Closures capture `SharedPtr` **by value** (Copy). Do not revert to raw pointers. Immutable inputs cross threads via `threadpool::SendSlice<T>`.
+
+### `src/threadpool.rs` — Persistent worker pool
+- `init(threads)` spawns a fixed set of workers (called from `main` with `--threads`); `run(jobs)` dispatches `Box<dyn FnOnce() + Send>` jobs through std channels and waits on a `Barrier` before returning.
+- Jobs execute sequentially if `init` was never called (unit tests). A `BarrierGuard` releases the barrier even if a job panics, and the worker catches panics so the pool survives.
+- Used by `tensor::matmul_t_scalar` and `QuantLinear::matmul` (f16/packed paths) instead of spawning scoped threads per call.
 
 ### `src/compute.rs` — Compute backend selection
 - `Backend::{Scalar, Blas, Gpu}`; `init(preference)` picks at startup. `auto` (default): if GPU compiled in (`--features gpu-metal`/`gpu-cuda`) and a device is present → Gpu; else micro-benchmarks a 4096x1024 GEMV (`pick_fastest_cpu()`) and picks the faster of scalar vs `matrixmultiply::sgemm`.
@@ -143,18 +149,18 @@ See §5 for the full format. Key items:
 - `decode_3inst`, `decode_mcg`, `decode_mul1` — the three codebooks (16-bit index → fp16).
 - `window()` — extracts a 16-bit codeword from the packed MSB-first bitstream with wraparound.
 - `tile_perm()` — maps ring position → row-major 16×16 tile offset.
-- `unpack_tile()` — unpacks + decodes one tile into 256 f32 values (integer or half-integer K).
-- `hadamard128()`, `hadamard_rows()`, `hadamard_cols()` — normalized Sylvester H128 butterflies.
-- `read_safetensors()`, `load_all_shards()` — safetensors header parsing, sharding via index JSON or glob. Header arithmetic is checked and malformed metadata (dtype/shape/data_offsets) is rejected; `validate_tile_width()` bounds trellis widths before unpacking.
+- `unpack_tile_bits()` — unpacks one tile into 256 raw fp16 codebook bits; `unpack_tile()` converts those to f32 via the `half_f32` LUT. The f16 cache stores the bits directly (no f32→f16 round-trip).
+- `hadamard128()`, `hadamard_rows()`, `hadamard_cols()` — normalized Sylvester H128 butterflies. `hadamard_rows` uses a stack buffer per 128-column slice (cache-friendly) instead of strided butterflies.
+- `read_safetensors()`, `load_all_shards()` — safetensors header parsing, sharding via index JSON or glob. Header arithmetic is checked and malformed metadata (dtype/shape/data_offsets) is rejected; `validate_tile_width()` bounds trellis widths before unpacking. `Shards::compact_to()` drops trellis byte ranges after the linear pass.
 - `dequant_linear()` — reference full dequant pipeline for one quantized linear: unpack tiles → H_k → ×suh → H_n → ×svh → transpose to `(n, k)` → `Matrix`. **Used only by tests** as ground truth.
 - `QuantLinear` — a quantized linear (trellis + suh/svh) with three storage modes set by `--weight-mode`:
   - `packed`: `matmul(x)` decodes one 16×16 tile at a time into a small scratch (1× on-disk RAM but ~10+ s/token — too slow for interactive use on CPU). O(1) `window()` (64-bit funnel shift), `DECODE_*` LUTs (65536 f32 entries per codebook, avoids log2/powi per codeword), `TILE_PERM` table, and stack buffers keep it from being worse.
   - `f16`: `build_decode_cache()` decodes W_hat once into fp16 (2 bytes/weight, lossless) stored as `(n,k)`; `matmul` uses `half_f32` LUT for a fast dot.
   - `f32` (default): `build_decode_cache_f32()` decodes W_hat once into f32 `(n,k)`; `matmul` is a direct f32 dot. ~0.02 s for a 1024×6144 layer.
-  - All modes use the derivation `y[j] = svh[j] * (H_n @ (W_hat^T @ (H_k @ (x ⊙ suh))))[j]` and split output rows across scoped threads (`SharedPtr` newtype, ≥65536-element threshold). Verified equivalent by `quantized_matmul_matches_f32_dequant`.
+  - All modes use the derivation `y[j] = svh[j] * (H_n @ (W_hat^T @ (H_k @ (x ⊙ suh))))[j]` and split output rows across the persistent worker pool (`SharedPtr` newtype / `SendSlice`, ≥65536-element threshold). Verified equivalent by `quantized_matmul_matches_f32_dequant`.
   - `linear()` in model.rs prefers a plain `Matrix` over `QuantLinear` — for tied-embedding models the lm_head uses the plain embedding matrix, skipping the largest decode.
 - `Exl3Model::load(path, weight_mode)` — loads config.json + all shards, detects prefix, keeps quantized linears in `linears` (skipping vision) with optional f32/f16 decode cache per `weight_mode`, loads plain tensors as flat vectors, builds plain 2-D matrices (embeddings etc.) in `weights`.
-- `Exl3Model { config, weights: HashMap<String, Matrix>, linears: HashMap<String, QuantLinear>, vectors: HashMap<String, Vec<f32>> }`.
+- `Exl3Model { config, weights: HashMap<String, Matrix>, embeddings_f16: HashMap<String, F16Matrix>, linears: HashMap<String, QuantLinear>, vectors: HashMap<String, Vec<f32>> }`. Untied embeddings are read straight from the F16 shard into `embeddings_f16`; tied ones stay in `weights` for `lm_head`.
 - `read_signs()` — reads suh/svh (F16) with legacy packed su/sv fallback.
 
 ### `src/model.rs` — Qwen3.5 decoder forward (846 lines)
@@ -324,7 +330,7 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 
 ## 8. Known Limitations & Gotchas
 
-- **Memory vs speed:** `--weight-mode` trades RAM for tokens/s. `f32` (default): quantized linears decoded to f32 at load (~4× on-disk, fast). `f16`: ~2× on-disk, near-f32 speed. `packed`: ~1× on-disk but ~10+ s/token on CPU — unusable interactively. On CPU, SIMD on `dot()` would not help the packed path; its bottleneck is codebook decode, not the MACs. Tied-embedding models skip the lm_head decode (plain embedding matrix used directly). Peak RAM during load includes raw shard bytes plus decoded caches (in `f32` mode, several times on-disk); the old "≈ 2× on-disk" claim was inaccurate. Plain 2-D tensors are now decoded once (previously stored in both `vectors` and `weights`).
+- **Memory vs speed:** `--weight-mode` trades RAM for tokens/s. `f32` (default): quantized linears decoded to f32 at load (~4× on-disk, fast). `f16`: ~2× on-disk, near-f32 speed. `packed`: ~1× on-disk but ~10+ s/token on CPU — unusable interactively. On CPU, SIMD on `dot()` would not help the packed path; its bottleneck is codebook decode, not the MACs. Tied-embedding models skip the lm_head decode (plain embedding matrix used directly). Peak RAM during load includes raw shard bytes plus decoded caches (in `f32` mode, several times on-disk); the old "≈ 2× on-disk" claim was inaccurate. Plain 2-D tensors are decoded once (previously stored in both `vectors` and `weights`), trellis byte ranges are compacted away after the linear pass, and untied embedding tables are stored as fp16 with per-row decode. Tied models (0.8B) still keep the ~1 GB f32 embedding for `lm_head`.
 - **No GPU:** CPU only; large models are slow.
 - **Single-request generation:** `Engine.model` is a mutex; concurrent requests serialize.
 - **No full Jinja template engine:** chat template covers text-only common cases; tool-call arguments and advanced Jinja features (e.g. `tojson` of tool definitions) are not implemented.
@@ -351,7 +357,7 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 | `exl3::tests::half_roundtrip` | fp16 conversion correctness |
 | `exl3::tests::tile_perm_matches_reference` | Tile permutation vs reference |
 
-Run `cargo test` — 66 pass, 4 ignored on the current state.
+Run `cargo test` — 72 pass, 4 ignored on the current state.
 
 ---
 

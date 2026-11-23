@@ -10,6 +10,25 @@ pub struct Matrix {
     pub data: Vec<f32>,
 }
 
+/// Row-major matrix with fp16-encoded weights (2 bytes/weight). Used for the
+/// token embedding table: a single row is decoded to f32 on lookup, which
+/// halves the largest remaining allocation for untied models.
+pub struct F16Matrix {
+    pub rows: usize,
+    pub cols: usize,
+    /// Raw fp16 bit patterns, row-major.
+    pub data: Vec<u16>,
+}
+
+impl F16Matrix {
+    /// Decode one row into f32 values.
+    pub fn row_f32(&self, row: usize) -> Vec<f32> {
+        (0..self.cols)
+            .map(|j| crate::exl3::half_to_f32(self.data[row * self.cols + j]))
+            .collect()
+    }
+}
+
 impl Matrix {
     pub fn zeros(rows: usize, cols: usize) -> Self {
         Matrix {
@@ -38,6 +57,23 @@ impl Matrix {
 
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f16_matrix_row_decodes_to_f32() {
+        let enc = crate::exl3::f32_to_half;
+        let m = F16Matrix {
+            rows: 2,
+            cols: 3,
+            data: vec![enc(1.0), enc(2.0), enc(3.0), enc(-1.5), enc(0.0), enc(0.25)],
+        };
+        assert_eq!(m.row_f32(0), vec![1.0, 2.0, 3.0]);
+        assert_eq!(m.row_f32(1), vec![-1.5, 0.0, 0.25]);
     }
 }
 
@@ -97,56 +133,58 @@ pub fn matmul_t_scalar(
         }
         return;
     }
-    // Each worker writes to a disjoint region of `y`, so a raw base pointer
-    // (wrapped in a Send newtype) is shared across the spawned closures.
+    // Each worker writes to a disjoint region of `y`. The pool joins all jobs
+    // before returning, so raw pointers to the borrowed slices stay valid.
     let base = SharedPtr(y.as_mut_ptr());
-    std::thread::scope(|s| {
-        if x_rows >= w_rows {
-            // Split over input rows.
-            let n = n.min(x_rows);
-            let chunk = x_rows.div_ceil(n);
-            for t in 0..n {
-                let i0 = t * chunk;
-                if i0 >= x_rows {
-                    break;
-                }
-                let i1 = (i0 + chunk).min(x_rows);
-                s.spawn(move || {
-                    for i in i0..i1 {
-                        let xrow = &x[i * x_cols..(i + 1) * x_cols];
-                        for j in 0..w_rows {
-                            base.write_at(
-                                i * w_rows + j,
-                                dot(xrow, &w[j * x_cols..(j + 1) * x_cols]),
-                            );
-                        }
-                    }
-                });
+    let xp = crate::threadpool::SendSlice::new(x);
+    let wp = crate::threadpool::SendSlice::new(w);
+    let mut jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::new();
+    if x_rows >= w_rows {
+        // Split over input rows.
+        let n = n.min(x_rows);
+        let chunk = x_rows.div_ceil(n);
+        for t in 0..n {
+            let i0 = t * chunk;
+            if i0 >= x_rows {
+                break;
             }
-        } else {
-            // Split over output neurons.
-            let n = n.min(w_rows);
-            let chunk = w_rows.div_ceil(n);
-            for t in 0..n {
-                let j0 = t * chunk;
-                if j0 >= w_rows {
-                    break;
-                }
-                let j1 = (j0 + chunk).min(w_rows);
-                s.spawn(move || {
-                    for i in 0..x_rows {
-                        let xrow = &x[i * x_cols..(i + 1) * x_cols];
-                        for j in j0..j1 {
-                            base.write_at(
-                                i * w_rows + j,
-                                dot(xrow, &w[j * x_cols..(j + 1) * x_cols]),
-                            );
-                        }
+            let i1 = (i0 + chunk).min(x_rows);
+            let (base, xp, wp) = (base, xp, wp);
+            jobs.push(Box::new(move || unsafe {
+                let x = xp.get(x_rows * x_cols);
+                let w = wp.get(w_rows * x_cols);
+                for i in i0..i1 {
+                    let xrow = &x[i * x_cols..(i + 1) * x_cols];
+                    for j in 0..w_rows {
+                        base.write_at(i * w_rows + j, dot(xrow, &w[j * x_cols..(j + 1) * x_cols]));
                     }
-                });
-            }
+                }
+            }));
         }
-    });
+    } else {
+        // Split over output neurons.
+        let n = n.min(w_rows);
+        let chunk = w_rows.div_ceil(n);
+        for t in 0..n {
+            let j0 = t * chunk;
+            if j0 >= w_rows {
+                break;
+            }
+            let j1 = (j0 + chunk).min(w_rows);
+            let (base, xp, wp) = (base, xp, wp);
+            jobs.push(Box::new(move || unsafe {
+                let x = xp.get(x_rows * x_cols);
+                let w = wp.get(w_rows * x_cols);
+                for i in 0..x_rows {
+                    let xrow = &x[i * x_cols..(i + 1) * x_cols];
+                    for j in j0..j1 {
+                        base.write_at(i * w_rows + j, dot(xrow, &w[j * x_cols..(j + 1) * x_cols]));
+                    }
+                }
+            }));
+        }
+    }
+    crate::threadpool::run(jobs);
 }
 
 /// A raw mutable pointer that is explicitly `Send`, for sharing a base

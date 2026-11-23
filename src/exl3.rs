@@ -11,12 +11,13 @@
 //! Dequantization: unpack 256 codewords per 16x16 tile, decode each to fp16,
 //! then apply diag(suh) . H128 . W_hat . H128 . diag(svh).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::json::Json;
-use crate::tensor::Matrix;
+use crate::tensor::{F16Matrix, Matrix};
+use crate::threadpool::SendSlice;
 
 /// Best-effort resident-set size in MiB. `std` has no portable RSS API, so
 /// this is Linux-only and simply omitted elsewhere.
@@ -41,7 +42,7 @@ fn rss_mib() -> Option<f64> {
 /// Convert an fp16 bit pattern to f32 (round-to-nearest is implicit in the
 /// exact conversion).
 #[inline]
-fn half_to_f32(bits: u16) -> f32 {
+pub(crate) fn half_to_f32(bits: u16) -> f32 {
     let sign = if bits & 0x8000 != 0 { -1.0f32 } else { 1.0f32 };
     let exp = ((bits >> 10) & 0x1f) as i32;
     let mant = (bits & 0x3ff) as u32;
@@ -62,7 +63,7 @@ fn half_to_f32(bits: u16) -> f32 {
 /// Round an f32 to the nearest fp16 and return its bit pattern
 /// (round-to-nearest-even).
 #[inline]
-fn f32_to_half(v: f32) -> u16 {
+pub(crate) fn f32_to_half(v: f32) -> u16 {
     if v.is_nan() {
         return 0x7e00;
     }
@@ -254,12 +255,12 @@ fn tile_perm_table() -> &'static [usize; 256] {
 /// `packed` points at the tile's packed uint16 data (length `16*K` for integer
 /// K, or `16*KA + 8` for half-integer K). `k_half` is true for the MUL1
 /// half-integer rates.
-fn unpack_tile(
+fn unpack_tile_bits(
     packed: &[u16],
     k_bits_int: usize,
     k_half: bool,
     cb: Codebook,
-    out: &mut [f32; 256],
+    out: &mut [u16; 256],
 ) {
     let nw = packed.len() / 2; // number of u32 words
                                // Stack buffer avoids a heap allocation per tile. Max supported width
@@ -275,8 +276,7 @@ fn unpack_tile(
         let k = k_bits_int;
         for i in 0..256 {
             let end = ((i + 1) * k) as i64;
-            let idx = window(&words, nw, end - 16);
-            out[perm[i]] = decode_f32(idx, cb);
+            out[perm[i]] = decode(window(&words, nw, end - 16), cb);
         }
     } else {
         // Half-integer K = KA + 0.5 with MASK = 0xAAAA.
@@ -288,9 +288,23 @@ fn unpack_tile(
             let q = i & 15;
             // S(i) = g*bpb + sum_{j=0..=q} (ka + odd(j))
             let end = end_of_group(g) + (q * ka) as i64 + q.div_ceil(2) as i64;
-            let idx = window(&words, nw, end - 16);
-            out[perm[i]] = decode_f32(idx, cb);
+            out[perm[i]] = decode(window(&words, nw, end - 16), cb);
         }
+    }
+}
+
+/// Unpack one tile into 256 decoded f32 weights (integer or half-integer K).
+fn unpack_tile(
+    packed: &[u16],
+    k_bits_int: usize,
+    k_half: bool,
+    cb: Codebook,
+    out: &mut [f32; 256],
+) {
+    let mut bits = [0u16; 256];
+    unpack_tile_bits(packed, k_bits_int, k_half, cb, &mut bits);
+    for i in 0..256 {
+        out[i] = half_f32(bits[i]);
     }
 }
 
@@ -322,9 +336,19 @@ fn hadamard128(data: &mut [f32], base: usize, stride: usize, scale: f32) {
 /// Apply H_k (transform each 128-row block, for every column): `W = H_k @ W`.
 fn hadamard_rows(w: &mut [f32], rows: usize, cols: usize) {
     let scale = 1.0 / (128.0f32).sqrt();
+    // Read a 128-element column slice into a stack buffer, transform it
+    // contiguously, then write it back. The old strided butterfly touched 128
+    // cache lines per element and was much slower on large matrices.
+    let mut buf = [0.0f32; 128];
     for rb in 0..(rows / 128) {
         for j in 0..cols {
-            hadamard128(w, rb * 128 * cols + j, cols, scale);
+            for i in 0..128 {
+                buf[i] = w[(rb * 128 + i) * cols + j];
+            }
+            hadamard128(&mut buf, 0, 1, scale);
+            for i in 0..128 {
+                w[(rb * 128 + i) * cols + j] = buf[i];
+            }
         }
     }
 }
@@ -598,6 +622,47 @@ impl Shards {
     fn shape(&self, name: &str) -> Option<Vec<usize>> {
         let i = *self.map.get(name)?;
         Some(self.files[i].tensors.get(name)?.shape.clone())
+    }
+    fn dtype(&self, name: &str) -> Option<&str> {
+        let i = *self.map.get(name)?;
+        Some(self.files[i].tensors.get(name)?.dtype.as_str())
+    }
+
+    /// Release raw byte ranges that are no longer needed (quantized trellises
+    /// have already been copied into `QuantLinear`s by this point), keeping
+    /// only the tensors named in `keep`. Offsets of the retained tensors are
+    /// rewritten to the compacted buffer.
+    fn compact_to(&mut self, keep: &HashSet<String>) {
+        for sf in &mut self.files {
+            let ranges: Vec<(usize, usize)> = sf
+                .tensors
+                .iter()
+                .filter(|(name, _)| keep.contains(*name))
+                .map(|(_, t)| (t.offset, t.offset + t.len))
+                .collect();
+            if ranges.is_empty() {
+                sf.bytes.clear();
+                sf.tensors.clear();
+                continue;
+            }
+            let lo = ranges.iter().map(|r| r.0).min().unwrap();
+            let hi = ranges.iter().map(|r| r.1).max().unwrap();
+            if lo > 0 {
+                sf.bytes.drain(..lo);
+            }
+            sf.bytes.truncate(hi - lo);
+            sf.tensors.retain(|name, _| keep.contains(name));
+            // Only retained tensors have offsets >= lo.
+            for t in sf.tensors.values_mut() {
+                t.offset -= lo;
+            }
+        }
+        self.map.clear();
+        for (i, sf) in self.files.iter().enumerate() {
+            for name in sf.tensors.keys() {
+                self.map.insert(name.clone(), i);
+            }
+        }
     }
 }
 
@@ -895,25 +960,23 @@ impl QuantLinear {
             .take()
             .ok_or_else(|| format!("{}: trellis already consumed", self.name))?;
         let mut what = vec![0u16; self.k * self.n];
-        let mut tile_f32 = [0.0f32; 256];
-        let mut tile_f16 = [0u16; 256];
+        // Codebook outputs are fp16 bit patterns; store them directly instead
+        // of going through f32 and back (`f32_to_half`).
+        let mut tile = [0u16; 256];
         for tk in 0..self.tiles_k {
             for tn in 0..self.tiles_n {
                 let off = (tk * self.tiles_n + tn) * self.words_per_tile;
-                unpack_tile(
+                unpack_tile_bits(
                     &trellis[off..off + self.words_per_tile],
                     self.k_bits_int,
                     self.k_half,
                     self.cb,
-                    &mut tile_f32,
+                    &mut tile,
                 );
-                for c in 0..256 {
-                    tile_f16[c] = f32_to_half(tile_f32[c]);
-                }
                 for r in 0..16 {
                     for c in 0..16 {
                         // Store as (n, k) so the matmul dot is contiguous in k.
-                        what[(tn * 16 + c) * self.k + tk * 16 + r] = tile_f16[r * 16 + c];
+                        what[(tn * 16 + c) * self.k + tk * 16 + r] = tile[r * 16 + c];
                     }
                 }
             }
@@ -991,22 +1054,25 @@ impl QuantLinear {
             let base = SharedPtr(t.as_mut_ptr());
             let n_threads = if n < 256 { 1 } else { threads.max(1).min(n) };
             let chunk = n.div_ceil(n_threads);
-            let xr_ref = &xr;
-            let what_ref = what;
-            std::thread::scope(|s| {
-                for t_idx in 0..n_threads {
-                    let j0 = t_idx * chunk;
-                    if j0 >= n {
-                        break;
-                    }
-                    let j1 = (j0 + chunk).min(n);
-                    s.spawn(move || {
-                        for j in j0..j1 {
-                            base.write_at(j, dot_f16(xr_ref, &what_ref[j * k..(j + 1) * k]));
-                        }
-                    });
+            let xr_p = SendSlice::new(&xr);
+            let what_p = SendSlice::new(what);
+            let mut jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::new();
+            for t_idx in 0..n_threads {
+                let j0 = t_idx * chunk;
+                if j0 >= n {
+                    break;
                 }
-            });
+                let j1 = (j0 + chunk).min(n);
+                let (base, xr_p, what_p) = (base, xr_p, what_p);
+                jobs.push(Box::new(move || unsafe {
+                    let xr = xr_p.get(k);
+                    let what = what_p.get(n * k);
+                    for j in j0..j1 {
+                        base.write_at(j, dot_f16(xr, &what[j * k..(j + 1) * k]));
+                    }
+                }));
+            }
+            crate::threadpool::run(jobs);
         } else {
             // Packed path: decode tiles on demand (low memory, slow). Split over
             // tn so each worker writes a disjoint slice of `t`.
@@ -1024,41 +1090,40 @@ impl QuantLinear {
                 threads.max(1).min(self.tiles_n)
             };
             let chunk = self.tiles_n.div_ceil(n_threads);
-            let slf = self;
-            let xr_ref = &xr;
-            std::thread::scope(|s| {
-                for t_idx in 0..n_threads {
-                    let tn0 = t_idx * chunk;
-                    if tn0 >= self.tiles_n {
-                        break;
-                    }
-                    let tn1 = (tn0 + chunk).min(self.tiles_n);
-                    s.spawn(move || {
-                        let mut tile = [0.0f32; 256];
-                        for tn in tn0..tn1 {
-                            for tk in 0..slf.tiles_k {
-                                let off = (tk * slf.tiles_n + tn) * slf.words_per_tile;
-                                unpack_tile(
-                                    &trellis[off..off + slf.words_per_tile],
-                                    slf.k_bits_int,
-                                    slf.k_half,
-                                    slf.cb,
-                                    &mut tile,
-                                );
-                                let xbase = tk * 16;
-                                let ybase = tn * 16;
-                                for c in 0..16 {
-                                    let mut acc = 0.0f32;
-                                    for r in 0..16 {
-                                        acc += tile[r * 16 + c] * xr_ref[xbase + r];
-                                    }
-                                    base.add_at(ybase + c, acc);
+            let trellis_p = SendSlice::new(trellis);
+            let xr_p = SendSlice::new(&xr);
+            let (tiles_k, tiles_n, wpb) = (self.tiles_k, self.tiles_n, self.words_per_tile);
+            let (kbi, kh, cb) = (self.k_bits_int, self.k_half, self.cb);
+            let mut jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::new();
+            for t_idx in 0..n_threads {
+                let tn0 = t_idx * chunk;
+                if tn0 >= tiles_n {
+                    break;
+                }
+                let tn1 = (tn0 + chunk).min(tiles_n);
+                let (base, trellis_p, xr_p) = (base, trellis_p, xr_p);
+                jobs.push(Box::new(move || unsafe {
+                    let trellis = trellis_p.get(tiles_k * tiles_n * wpb);
+                    let xr = xr_p.get(k);
+                    let mut tile = [0.0f32; 256];
+                    for tn in tn0..tn1 {
+                        for tk in 0..tiles_k {
+                            let off = (tk * tiles_n + tn) * wpb;
+                            unpack_tile(&trellis[off..off + wpb], kbi, kh, cb, &mut tile);
+                            let xbase = tk * 16;
+                            let ybase = tn * 16;
+                            for c in 0..16 {
+                                let mut acc = 0.0f32;
+                                for r in 0..16 {
+                                    acc += tile[r * 16 + c] * xr[xbase + r];
                                 }
+                                base.add_at(ybase + c, acc);
                             }
                         }
-                    });
-                }
-            });
+                    }
+                }));
+            }
+            crate::threadpool::run(jobs);
         } // end packed path
 
         // 3. t = H_n @ t, per 128-col block.
@@ -1099,10 +1164,38 @@ fn read_signs(shards: &Shards, prefix: &str, f16: &str, legacy: &str) -> Result<
 
 /// A fully loaded EXL3 model: config, plain weight matrices, quantized linears,
 /// and 1-D vectors (norm weights, biases, etc.).
+/// Read a 2-D tensor as an fp16 matrix without staging a full f32 copy when
+/// the on-disk dtype is already F16 (the common case for embeddings).
+fn read_f16_matrix(shards: &Shards, name: &str) -> Option<F16Matrix> {
+    let shape = shards.shape(name)?;
+    if shape.len() != 2 {
+        return None;
+    }
+    let (rows, cols) = (shape[0], shape[1]);
+    let len = rows.checked_mul(cols)?;
+    let data = if shards.dtype(name) == Some("F16") {
+        let v = shards.u16(name)?;
+        if v.len() != len {
+            return None;
+        }
+        v
+    } else {
+        let v = shards.f32(name)?;
+        if v.len() != len {
+            return None;
+        }
+        v.iter().map(|&x| f32_to_half(x)).collect()
+    };
+    Some(F16Matrix { rows, cols, data })
+}
+
 pub struct Exl3Model {
     pub config: Json,
     /// Plain (unquantized) 2-D tensors in `(out_features, in_features)` layout.
     pub weights: HashMap<String, Matrix>,
+    /// Embedding tables stored as fp16 (2 bytes/weight), decoded per row on
+    /// lookup. Used only for untied models; tied lm_heads need f32 weights.
+    pub embeddings_f16: HashMap<String, F16Matrix>,
     /// Quantized linears, kept packed. Matmul dequantizes on the fly.
     pub linears: HashMap<String, QuantLinear>,
     /// 1-D tensors (norm weights, biases, A_log, dt_bias, ...).
@@ -1131,7 +1224,7 @@ impl Exl3Model {
         let config = crate::json::parse(&config_str)
             .map_err(|e| format!("parse {}: {}", config_path.display(), e))?;
 
-        let shards = load_all_shards(&dir)?;
+        let mut shards = load_all_shards(&dir)?;
 
         // Detect tensor prefix: multimodal checkpoints nest the text model
         // under `model.language_model.`, text-only ones use `model.`.
@@ -1144,6 +1237,7 @@ impl Exl3Model {
         };
 
         let mut weights: HashMap<String, Matrix> = HashMap::new();
+        let mut embeddings_f16: HashMap<String, F16Matrix> = HashMap::new();
         let mut linears: HashMap<String, QuantLinear> = HashMap::new();
         let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
 
@@ -1200,8 +1294,49 @@ impl Exl3Model {
             shards.map.len()
         );
 
-        // Plain (unquantized) tensors: embeddings, lm_head, 1-D vectors.
+        // The quantized trellises have been copied into `QuantLinear`s now;
+        // release their raw file bytes before decoding plain tensors.
         let all_names: Vec<String> = shards.map.keys().cloned().collect();
+        let keep: HashSet<String> = all_names
+            .iter()
+            .filter(|name| {
+                !name.ends_with(".trellis")
+                    && !name.ends_with(".suh")
+                    && !name.ends_with(".svh")
+                    && !name.ends_with(".su")
+                    && !name.ends_with(".sv")
+                    && !name.ends_with(".mcg")
+                    && !name.ends_with(".mul1")
+                    && !name.starts_with("model.visual.")
+            })
+            .cloned()
+            .collect();
+        shards.compact_to(&keep);
+
+        // Untied models can store the embedding table as fp16 and decode one
+        // row per token. Tied models need the full f32 matrix for lm_head.
+        let embed_name = {
+            let preferred = format!("{}embed_tokens.weight", prefix);
+            if shards.has(&preferred) {
+                Some(preferred)
+            } else if shards.has("model.embed_tokens.weight") {
+                Some("model.embed_tokens.weight".to_string())
+            } else {
+                None
+            }
+        };
+        let tie_embeddings = config
+            .get("tie_word_embeddings")
+            .or_else(|| {
+                config
+                    .get("text_config")
+                    .and_then(|t| t.get("tie_word_embeddings"))
+            })
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let embed_as_f16 = !tie_embeddings;
+
+        // Plain (unquantized) tensors: embeddings, lm_head, 1-D vectors.
         for name in &all_names {
             // Skip quantized internals and vision tensors.
             if name.ends_with(".trellis")
@@ -1213,6 +1348,10 @@ impl Exl3Model {
                 || name.ends_with(".mul1")
                 || name.starts_with("model.visual.")
             {
+                continue;
+            }
+            // Loaded directly as fp16 below (no f32 staging buffer).
+            if embed_as_f16 && embed_name.as_deref() == Some(name.as_str()) {
                 continue;
             }
             // Already dequantized.
@@ -1248,9 +1387,21 @@ impl Exl3Model {
             }
         }
 
+        if embed_as_f16 {
+            if let Some(name) = &embed_name {
+                if let Some(emb) = read_f16_matrix(&shards, name) {
+                    embeddings_f16.insert(name.clone(), emb);
+                }
+            }
+        }
+
         // Sanity: embedding must exist under one of the two possible prefixes.
         let embed = format!("{}embed_tokens.weight", prefix);
-        if !weights.contains_key(&embed) && !weights.contains_key("model.embed_tokens.weight") {
+        if !weights.contains_key(&embed)
+            && !weights.contains_key("model.embed_tokens.weight")
+            && !embeddings_f16.contains_key(&embed)
+            && !embeddings_f16.contains_key("model.embed_tokens.weight")
+        {
             return Err(format!("missing embedding tensor {}", embed));
         }
 
@@ -1267,6 +1418,7 @@ impl Exl3Model {
         Ok(Exl3Model {
             config,
             weights,
+            embeddings_f16,
             linears,
             vectors,
         })
@@ -1393,6 +1545,91 @@ mod tests {
         assert_eq!(validate_tile_width(96).unwrap(), (6, false));
         assert_eq!(validate_tile_width(128).unwrap(), (8, false));
         assert_eq!(validate_tile_width(40).unwrap(), (2, true));
+    }
+
+    #[test]
+    fn unpack_tile_bits_match_codebook_f32() {
+        // The f16 cache now stores the raw codebook fp16 bits instead of
+        // round-tripping through f32 (which loses some subnormal patterns).
+        // Their f32 values must match the f32 decode path exactly.
+        for (ka, half, cb) in [
+            (6usize, false, Codebook::Mcg),
+            (2usize, true, Codebook::Mul1),
+        ] {
+            let words = if half { 16 * ka + 8 } else { 16 * ka };
+            let packed: Vec<u16> = (0..words)
+                .map(|i| ((i as u32 * 7919 + 13) & 0xffff) as u16)
+                .collect();
+            let mut bits = [0u16; 256];
+            let mut vals = [0f32; 256];
+            unpack_tile_bits(&packed, ka, half, cb, &mut bits);
+            unpack_tile(&packed, ka, half, cb, &mut vals);
+            for i in 0..256 {
+                assert_eq!(half_to_f32(bits[i]), vals[i], "tile bit {}", i);
+            }
+        }
+    }
+
+    #[test]
+    fn hadamard_rows_blocking_matches_strided_reference() {
+        let (rows, cols) = (256usize, 192usize);
+        let original: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i % 37) as f32) * 0.1 - 1.0)
+            .collect();
+        let mut blocked = original.clone();
+        let mut strided = original.clone();
+        hadamard_rows(&mut blocked, rows, cols);
+        let scale = 1.0 / (128.0f32).sqrt();
+        for rb in 0..(rows / 128) {
+            for j in 0..cols {
+                hadamard128(&mut strided, rb * 128 * cols + j, cols, scale);
+            }
+        }
+        for i in 0..blocked.len() {
+            assert!(
+                (blocked[i] - strided[i]).abs() < 1e-4,
+                "element {}: {} vs {}",
+                i,
+                blocked[i],
+                strided[i]
+            );
+        }
+    }
+
+    #[test]
+    fn shard_compaction_keeps_only_requested_bytes() {
+        let mut sf = SafeFile {
+            bytes: vec![0u8; 100],
+            tensors: HashMap::new(),
+        };
+        sf.tensors.insert(
+            "keep".into(),
+            RawTensor {
+                dtype: "F16".into(),
+                shape: vec![2],
+                offset: 60,
+                len: 20,
+            },
+        );
+        sf.tensors.insert(
+            "drop".into(),
+            RawTensor {
+                dtype: "F16".into(),
+                shape: vec![2],
+                offset: 0,
+                len: 50,
+            },
+        );
+        let mut shards = Shards {
+            files: vec![sf],
+            map: HashMap::new(),
+        };
+        shards.map.insert("keep".into(), 0);
+        shards.map.insert("drop".into(), 0);
+        shards.compact_to(&HashSet::from(["keep".to_string()]));
+        assert_eq!(shards.map.len(), 1);
+        assert_eq!(shards.files[0].tensors["keep"].offset, 0);
+        assert_eq!(shards.files[0].bytes.len(), 20);
     }
 
     #[test]

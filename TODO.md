@@ -39,6 +39,11 @@ checked off with a short note; open items are unchecked.
   seed 0; strict pre-tokenizer parsing and config added tokens; EOS/thinking
   defaults from config; chat `reasoning_content` / tool-call round-trip and
   committed golden prompts. Regression tests added.
+- [x] **(P2) Phase 2 memory/perf.** fp16 embedding storage with per-row decode,
+  direct fp16 codebook bits for the f16 cache (no f32 round-trip), blocked
+  Hadamard rows, shard-byte compaction after the linear pass, and a persistent
+  worker pool replacing per-matmul thread spawning. Equivalence tests added;
+  real-model throughput benchmark still optional.
 
 ### Resolved during real-model validation (for the record)
 
@@ -67,20 +72,19 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
   All three modes validated on the real 0.8B EXL3 model: `f32` and `f16` gave
   byte-identical, coherent answers quickly; `packed` gave the same correct
   answer but at ~3.5 s/token (long requests hit client timeouts).
-- [ ] **(P1) Reduce embedding memory.** `embed_tokens` is still a plain f32
-  matrix (~1 GB for 0.8B, ~4 GB for 9B). Store as f16 and convert rows on
-  lookup, or keep the raw safetensors bytes and decode single rows lazily.
-  Note: quantized linear trellises are freed after decode and plain 2-D tensors
-  are no longer double-stored (they used to be kept in both `vectors` and
-  `weights`), so this is the largest remaining allocation.
+- [x] **(P1) Reduce embedding memory.** Done for untied models — `embed_tokens`
+  is stored as raw fp16 code bits from the shard (2 bytes/weight) and one row is
+  decoded per token. Tied models (0.8B) still keep the f32 matrix because it is
+  also used by `lm_head` (~1 GB); for 9B this saves roughly 2 GB.
 - [ ] **(P2) Speed up the `packed` mode.** Its bottleneck is codebook decode
   (not the dot product), so SIMD on `dot()` won't help. O(1) window extraction,
   decode LUTs and stack buffers are already in place; further gains need SIMD
   gather for the LUT or a different packed representation. Low priority — `f16`
   gives 2× memory at near-f32 speed.
 - [x] **(P1) Free shard bytes before allocating weights.** Done — quantized
-  linears copy only their trellis; `Shards` (holding raw file bytes) is dropped
-  when `Exl3Model::load` returns. Peak during load is ~2× on-disk briefly.
+  linears copy only their trellis; after the linear pass, `Shards::compact_to`
+  drops all non-plain tensor byte ranges before plain tensors are decoded.
+  `Shards` itself is dropped when `Exl3Model::load` returns.
 - [x] **(P1) BLAS/GPU compute backends.** Done — `src/compute.rs` with `matrixmultiply::sgemm` (pure-Rust SIMD BLAS) and opt-in `candle-core` GPU (features `gpu-metal`/`gpu-cuda`), auto-selected at startup by a GEMV micro-benchmark. CLI `--compute auto|blas|gpu|scalar`. Key finding: for memory-bound decode GEMV the hand-written threaded dot is 3-4x faster than sgemm, so `auto` usually picks `scalar`; BLAS/GPU help matrix-matrix batches.
 - [ ] **(P2) Batched / continuous inference.** `Engine.model` is a `Mutex<Model>` and serializes all requests. Add a request queue, or support `n > 1` by expanding the prompt batch.
 - [ ] **(P2) KV cache quantization.** Cache is f32 `(ctx, heads, head_dim)`; f16 or int8 could double context within the same RAM.

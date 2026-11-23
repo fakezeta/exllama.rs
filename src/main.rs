@@ -16,6 +16,7 @@ mod regex;
 mod rng;
 mod server;
 mod tensor;
+mod threadpool;
 mod tokenizer;
 
 use std::env;
@@ -146,8 +147,9 @@ fn main() -> ExitCode {
         }
     };
 
-    // Select compute backend (best available for "auto"). Pass the configured
-    // thread count so the auto probe benchmarks the actual inference setup.
+    // Start the matmul worker pool and select the compute backend. Both use
+    // the configured thread count so the auto probe measures the real setup.
+    threadpool::init(cli.threads);
     compute::init(&cli.compute, cli.threads);
 
     // Load model.
