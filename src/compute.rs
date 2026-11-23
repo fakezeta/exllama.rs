@@ -38,7 +38,7 @@ static COMPUTE: OnceLock<Compute> = OnceLock::new();
 /// uploaded once and reused, keyed by buffer address and shape.
 #[cfg(feature = "gpu")]
 struct GpuCache {
-    tensors: Mutex<HashMap<(usize, usize, usize), candle_core::Tensor>>,
+    tensors: Mutex<HashMap<(usize, usize, usize, u32), candle_core::Tensor>>,
 }
 
 #[cfg(feature = "gpu")]
@@ -251,6 +251,20 @@ fn blas_matmul(x: &[f32], x_rows: usize, x_cols: usize, w: &[f32], w_rows: usize
 }
 
 #[cfg(feature = "gpu")]
+fn weight_fingerprint(w: &[f32]) -> u32 {
+    // FNV-1a over sampled positions (including the last). Cheap relative to
+    // an upload, and catches recycled buffers holding different weights.
+    let mut h = 2166136261u32;
+    let n = w.len();
+    for i in [0usize, n / 4, n / 2, (n * 3) / 4, n.saturating_sub(1)] {
+        if i < n {
+            h = (h ^ w[i].to_bits()).wrapping_mul(16777619);
+        }
+    }
+    h
+}
+
+#[cfg(feature = "gpu")]
 fn gpu_matmul(
     x: &[f32],
     x_rows: usize,
@@ -267,7 +281,10 @@ fn gpu_matmul(
     if x_rows != 1 {
         return false; // decode is GEMV; fall back for multi-row
     }
-    let key = (w.as_ptr() as usize, w_rows, x_cols);
+    // Pointer alone is unsafe as a cache key: if an address is recycled for
+    // a different weight matrix, a stale device tensor would be reused.
+    // A cheap fingerprint of a few sampled elements disambiguates reuse.
+    let key = (w.as_ptr() as usize, w_rows, x_cols, weight_fingerprint(w));
     let cache = GPU_CACHE.get_or_init(|| GpuCache {
         tensors: Mutex::new(HashMap::new()),
     });
@@ -310,6 +327,17 @@ fn gpu_matmul(
 mod tests {
     use super::*;
     use crate::tensor::dot;
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_cache_fingerprint_detects_recycled_buffer() {
+        let a: Vec<f32> = (0..1024).map(|i| i as f32).collect();
+        let mut b = a.clone();
+        assert_eq!(weight_fingerprint(&a), weight_fingerprint(&b));
+        b[512] += 1.0; // sampled position changed -> new cache key
+        b[1023] = -7.0; // last element changed too
+        assert_ne!(weight_fingerprint(&a), weight_fingerprint(&b));
+    }
 
     #[test]
     fn blas_matches_dot() {

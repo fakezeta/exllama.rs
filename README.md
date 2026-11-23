@@ -171,11 +171,13 @@ of wall-clock time so a stalled request cannot block other clients.
   delimiters (`<think>` / `</think>`) and stop tokens are excluded, matching
   `completion_tokens`; delimiters still consume a forward step so the model
   state stays aligned.
-- `n` (1–128) returns that many choices. Choices are generated **sequentially**
-  (the model is mutex-guarded), so cost scales linearly; each choice gets its own
-  RNG stream derived from `seed`. With greedy decoding (`temperature: 0`) all
-  choices are identical, as with OpenAI. SSE chunks carry the choice `index`, and
-  usage is the sum across choices.
+- `n` (1–128) returns that many choices. All choices **share one prefill**: the
+  post-prompt state is snapshotted and restored for each choice, so only decoding
+  is repeated (generation is still sequential under the model mutex). Each choice
+  gets its own RNG stream derived from `seed`. With greedy decoding
+  (`temperature: 0`) all choices are identical, as with OpenAI. SSE chunks carry
+  the choice `index`, and usage is the sum across choices. At most 16 requests may
+  queue at once; further callers receive HTTP 429.
 - `user` is accepted and validated but otherwise ignored (OpenAI uses it for
   abuse monitoring).
 - `response_format` accepts `{"type": "text"}` (default) and
@@ -205,7 +207,7 @@ Supported request parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `m
 1. **Model loading** — EXL3 files are standard safetensors. Each quantized linear stores a packed tail-biting trellis plus input/output sign vectors (`suh`/`svh`). Depending on `--weight-mode`, W_hat is decoded once at load into an f32/f16 cache (default f32) or kept packed.
 2. **Quantized matmul** — the normalized Sylvester-Hadamard transforms are applied to the *input* and *output* vectors (not the weight matrix), so a linear needs only its W_hat in the rotated basis. `--weight-mode` decides how W_hat is stored: decoded to f32/f16 at load (fast) or kept packed and decoded per matmul (slow, minimum RAM). All three paths are verified equivalent to full reconstruction by `quantized_matmul_matches_f32_dequant`. A few O(1) optimizations (codebook LUTs, precomputed tile permutation, stack buffers) keep the packed path from being unusable.
 3. **Tokenizer** — byte-level BPE with the Qwen3.5 pre-tokenizer regex, added-token protection (so `<|im_start|>` and `<think>` remain single tokens), and byte fallback.
-4. **Inference** — one OS thread per HTTP connection; the model is guarded by a mutex. Prefill processes the prompt one token at a time (logged in 32-token groups); decoding emits one token at a time with KV cache (full attention) and recurrent state (linear attention). Matmul work is split across a persistent pool of worker threads (sized by `--threads`) instead of spawning threads per call. The server prints progress to stderr: `[load]` during model load, `[prompt] X/N tokens (tok/s)` per prefill batch, and `[decode] N tokens generated (tok/s)` every 16 tokens, with a final `[done]` summary.
+4. **Inference** — one OS thread per HTTP connection; the model is guarded by a mutex, with bounded admission (429 when 16 requests are queued). Prefill runs once per request and its state is reused across `n` choices. Prefill processes the prompt one token at a time (logged in 32-token groups); decoding emits one token at a time with an fp16 KV cache (full attention, halved context RAM) and recurrent state (linear attention). Matmul work is split across a persistent pool of worker threads (sized by `--threads`) instead of spawning threads per call. The server prints progress to stderr: `[load]` during model load, `[prompt] X/N tokens (tok/s)` per prefill batch, and `[decode] N tokens generated (tok/s)` every 16 tokens, with a final `[done]` summary.
 
 ## Testing
 
@@ -213,7 +215,7 @@ Supported request parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `m
 cargo test
 ```
 
-Tests cover JSON parsing, regex/pre-tokenizer behavior, chat-template rendering (including committed golden prompts in `tests/golden/`), tool-call parsing, EXL3 codebook/tile-layout correctness against the reference implementation, sampling, logprobs, `n`-choice handling, parameter validation, end-to-end HTTP/SSE behavior against a tiny synthetic model, and deterministic dependency-free fuzz smoke tests for the JSON/HTTP/regex/tokenizer/API parsers (`src/fuzz.rs`). Two suites need no model download and always run: `exl3::synthetic_tests` verifies all three `--weight-mode` paths against full dequantization for every EXL3 codebook using an in-memory fixture, and `model::tests` holds hand-computed golden tests for the decoder math (RMSNorm, RoPE, q_proj interleaving, GQA, DeltaNet). Tests that need `/tmp` reference files (real tokenizer / real EXL3 layer) are explicitly `#[ignore]`d with reasons — run them with `cargo test -- --ignored` when those files exist. Current totals: 99 passed, 10 ignored. For throughput benchmarking with a real model, see `bench_generation_throughput` in `src/server.rs`.
+Tests cover JSON parsing, regex/pre-tokenizer behavior, chat-template rendering (including committed golden prompts in `tests/golden/`), tool-call parsing, EXL3 codebook/tile-layout correctness against the reference implementation, sampling, logprobs, `n`-choice handling, parameter validation, end-to-end HTTP/SSE behavior against a tiny synthetic model, and deterministic dependency-free fuzz smoke tests for the JSON/HTTP/regex/tokenizer/API parsers (`src/fuzz.rs`). Two suites need no model download and always run: `exl3::synthetic_tests` verifies all three `--weight-mode` paths against full dequantization for every EXL3 codebook using an in-memory fixture, and `model::tests` holds hand-computed golden tests for the decoder math (RMSNorm, RoPE, q_proj interleaving, GQA, DeltaNet). Tests that need `/tmp` reference files (real tokenizer / real EXL3 layer) are explicitly `#[ignore]`d with reasons — run them with `cargo test -- --ignored` when those files exist. Current totals: 102 passed, 11 ignored. For throughput benchmarking with a real model, see `bench_generation_throughput` and `bench_n_choices_prefill_reuse` in `src/server.rs`.
 
 For manual end-to-end checks against a **running server**, see [`tests/README.md`](tests/README.md). It contains smoke-test and diagnostic shell scripts (`test_api.sh`, `test_diag.sh`, `test_sample.sh`, `test_prompts.sh`) that exercise the OpenAI-compatible endpoints with curl.
 

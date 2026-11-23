@@ -121,6 +121,7 @@ pub fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &s
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         _ => "OK",
     };

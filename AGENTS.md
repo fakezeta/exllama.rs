@@ -23,7 +23,7 @@ This document is a complete orienteering guide for AI agents (or humans) continu
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build                      # debug
 cargo build --release            # optimized binary at target/release/exllama-server
-cargo test                       # 99 unit tests (10 ignored: real-model / /tmp fixtures + benchmarks)
+cargo test                       # 102 unit tests (11 ignored: real-model / /tmp fixtures + benchmarks)
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings   # must pass (CI enforces)
 ```
@@ -63,7 +63,7 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 
 ### `src/http.rs` — Minimal HTTP/1.1 server
 - `Request { method, path, headers, body }` — parsed by `read_request()` (64 KiB header cap, 8 MiB body cap, rejects duplicate/invalid Content-Length).
-- `respond()` — writes a complete response with Content-Length and CORS headers.
+- `respond()` — writes a complete response with Content-Length and CORS headers; 429 maps to "Too Many Requests" for admission backpressure.
 - `Streamer` — chunked SSE writer with `Cache-Control: no-cache`; `write_chunk()` returns false on a broken connection so generation aborts; `end(&mut self)` writes `0\r\n\r\n` (takes `&mut self` so callers sharing the stream with generation callbacks can still finish it).
 - `serve(listener, handler)` — accept loop; one OS thread per connection (capped at 64), 600 s read/write timeouts. Handler signature: `Fn(TcpStream, Request)` (takes ownership of the stream).
 - `read_request()` reads the request line and headers through `Read::take(MAX_HEADER_BYTES + 1)` so a newline-free flood is rejected instead of buffered without limit. Body is capped at 8 MiB.
@@ -95,6 +95,7 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 - **NOTE:** for CPU decode GEMV (memory-bound), the hand-written threaded scalar dot is typically 3-4x *faster* than sgemm — so `auto` often picks `scalar`. That is expected, not a regression. sgemm wins for matrix-matrix (prefill batches).
 - `blas-src`/`openblas-src` were rejected: netlib needs a Fortran compiler, OpenBLAS needs a native lib — both break portable CI. `matrixmultiply` is pure Rust with SIMD kernels (the sgemm core used by ndarray).
 - Cargo features: `gpu` (candle-core), `gpu-metal` (Apple), `gpu-cuda` (NVIDIA); default build has no GPU deps.
+- GPU weight cache keys include a cheap fingerprint of sampled weight elements alongside `(pointer, rows, cols)`, so a recycled address cannot reuse a stale device tensor. `weight_fingerprint` has a GPU-only unit test.
 
 ### `src/rng.rs` — SplitMix64 PRNG
 - `Rng::new(seed)`, `next_f64() -> f64`, `next_u32()`, private `next_u64()`. Used for sampling.
@@ -134,6 +135,8 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 ### `src/server.rs` — Inference engine + API handlers
 - `Engine { model: Mutex<Model>, tokenizer, model_name, default_max_tokens, threads, default_enable_thinking }`.
 - `GenResult { text, reasoning_content, prompt_tokens, completion_tokens, finish_reason, logprobs }`.
+- `PrefillState` + `prepare_prefill()` / `prepare_chat_prefill()` / `prepare_completion_prefill()` — one prompt forward pass captured as a `Model::snapshot()` plus final logits; `generate_inner` takes `Option<&PrefillState>` and restores it for each choice. Both endpoints prepare once when `n > 1`.
+- Bounded admission: `Engine::try_admit()` reserves one of `MAX_QUEUED_REQUESTS = 16` slots (RAII `AdmissionGuard`); excess requests get a 429 instead of piling up behind the model mutex. Full multi-request batching remains deferred (see §8).
 - `Params` (Clone) adds `n`, `user`, `response_format`, `logprobs`, `top_logprobs` and an internal `deadline: Option<Instant>` override (never set by the API; used by tests). `parse_params_inner(body, engine, chat)` handles the different chat/completions shapes (`logprobs` bool vs integer). `ResponseFormat::JsonObject` adds a best-effort prompt hint (`apply_response_format_chat/text`); no constrained decoding.
 - `generate_inner()` is the core loop; `generate()` wraps it with a no-op logprob callback. `run_chat_inner()` / `run_completion_inner()` likewise wrap `run_chat()` / `run_completion()` and thread an `on_logprob` callback through for SSE deltas. `prepare_logits()` (penalties/bias) is shared by `sample()` and `logprob_info()` so reported probabilities match the sampled distribution; `choice_seeds()` derives one RNG stream per choice for `n > 1`.
 - `generate()` — core loop:
@@ -169,13 +172,14 @@ See §5 for the full format. Key items:
 - `Exl3Model { config, prefix: String, weights: HashMap<String, Matrix>, embeddings_f16: HashMap<String, F16Matrix>, linears: HashMap<String, QuantLinear>, vectors: HashMap<String, Vec<f32>> }`. `prefix` is detected from shard tensor names (`model.` or `model.language_model.`) and reused by `Model::load`. Untied embeddings are read straight from the F16 shard into `embeddings_f16`; tied ones stay in `weights` for `lm_head`.
 - `read_signs()` — reads suh/svh (F16) with legacy packed su/sv fallback.
 
-### `src/model.rs` — Qwen3.5 decoder forward (1158 lines)
+### `src/model.rs` — Qwen3.5 decoder forward (1224 lines)
 See §6 for the full math. Key items:
 - `ModelConfig` — extracted from `config.json` (handles nested `text_config`).
 - `Model { config, prefix, weights, linears, vectors, threads, context_size, position, full_states, linear_states }`.
 - `w(name)` / `ql(name)` / `v(name)` — resolve unprefixed names by trying `{prefix}{name}`, `{prefix}{name}.weight`, bare `name`, `name.weight`; `ql` also aliases `lm_head` → the quantized head. `embedding_row(token)` looks up the fp16 table under `{prefix}embed_tokens.weight` first (or the f32 fallback), so untied multimodal checkpoints resolve correctly.
 - `linear(x, name)` — the universal linear: prefers a packed `QuantLinear` (dequantize-on-matmul), falls back to a plain `Matrix` via `matmul_t`. All projections (q/k/v/o, in_proj_*, out_proj, MLP gate/up/down, lm_head) go through it; only the embedding stays a direct row lookup on a `Matrix`.
-- `FullAttnState { k, v }` — KV cache `(max_ctx, num_kv_heads, head_dim)`.
+- `FullAttnState { k, v }` — **fp16** KV cache `(max_ctx, num_kv_heads, head_dim)` stored as `Vec<u16>` bits (halves context RAM). Writes use `f32_to_half`; the used prefix is decoded through the `half_f32` LUT into f32 scratch before attention.
+- `ModelState` / `snapshot()` / `restore()` — a compact post-prefill snapshot (only the used KV prefix plus DeltaNet state) so `n > 1` choices share one prompt forward pass.
 - `LinearAttnState { conv, conv_pos, state }` — conv circular buffer + recurrent state.
 - Testable math helpers (extracted from the forward paths without changing the math): `split_q_gate()` (per-head `[query|gate]` interleaving), `gqa_attention()` (`AttnShape` carries nh/nkv/hd/tlen; GQA gather + scale + softmax + sigmoid gate), and `deltanet_step()` (one value-head recurrence; `DeltaNetScratch` carries kd/vd and reusable buffers). Each has a hand-computed golden test in `model::tests`.
 - `rms_norm()` — zero-centered: `x * rsqrt(mean(x²)+eps) * (1+w)`.
@@ -340,9 +344,9 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 
 ## 8. Known Limitations & Gotchas
 
-- **Memory vs speed:** `--weight-mode` trades RAM for tokens/s. `f32` (default): quantized linears decoded to f32 at load (~4× on-disk, fast). `f16`: ~2× on-disk, near-f32 speed. `packed`: ~1× on-disk but ~10+ s/token on CPU — unusable interactively. On CPU, SIMD on `dot()` would not help the packed path; its bottleneck is codebook decode, not the MACs. Tied-embedding models skip the lm_head decode (plain embedding matrix used directly). Peak RAM during load includes raw shard bytes plus decoded caches (in `f32` mode, several times on-disk); the old "≈ 2× on-disk" claim was inaccurate. Plain 2-D tensors are decoded once (previously stored in both `vectors` and `weights`), trellis byte ranges are compacted away after the linear pass, and untied embedding tables are stored as fp16 with per-row decode. Tied models (0.8B) still keep the ~1 GB f32 embedding for `lm_head`.
+- **Memory vs speed:** `--weight-mode` trades RAM for tokens/s. `f32` (default): quantized linears decoded to f32 at load (~4× on-disk, fast). `f16`: ~2× on-disk, near-f32 speed. `packed`: ~1× on-disk but ~10+ s/token on CPU — unusable interactively. On CPU, SIMD on `dot()` would not help the packed path; its bottleneck is codebook decode, not the MACs. Tied-embedding models skip the lm_head decode (plain embedding matrix used directly). Peak RAM during load includes raw shard bytes plus decoded caches (in `f32` mode, several times on-disk); the old "≈ 2× on-disk" claim was inaccurate. Plain 2-D tensors are decoded once (previously stored in both `vectors` and `weights`), trellis byte ranges are compacted away after the linear pass, and untied embedding tables are stored as fp16 with per-row decode. Tied models (0.8B) still keep the ~1 GB f32 embedding for `lm_head` (converting just the embedding to f16 needs a new threaded f16 lm_head matmul — deferred). The full-attention KV cache is now fp16 (2 bytes/value, LUT-decoded per step), halving context RAM; a SIMD-gather rewrite of the `packed` decode path is also deferred (bottleneck is codebook decode, not MACs).
 - **No GPU:** CPU only; large models are slow.
-- **Single-request generation:** `Engine.model` is a mutex; concurrent requests serialize. `n > 1` therefore generates choices sequentially (linear cost), not as a batch.
+- **Single-request generation:** `Engine.model` is a mutex; concurrent requests serialize. `n > 1` still decodes choices sequentially, but they now **share one prefill** via `PrefillState` (see §3), so cost grows sublinearly in the prompt pass. Bounded admission returns 429 when more than 16 requests queue. Full multi-request batching is deferred: it requires splitting shared weights from per-request state (or N full model copies), a large refactor with RAM scaling linearly in concurrent requests.
 - **API fidelity limits:** `response_format: json_object` only adds a prompt hint — there is no grammar/constrained decoding or JSON validation. Streaming tool calls now produce indexed `tool_calls` deltas (name + argument fragments) with the XML withheld from content, but tool-call arguments are still assembled with the simple `<parameter=...>` parser, not full JSON streaming. Chat `top_logprobs` is capped at 20 (completions accept up to 20 as an extension; OpenAI allows 5). Logprobs exclude reasoning delimiters and stop tokens, so their count matches `completion_tokens`, not every token sampled internally; `<think>`/`</think>` also consume a forward step but are not counted in `completion_tokens`.
 - **No full Jinja template engine:** chat template covers text-only common cases; tool-call arguments and advanced Jinja features (e.g. `tojson` of tool definitions) are not implemented.
 - **No Unicode NFC normalization:** tokenizer assumes input is already NFC (chat content typically is).
@@ -376,11 +380,15 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 | `threadpool::tests` | Concurrent `run()` calls complete without deadlock |
 | `tensor::tests` | `dot()` rejects length mismatches |
 | `regex::tests::unbounded_quantifier_is_bounded` | Quantifier repeat/work caps on long and nested-pattern inputs |
+| `server::tests::prefill_reuse_matches_fresh_prefill` | Post-prefill snapshot/restore produces the same output as a fresh prefill |
+| `server::tests::admission_bounds_queued_requests` | Bounded request admission slots |
+| `model::tests::kv_cache_stores_fp16_bits` | fp16 KV cache layout and LUT decode |
+| `compute::tests::gpu_cache_fingerprint_detects_recycled_buffer` | GPU cache key disambiguates recycled buffers (feature `gpu`) |
 | `fuzz::tests` | Seeded random inputs against JSON/HTTP/regex/chat/tokenizer/API parsers (no panics) |
 
-Run `cargo test` — 99 pass, 10 ignored on the current state. The ignored set
+Run `cargo test` — 102 pass, 11 ignored on the current state. The ignored set
 is 6 real-model / `/tmp`-fixture tests (now explicitly marked with reasons) plus
-4 benchmarks. On a fresh clone the dequantization/matmul guarantee is still
+5 benchmarks (including `bench_n_choices_prefill_reuse`). On a fresh clone the dequantization/matmul guarantee is still
 verified by the committed synthetic fixtures.
 
 ---

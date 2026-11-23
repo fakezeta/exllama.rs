@@ -191,7 +191,7 @@ fn build_decode_table(f: fn(u16) -> u16) -> Vec<f32> {
 /// Fast fp16-bit-pattern -> f32 lookup (avoids powi in the matmul inner loop).
 static HALF_F32: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
 #[inline]
-fn half_f32(bits: u16) -> f32 {
+pub(crate) fn half_f32(bits: u16) -> f32 {
     HALF_F32.get_or_init(|| (0..=u16::MAX).map(half_to_f32).collect())[bits as usize]
 }
 

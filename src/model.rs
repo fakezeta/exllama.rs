@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::exl3::{Exl3Model, QuantLinear};
+use crate::exl3::{f32_to_half, half_f32, Exl3Model, QuantLinear};
 use crate::json::Json;
 use crate::tensor::{dot, matmul_t, F16Matrix, Matrix};
 
@@ -40,10 +40,12 @@ impl ModelConfig {
     }
 }
 
-/// State for one full-attention layer: KV cache.
+/// State for one full-attention layer: fp16 KV cache. Storing the code bits
+/// directly halves context RAM; each step decodes the used prefix into f32
+/// through a lookup table before computing attention.
 struct FullAttnState {
-    k: Vec<f32>, // (max_ctx, num_kv_heads, head_dim)
-    v: Vec<f32>,
+    k: Vec<u16>, // (max_ctx, num_kv_heads, head_dim), fp16 bits
+    v: Vec<u16>,
 }
 
 /// State for one linear-attention layer: convolution buffer + recurrent state.
@@ -53,6 +55,15 @@ struct LinearAttnState {
     conv_pos: usize,
     /// Recurrent state S, one (value_dim x key_dim) matrix per value head.
     state: Vec<f32>, // (num_value_heads, value_dim, key_dim)
+}
+
+/// Snapshot of the per-sequence state after prefill. Only the *used* prefix
+/// of each KV cache is copied, so generating `n` choices from one prefill
+/// costs O(1) snapshot memory instead of O(n) full context-sized caches.
+pub(crate) struct ModelState {
+    position: usize,
+    full: Vec<(Vec<u16>, Vec<u16>)>,
+    linear: Vec<(Vec<f32>, usize, Vec<f32>)>,
 }
 
 /// Shape of one GQA attention call, grouped to keep the helper signature small.
@@ -225,8 +236,8 @@ impl Model {
             if is_full {
                 let kv = config.num_key_value_heads * config.head_dim;
                 full_states.push(FullAttnState {
-                    k: vec![0.0; context_size * kv],
-                    v: vec![0.0; context_size * kv],
+                    k: vec![0u16; context_size * kv],
+                    v: vec![0u16; context_size * kv],
                 });
             } else {
                 let conv_dim = config.linear_num_value_heads * config.linear_value_head_dim
@@ -275,13 +286,52 @@ impl Model {
     pub fn reset(&mut self) {
         self.position = 0;
         for s in &mut self.full_states {
-            s.k.fill(0.0);
-            s.v.fill(0.0);
+            s.k.fill(0);
+            s.v.fill(0);
         }
         for s in &mut self.linear_states {
             s.conv.fill(0.0);
             s.conv_pos = 0;
             s.state.fill(0.0);
+        }
+    }
+
+    /// Copy the state produced by a prefill. Only KV rows up to `position`
+    /// are retained; the unused tail of the cache is irrelevant to decoding.
+    pub(crate) fn snapshot(&self) -> ModelState {
+        let kv = self.config.num_key_value_heads * self.config.head_dim;
+        let used = self.position * kv;
+        ModelState {
+            position: self.position,
+            full: self
+                .full_states
+                .iter()
+                .map(|s| (s.k[..used].to_vec(), s.v[..used].to_vec()))
+                .collect(),
+            linear: self
+                .linear_states
+                .iter()
+                .map(|s| (s.conv.clone(), s.conv_pos, s.state.clone()))
+                .collect(),
+        }
+    }
+
+    /// Restore a post-prefill snapshot into this model, so a new choice can
+    /// decode from the same state without re-running the prompt.
+    pub(crate) fn restore(&mut self, state: &ModelState) {
+        debug_assert_eq!(self.full_states.len(), state.full.len());
+        debug_assert_eq!(self.linear_states.len(), state.linear.len());
+        self.position = state.position;
+        let kv = self.config.num_key_value_heads * self.config.head_dim;
+        let used = state.position * kv;
+        for (dst, (k, v)) in self.full_states.iter_mut().zip(&state.full) {
+            dst.k[..used].copy_from_slice(k);
+            dst.v[..used].copy_from_slice(v);
+        }
+        for (dst, (conv, conv_pos, recurrent)) in self.linear_states.iter_mut().zip(&state.linear) {
+            dst.conv.copy_from_slice(conv);
+            dst.conv_pos = *conv_pos;
+            dst.state.copy_from_slice(recurrent);
         }
     }
 
@@ -593,24 +643,26 @@ impl Model {
         let mut k = kp[..nkv * hd].to_vec();
         self.apply_rope(&mut k, hd, nkv, pos);
 
-        // Write to KV cache.
+        // Write the new K/V row as fp16 bits (halves context memory).
         let kv = nkv * hd;
         if pos < self.context_size {
             let st = &mut self.full_states[state_idx];
-            st.k[pos * kv..(pos + 1) * kv].copy_from_slice(&k);
-            st.v[pos * kv..(pos + 1) * kv].copy_from_slice(&vp[..kv]);
+            for (dst, &src) in st.k[pos * kv..(pos + 1) * kv].iter_mut().zip(&k) {
+                *dst = f32_to_half(src);
+            }
+            for (dst, &src) in st.v[pos * kv..(pos + 1) * kv].iter_mut().zip(&vp[..kv]) {
+                *dst = f32_to_half(src);
+            }
         }
 
         // Causal attention over cached keys/values, then sigmoid(gate).
+        // Decode the used prefix through the f16 LUT once per token rather
+        // than doing a slow powi-based conversion at every score/value read.
         let tlen = pos.min(self.context_size - 1) + 1;
         let st = &self.full_states[state_idx];
-        let attn = Self::gqa_attention(
-            &q,
-            &gate,
-            &st.k[..tlen * kv],
-            &st.v[..tlen * kv],
-            AttnShape { nh, nkv, hd, tlen },
-        );
+        let k_f32: Vec<f32> = st.k[..tlen * kv].iter().map(|&b| half_f32(b)).collect();
+        let v_f32: Vec<f32> = st.v[..tlen * kv].iter().map(|&b| half_f32(b)).collect();
+        let attn = Self::gqa_attention(&q, &gate, &k_f32, &v_f32, AttnShape { nh, nkv, hd, tlen });
 
         // Output projection.
         let y = self.linear(&attn, &format!("layers.{}.self_attn.o_proj", layer))?;
@@ -963,8 +1015,8 @@ impl Model {
             rope_sin,
             rope_half,
             full_states: vec![FullAttnState {
-                k: vec![0.0; context_size * 4],
-                v: vec![0.0; context_size * 4],
+                k: vec![0u16; context_size * 4],
+                v: vec![0u16; context_size * 4],
             }],
             linear_states: Vec::new(),
         }
@@ -995,6 +1047,20 @@ mod tests {
         // A wrong prefix must fail loudly rather than mis-tokenize.
         m.prefix = "model.".into();
         assert!(m.embedding_row(0).is_err());
+    }
+
+    #[test]
+    fn kv_cache_stores_fp16_bits() {
+        let m = Model::tiny();
+        let kv = m.config.num_key_value_heads * m.config.head_dim;
+        assert_eq!(m.full_states[0].k.len(), m.context_size * kv);
+        assert_eq!(m.full_states[0].v.len(), m.context_size * kv);
+        // A fresh cache is all-zero fp16 bits, and the LUT decoder used by
+        // attention round-trips a representative value exactly.
+        assert!(m.full_states[0].k.iter().all(|&b| b == 0));
+        assert!(m.full_states[0].v.iter().all(|&b| b == 0));
+        let bits = f32_to_half(1.25);
+        assert!((half_f32(bits) - 1.25).abs() < 1e-6);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::{json::Json, rng::Rng};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -110,6 +110,14 @@ pub struct GenResult {
     /// One entry per generated completion token (empty unless `logprobs` is on).
     /// Delimiters and stop tokens are excluded, matching `completion_tokens`.
     pub logprobs: Vec<TokenLogprob>,
+}
+
+/// Post-prefill state that can be restored for every choice when `n > 1`,
+/// avoiding an O(n) repetition of the prompt forward pass.
+pub struct PrefillState {
+    model: crate::model::ModelState,
+    logits: Vec<f32>,
+    prompt_tokens: usize,
 }
 
 /// Qwen3.5 added-token ids used as reasoning delimiters.
@@ -306,6 +314,38 @@ impl OutputRouter {
     }
 }
 
+/// Bounds requests waiting on (or using) the single model mutex. Without this,
+/// every connection thread can block in `run_chat` while holding a parsed
+/// request; excess callers get a prompt 429 instead of piling up.
+const MAX_QUEUED_REQUESTS: usize = 16;
+
+struct Admission {
+    active: AtomicUsize,
+}
+
+impl Admission {
+    fn try_acquire(&self) -> bool {
+        self.active
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_QUEUED_REQUESTS).then_some(n + 1)
+            })
+            .is_ok()
+    }
+
+    fn release(&self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Releases an admission slot when a request handler returns (or panics).
+pub struct AdmissionGuard<'a>(&'a Admission);
+
+impl Drop for AdmissionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 pub struct Engine {
     model: Mutex<Model>,
     tokenizer: Tokenizer,
@@ -314,6 +354,7 @@ pub struct Engine {
     pub threads: usize,
     /// Model-size-aware default for chat requests that omit `enable_thinking`.
     pub default_enable_thinking: bool,
+    admission: Admission,
 }
 
 impl Engine {
@@ -332,7 +373,48 @@ impl Engine {
             default_max_tokens,
             threads,
             default_enable_thinking,
+            admission: Admission {
+                active: AtomicUsize::new(0),
+            },
         }
+    }
+
+    /// Try to reserve one of the bounded request slots. `None` means the
+    /// server is saturated and the caller should answer 429.
+    pub fn try_admit(&self) -> Option<AdmissionGuard<'_>> {
+        self.admission
+            .try_acquire()
+            .then(|| AdmissionGuard(&self.admission))
+    }
+
+    /// Run the prompt forward pass once and capture the state needed to
+    /// decode any number of choices from that same prefix.
+    pub fn prepare_prefill(&self, prompt_ids: &[u32]) -> Result<PrefillState, String> {
+        if prompt_ids.is_empty() {
+            return Err("empty prompt: no tokens to generate from".into());
+        }
+        let mut model = self.model.lock().unwrap_or_else(|e| e.into_inner());
+        model.reset();
+        const PROMPT_BATCH: usize = 32;
+        let prompt_start = std::time::Instant::now();
+        let mut logits = Vec::new();
+        let mut processed = 0usize;
+        for chunk in prompt_ids.chunks(PROMPT_BATCH) {
+            logits = model.forward(chunk)?;
+            processed += chunk.len();
+            let secs = prompt_start.elapsed().as_secs_f64().max(1e-6);
+            eprintln!(
+                "[prompt] {}/{} tokens  ({:.1} tok/s)",
+                processed,
+                prompt_ids.len(),
+                processed as f64 / secs
+            );
+        }
+        Ok(PrefillState {
+            model: model.snapshot(),
+            logits,
+            prompt_tokens: prompt_ids.len(),
+        })
     }
 
     /// Shared generation core. `prompt_ids` is the already-tokenized prompt.
@@ -356,17 +438,20 @@ impl Engine {
             params,
             split_reasoning,
             start_in_reasoning,
+            None,
             on_token,
             |_| {},
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_inner<F, G>(
         &self,
         prompt_ids: Vec<u32>,
         params: &Params,
         split_reasoning: bool,
         start_in_reasoning: bool,
+        prefill: Option<&PrefillState>,
         mut on_token: F,
         mut on_logprob: G,
     ) -> Result<GenResult, String>
@@ -374,10 +459,6 @@ impl Engine {
         F: FnMut(&str, bool) -> bool,
         G: FnMut(&TokenLogprob),
     {
-        let prompt_tokens = prompt_ids.len();
-        if prompt_tokens == 0 {
-            return Err("empty prompt: no tokens to generate from".into());
-        }
         let requested_tokens = if params.max_tokens == 0 {
             self.default_max_tokens
         } else {
@@ -385,7 +466,37 @@ impl Engine {
         };
 
         let mut model = self.model.lock().unwrap_or_else(|e| e.into_inner());
-        model.reset();
+        // A supplied PrefillState lets `n > 1` choices share one prompt pass:
+        // restore the post-prefill KV/DeltaNet state and the final logits.
+        let (prompt_tokens, mut logits) = match prefill {
+            Some(ps) => {
+                model.restore(&ps.model);
+                (ps.prompt_tokens, ps.logits.clone())
+            }
+            None => {
+                if prompt_ids.is_empty() {
+                    return Err("empty prompt: no tokens to generate from".into());
+                }
+                model.reset();
+                // Prompt prefill in batches so we can report progress + tok/s.
+                const PROMPT_BATCH: usize = 32;
+                let prompt_start = std::time::Instant::now();
+                let mut logits = Vec::new();
+                let mut processed = 0usize;
+                for chunk in prompt_ids.chunks(PROMPT_BATCH) {
+                    logits = model.forward(chunk)?;
+                    processed += chunk.len();
+                    let secs = prompt_start.elapsed().as_secs_f64().max(1e-6);
+                    eprintln!(
+                        "[prompt] {}/{} tokens  ({:.1} tok/s)",
+                        processed,
+                        prompt_ids.len(),
+                        processed as f64 / secs
+                    );
+                }
+                (prompt_ids.len(), logits)
+            }
+        };
         // Clamp the generation budget to the room left in the KV cache.
         // Otherwise the final `forward(&[tok])` can cross context_size and
         // fail with a 500 after the client has already received many tokens.
@@ -405,23 +516,6 @@ impl Engine {
                 finish_reason: "length".into(),
                 logprobs: Vec::new(),
             });
-        }
-
-        // Prompt prefill in batches so we can report progress + tok/s.
-        const PROMPT_BATCH: usize = 32;
-        let prompt_start = std::time::Instant::now();
-        let mut logits = Vec::new();
-        let mut processed = 0usize;
-        for chunk in prompt_ids.chunks(PROMPT_BATCH) {
-            logits = model.forward(chunk)?;
-            processed += chunk.len();
-            let secs = prompt_start.elapsed().as_secs_f64().max(1e-6);
-            eprintln!(
-                "[prompt] {}/{} tokens  ({:.1} tok/s)",
-                processed,
-                prompt_tokens,
-                processed as f64 / secs
-            );
         }
 
         let mut rng = Rng::new(params.seed.unwrap_or_else(default_seed));
@@ -584,6 +678,21 @@ impl Engine {
         F: FnMut(&str, bool) -> bool,
         G: FnMut(&TokenLogprob),
     {
+        self.run_chat_inner_with_prefill(messages, params, None, on_token, on_logprob)
+    }
+
+    /// Prefill once for a chat request so several choices can share it.
+    pub fn prepare_chat_prefill(
+        &self,
+        messages: &[Message],
+        params: &Params,
+    ) -> Result<PrefillState, String> {
+        let prompt = self.render_chat_prompt(messages, params);
+        let ids = self.tokenizer.encode(&prompt);
+        self.prepare_prefill(&ids)
+    }
+
+    fn render_chat_prompt(&self, messages: &[Message], params: &Params) -> String {
         // With `tools`, Qwen3.5 injects a tool-definition preamble into the
         // system turn (merged with any user-supplied system message).
         let mut rendered: Vec<Message> =
@@ -607,13 +716,29 @@ impl Engine {
                 },
             );
         }
-        let prompt = apply_chat_template(&rendered, true, params.enable_thinking);
+        apply_chat_template(&rendered, true, params.enable_thinking)
+    }
+
+    pub fn run_chat_inner_with_prefill<F, G>(
+        &self,
+        messages: &[Message],
+        params: &Params,
+        prefill: Option<&PrefillState>,
+        on_token: F,
+        on_logprob: G,
+    ) -> Result<GenResult, String>
+    where
+        F: FnMut(&str, bool) -> bool,
+        G: FnMut(&TokenLogprob),
+    {
+        let prompt = self.render_chat_prompt(messages, params);
         let prompt_ids = self.tokenizer.encode(&prompt);
         self.generate_inner(
             prompt_ids,
             params,
             true,
             params.enable_thinking,
+            prefill,
             on_token,
             on_logprob,
         )
@@ -642,9 +767,37 @@ impl Engine {
         F: FnMut(&str, bool) -> bool,
         G: FnMut(&TokenLogprob),
     {
+        self.run_completion_inner_with_prefill(prompt, params, None, on_token, on_logprob)
+    }
+
+    /// Prefill once for a completions request so several choices can share it.
+    pub fn prepare_completion_prefill(
+        &self,
+        prompt: &str,
+        params: &Params,
+    ) -> Result<PrefillState, String> {
+        let prompt = apply_response_format_text(prompt, params.response_format);
+        let ids = self.tokenizer.encode(&prompt);
+        self.prepare_prefill(&ids)
+    }
+
+    pub fn run_completion_inner_with_prefill<F, G>(
+        &self,
+        prompt: &str,
+        params: &Params,
+        prefill: Option<&PrefillState>,
+        on_token: F,
+        on_logprob: G,
+    ) -> Result<GenResult, String>
+    where
+        F: FnMut(&str, bool) -> bool,
+        G: FnMut(&TokenLogprob),
+    {
         let prompt = apply_response_format_text(prompt, params.response_format);
         let prompt_ids = self.tokenizer.encode(&prompt);
-        self.generate_inner(prompt_ids, params, false, false, on_token, on_logprob)
+        self.generate_inner(
+            prompt_ids, params, false, false, prefill, on_token, on_logprob,
+        )
     }
 }
 
@@ -1653,6 +1806,14 @@ fn completion_usage_chunk(id: &str, model: &str, usage: Json) -> Json {
 }
 
 pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
+    let _admit = match engine.try_admit() {
+        Some(g) => g,
+        None => {
+            let (s, b) = json_error(429, "too many queued requests", "server_error");
+            respond(&mut stream, s, "application/json", &b);
+            return;
+        }
+    };
     let body: Json = match parse_body(&req) {
         Ok(b) => b,
         Err(e) => {
@@ -1686,6 +1847,20 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
     let id = gen_id("chatcmpl");
     let model_name = engine.model_name.clone();
     let seeds = choice_seeds(&params, params.n);
+    // For n > 1, run the prompt forward pass once and restore its state for
+    // each choice instead of re-prefilling n times.
+    let prefill = if params.n > 1 {
+        match engine.prepare_chat_prefill(&messages, &params) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                let (s, b) = json_error(500, &e, "server_error");
+                respond(&mut stream, s, "application/json", &b);
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     if stream_mode {
         let mut sse = Streamer::new(stream, 200, "text/event-stream");
@@ -1718,9 +1893,10 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
                     None
                 )
             ));
-            let res = engine.run_chat_inner(
+            let res = engine.run_chat_inner_with_prefill(
                 &messages,
                 &p,
+                prefill.as_ref(),
                 |chunk, is_reasoning| {
                     if chunk.is_empty() {
                         return true;
@@ -1889,7 +2065,13 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
         for seed in &seeds {
             let mut p = params.clone();
             p.seed = *seed;
-            match engine.run_chat(&messages, &p, |_, _| true) {
+            match engine.run_chat_inner_with_prefill(
+                &messages,
+                &p,
+                prefill.as_ref(),
+                |_, _| true,
+                |_| {},
+            ) {
                 Ok(r) => results.push(r),
                 Err(e) => {
                     let (s, b) = json_error(500, &e, "server_error");
@@ -1916,6 +2098,14 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
 }
 
 pub fn handle_completions(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
+    let _admit = match engine.try_admit() {
+        Some(g) => g,
+        None => {
+            let (s, b) = json_error(429, "too many queued requests", "server_error");
+            respond(&mut stream, s, "application/json", &b);
+            return;
+        }
+    };
     let body: Json = match parse_body(&req) {
         Ok(b) => b,
         Err(e) => {
@@ -1960,6 +2150,18 @@ pub fn handle_completions(mut stream: TcpStream, req: Request, engine: &Arc<Engi
     let id = gen_id("cmpl");
     let model_name = engine.model_name.clone();
     let seeds = choice_seeds(&params, params.n);
+    let prefill = if params.n > 1 {
+        match engine.prepare_completion_prefill(&prompt, &params) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                let (s, b) = json_error(500, &e, "server_error");
+                respond(&mut stream, s, "application/json", &b);
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     if stream_mode {
         let mut sse = Streamer::new(stream, 200, "text/event-stream");
@@ -1969,9 +2171,10 @@ pub fn handle_completions(mut stream: TcpStream, req: Request, engine: &Arc<Engi
         for (i, seed) in seeds.iter().enumerate() {
             let mut p = params.clone();
             p.seed = *seed;
-            let res = engine.run_completion_inner(
+            let res = engine.run_completion_inner_with_prefill(
                 &prompt,
                 &p,
+                prefill.as_ref(),
                 |chunk, _| {
                     if chunk.is_empty() {
                         return true;
@@ -2037,7 +2240,13 @@ pub fn handle_completions(mut stream: TcpStream, req: Request, engine: &Arc<Engi
         for seed in &seeds {
             let mut p = params.clone();
             p.seed = *seed;
-            match engine.run_completion(&prompt, &p, |_, _| true) {
+            match engine.run_completion_inner_with_prefill(
+                &prompt,
+                &p,
+                prefill.as_ref(),
+                |_, _| true,
+                |_| {},
+            ) {
                 Ok(r) => results.push(r),
                 Err(e) => {
                     let (s, b) = json_error(500, &e, "server_error");
@@ -2244,6 +2453,58 @@ mod tests {
         assert_eq!(res.completion_tokens, 0);
         assert_eq!(res.finish_reason, "length");
         assert!(res.logprobs.is_empty());
+    }
+
+    #[test]
+    fn admission_bounds_queued_requests() {
+        let engine = tiny_engine();
+        let guards: Vec<_> = (0..MAX_QUEUED_REQUESTS)
+            .map(|_| engine.try_admit().expect("slot should be available"))
+            .collect();
+        assert!(
+            engine.try_admit().is_none(),
+            "over-admission must be rejected"
+        );
+        drop(guards);
+        assert!(
+            engine.try_admit().is_some(),
+            "slots must be released on drop"
+        );
+    }
+
+    #[test]
+    fn prefill_reuse_matches_fresh_prefill() {
+        let engine = tiny_engine();
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "hi".into(),
+            ..Default::default()
+        }];
+        let params = Params {
+            temperature: 0.0,
+            max_tokens: 16,
+            enable_thinking: false,
+            seed: Some(123),
+            ..Default::default()
+        };
+
+        // Old behavior: every choice re-runs the prompt forward pass.
+        let fresh = engine.run_chat(&messages, &params, |_, _| true).unwrap();
+        // New behavior: one prefill, restored for the choice.
+        let prefill = engine.prepare_chat_prefill(&messages, &params).unwrap();
+        let reused = engine
+            .run_chat_inner_with_prefill(&messages, &params, Some(&prefill), |_, _| true, |_| {})
+            .unwrap();
+
+        assert_eq!(fresh.text, reused.text);
+        assert_eq!(fresh.reasoning_content, reused.reasoning_content);
+        assert_eq!(fresh.completion_tokens, reused.completion_tokens);
+        assert_eq!(fresh.finish_reason, reused.finish_reason);
+        assert_eq!(fresh.logprobs.len(), reused.logprobs.len());
+        for (a, b) in fresh.logprobs.iter().zip(&reused.logprobs) {
+            assert_eq!(a.token_id, b.token_id);
+            assert!((a.logprob - b.logprob).abs() < 1e-5);
+        }
     }
 
     #[test]
@@ -2922,6 +3183,63 @@ mod tests {
             total as f64 / secs,
             res.completion_tokens as f64 / secs,
             res.finish_reason
+        );
+    }
+
+    /// Opt-in benchmark for the `n > 1` prefill reuse. Compare the time for
+    /// `n` fresh prefills against one prefill + n restored decodes.
+    ///   EXLLAMA_BENCH_MODEL=/path cargo test --release \
+    ///       bench_n_choices_prefill_reuse -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_n_choices_prefill_reuse() {
+        let dir = match std::env::var("EXLLAMA_BENCH_MODEL") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let model = crate::model::Model::load(&dir, 4096, 4, "f32").unwrap();
+        let tok_path = std::path::Path::new(&dir).join("tokenizer.json");
+        let tokenizer = Tokenizer::load(&tok_path.to_string_lossy()).unwrap();
+        let engine = Engine::new(model, tokenizer, "bench".into(), 32, 4, false);
+        let params = Params {
+            temperature: 0.0,
+            max_tokens: 16,
+            enable_thinking: false,
+            ..Default::default()
+        };
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "Count: 1, 2, 3, 4,".into(),
+            ..Default::default()
+        }];
+        const N: usize = 8;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..N {
+            engine.run_chat(&messages, &params, |_, _| true).unwrap();
+        }
+        let fresh = t0.elapsed().as_secs_f64();
+
+        let t0 = std::time::Instant::now();
+        let prefill = engine.prepare_chat_prefill(&messages, &params).unwrap();
+        for _ in 0..N {
+            engine
+                .run_chat_inner_with_prefill(
+                    &messages,
+                    &params,
+                    Some(&prefill),
+                    |_, _| true,
+                    |_| {},
+                )
+                .unwrap();
+        }
+        let reused = t0.elapsed().as_secs_f64();
+        eprintln!(
+            "BENCH n={}: fresh={:.2}s reused={:.2}s speedup={:.2}x",
+            N,
+            fresh,
+            reused,
+            fresh / reused.max(1e-6)
         );
     }
 

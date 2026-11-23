@@ -61,8 +61,8 @@ checked off with a short note; open items are unchecked.
   grouping/scale/gate and the DeltaNet recurrence (with decay). `model.rs`
   now has 7 unit tests.
 - [x] **(P1) Fix doc drift.** Done — `AGENTS.md` counts/line numbers, `TODO.md`
-  stale "next steps", and this plan's baseline are updated to 99 passed /
-  10 ignored (88 after Phase 0).
+  stale "next steps", and this plan's baseline are updated to 102 passed /
+  11 ignored (88 after Phase 0, 99 after Phase 1).
 - [x] **(P1) Bounded request-line reading.** Done — see plan Phase 1 #4:
   `read_request()` reads the request line and headers through
   `Read::take(MAX_HEADER_BYTES + 1)` and rejects overlong lines. `http::tests`
@@ -109,8 +109,11 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
   drops all non-plain tensor byte ranges before plain tensors are decoded.
   `Shards` itself is dropped when `Exl3Model::load` returns.
 - [x] **(P1) BLAS/GPU compute backends.** Done — `src/compute.rs` with `matrixmultiply::sgemm` (pure-Rust SIMD BLAS) and opt-in `candle-core` GPU (features `gpu-metal`/`gpu-cuda`), auto-selected at startup by a GEMV micro-benchmark. CLI `--compute auto|blas|gpu|scalar`. Key finding: for memory-bound decode GEMV the hand-written threaded dot is 3-4x faster than sgemm, so `auto` usually picks `scalar`; BLAS/GPU help matrix-matrix batches.
-- [ ] **(P2) Batched / continuous inference.** `Engine.model` is a `Mutex<Model>` and serializes all requests. Add a request queue, or support `n > 1` by expanding the prompt batch.
-- [ ] **(P2) KV cache quantization.** Cache is f32 `(ctx, heads, head_dim)`; f16 or int8 could double context within the same RAM.
+- [x] **(P2) GPU weight-cache key.** Done — see plan Phase 2 #13: cache keys
+  include a sampled-weight fingerprint so a recycled pointer cannot reuse a
+  stale device tensor. GPU-only test added.
+- [ ] **(P2) Batched / continuous inference (partially done, see plan #11).** `n > 1` choices now share one prefill, and bounded admission (16 queued requests, 429 on overflow) prevents thread pileup. True multi-request batching / multiple Model instances deferred — needs shared weights split from per-request state, or N full copies (RAM scales linearly). See `AGENTS.md` §8.
+- [x] **(P2) KV cache quantization.** Done — full-attention KV cache stores fp16 bits (2 bytes/value) and decodes the used prefix via the `half_f32` LUT per step, halving context RAM. `model::tests::kv_cache_stores_fp16_bits` added.
 - [x] **(P2) Precompute RoPE cos/sin tables.** Done — tables built once at load; DeltaNet per-head scratch is also reused.
 - [x] **(P1) Guard the global threadpool against concurrent `run()` calls.** Done
   — see plan Phase 1 #5: a global `RUN_LOCK` serializes whole `run()` calls,
@@ -118,9 +121,9 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 - [x] **(P1) Catch dimension mismatches in `tensor::dot()`.** Done — see plan
   Phase 1 #6: `dot()` and `exl3::dot_f16()` assert equal lengths; `parse_cli()`
   uses one iterator and clamps context size / thread count. Tests added.
-- [ ] **(P2) Reuse post-prefill state for `n > 1`.** See plan Phase 2 #10: each
-  choice currently re-prefills the whole prompt; snapshot/restore after prefill
-  so `n=8` is not 8x the work.
+- [x] **(P2) Reuse post-prefill state for `n > 1`.** Done — see plan Phase 2
+  #10: `Model::snapshot()/restore()` + `Engine::prepare_*_prefill()` let all
+  choices share one prompt pass; equivalence test and opt-in benchmark added.
 
 ---
 
@@ -207,18 +210,19 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 ## Suggested Next Steps (ordered)
 
 The authoritative phased plan (with acceptance criteria) is
-[`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md). **Phases 0 and 1 are complete**;
-execute the remaining phases in this order:
+[`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md). **Phases 0–2 are complete** (Phase
+2 with documented deferrals); execute the remaining work in this order:
 
-1. **Phase 2 — performance (start here, measure first).** Reuse post-prefill
-   state for `n > 1`, then batching, f16 KV cache / tied embeddings, GPU cache
-   key fix.
+1. **Deferred Phase 2 work (measure first):** true multi-request batching /
+   split shared weights, f16 tied-model embedding with a threaded lm_head
+   matmul, packed-mode SIMD gather. See plan items 11–12 and `AGENTS.md` §8.
 2. **Phase 3 — exploration.** Vision, other architectures, NFC / `chat_template`
    loading, structured logging, Anthropic endpoint.
 3. **Manual validation still worth doing:** the end-to-end benchmark
    (`EXLLAMA_BENCH_MODEL=/path cargo test --release bench_generation_throughput -- --ignored --nocapture`),
    a real-client SSE smoke test (`curl -N`), and real-model runs on 2B/4B/9B
-   and MUL1 codebooks (only the 0.8B 8-bpw MCG model has been exercised).
+   and MUL1 codebooks (only the 0.8B 8-bpw MCG model has been exercised), and
+   `bench_n_choices_prefill_reuse` to confirm sublinear `n > 1` cost.
 
 Commit only on explicit approval — see the status note in `IMPROVEMENT_PLAN.md`.
 

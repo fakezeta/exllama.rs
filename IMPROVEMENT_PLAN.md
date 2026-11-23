@@ -7,18 +7,19 @@ module. It complements `TODO.md`: that file tracks individual checked-off tasks,
 while this file groups the *open* work into executable phases with acceptance
 criteria.
 
-> **Status:** Phases 0 and 1 are **implemented and verified** (see the
-> completion notes below); Phases 2–3 remain plans. Commit only on explicit
-> approval.
+> **Status:** Phases 0 and 1 are **implemented and verified**; Phase 2 is
+> **implemented with documented deferrals** (see the completion notes below);
+> Phase 3 remains a plan. Commit only on explicit approval.
 
 ## Baseline (at time of review)
 
 - Branch `main`, tag `v0.4.2`, working tree clean at review time.
 - At review: `cargo test` **84 passed, 4 ignored**. After Phase 0:
-  **88 passed, 10 ignored**. After Phase 1: **99 passed, 10 ignored** (6
-  real-model / `/tmp` fixtures explicitly ignored with reasons, 4 benchmarks).
-  `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`
-  remain clean.
+  **88 passed, 10 ignored**. After Phase 1: **99 passed, 10 ignored**. After
+  Phase 2: **102 passed, 11 ignored** (6 real-model / `/tmp` fixtures explicitly
+  ignored with reasons, 5 benchmarks). `cargo fmt --all -- --check` and
+  `cargo clippy --all-targets -- -D warnings` remain clean; the GPU feature
+  also compiles and its cache-key test passes.
 - The **forward math is correct**. `src/model.rs` matches both `AGENTS.md` §6
   and the upstream HuggingFace `modeling_qwen3_5.py` / `modeling_qwen3_next.py`
   reference on every subtlety checked: q_proj `[query|gate]` per-head
@@ -177,11 +178,24 @@ tests silently return early when `/tmp` files are absent.
     prefill and restore it per choice; `n=8` should not cost `8x` prefill.
     *Acceptance:* benchmark shows sublinear cost growth for `n`; equivalence
     test confirms identical outputs for the same seed.
+    **Done:** `Model::snapshot()/restore()` copy only the used KV prefix plus
+    DeltaNet state; `Engine::prepare_*_prefill()` captures the post-prefill
+    logits, and both endpoints prepare once when `n > 1`. Equivalence test
+    `prefill_reuse_matches_fresh_prefill` passes; opt-in benchmark
+    `bench_n_choices_prefill_reuse` reports fresh vs reused timing.
 
 11. **Batched / continuous inference.** `Engine.model: Mutex<Model>` serializes
     all requests. Add a request queue and batch prefill via the existing
     multi-row sgemm path; potentially allow multiple `Model` instances behind
     a semaphore rather than a single mutex. This is the main throughput ceiling.
+    **Partially done / deferred:** bounded admission (`Engine::try_admit()`,
+    `MAX_QUEUED_REQUESTS = 16`, RAII guard, 429 on overflow) prevents thread
+    pileup, and `n > 1` choices share one prefill (item 10). True multi-request
+    batching / multiple model instances is deferred: it needs shared weights
+    split from per-request state (or N full model copies, with RAM scaling
+    linearly), plus batch-aware attention and DeltaNet — a large refactor with
+    no correctness safety net on this codebase. Rationale recorded in
+    `AGENTS.md` §8.
 
 12. **Memory optimizations (in order of value).**
     - f16 KV cache with per-step f32 upcast (halves context RAM).
@@ -192,11 +206,23 @@ tests silently return early when `/tmp` files are absent.
       the dot product).
     *Acceptance:* before/after numbers from `bench_generation_throughput` and
     peak-RSS measurements; no correctness regression.
+    **Partially done / deferred:** the full-attention KV cache now stores fp16
+    bits (`Vec<u16>`, 2 bytes/value) and decodes the used prefix through the
+    `half_f32` LUT each step — halving context RAM. `model::tests::kv_cache_stores_fp16_bits`
+    locks the layout down; all generation/HTTP tests still pass. The tied-model
+    f16 embedding is deferred (requires a new threaded f16 lm_head matmul to
+    avoid a per-token full-table decode), as is the packed-mode SIMD gather
+    (explicitly low priority). Real-model RSS numbers still require running the
+    benchmarks with `EXLLAMA_BENCH_MODEL`.
 
 13. **GPU weight-cache key.** `compute.rs` (~270-289) keys cached device
     tensors by raw pointer; an address reuse can yield a stale entry (bounded
     by a 512-entry clear). Key by tensor identity/generation instead.
     *Acceptance:* a reuse test forces the eviction path and verifies refresh.
+    **Done:** the GPU cache key is now `(pointer, rows, cols, fingerprint)`,
+    where the fingerprint is FNV-1a over sampled weight elements (including the
+    last). A GPU-only test verifies different buffers map to different keys;
+    `cargo check --features gpu` passes.
 
 ---
 
@@ -217,9 +243,8 @@ tests silently return early when `/tmp` files are absent.
 
 ## Suggested execution order
 
-**Phase 0 and Phase 1 are complete** → **Phase 2 → Phase 3**. Phase 1 closed
-the request-line OOM vector, the threadpool cross-call deadlock, silent
-dimension mismatches, SSE ordering/usage/tool-call gaps, unbounded generation
-and the regex DoS vector. Start the remaining work with Phase 2 item 10
-(reusing post-prefill state for `n > 1`) and measure before changing matmul
-paths. Do not commit until the user explicitly approves.
+**Phases 0–2 are implemented** (Phase 2 with the deferrals noted in items 11
+and 12) → **Phase 3**. Phase 2 added shared prefill for `n > 1`, bounded
+admission, and a fp16 KV cache; measure with `EXLLAMA_BENCH_MODEL` before
+tackling the deferred multi-request batching / f16 tied embedding / packed SIMD
+work. Do not commit until the user explicitly approves.
