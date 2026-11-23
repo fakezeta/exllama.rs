@@ -188,7 +188,9 @@ impl Streamer {
         true
     }
 
-    pub fn end(mut self) {
+    /// Terminate the chunked body. Takes `&mut self` so callers that share a
+    /// mutable borrow with generation callbacks can still finish the stream.
+    pub fn end(&mut self) {
         if !self.failed {
             self.put(b"0\r\n\r\n");
             let _ = self.writer.flush();

@@ -5,11 +5,20 @@ use crate::http::{respond, Request, Streamer};
 use crate::model::Model;
 use crate::tokenizer::Tokenizer;
 use crate::{json::Json, rng::Rng};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ResponseFormat {
+    #[default]
+    Text,
+    JsonObject,
+}
+
+#[derive(Clone)]
 pub struct Params {
     pub temperature: f32,
     pub top_p: f32,
@@ -27,6 +36,16 @@ pub struct Params {
     pub enable_thinking: bool,
     /// OpenAI `tools` array, rendered into the system prompt by `run_chat`.
     pub tools: Option<Json>,
+    /// Number of completions per prompt (`n`). Generated sequentially.
+    pub n: usize,
+    /// OpenAI abuse-monitoring field. Accepted and validated, otherwise unused.
+    pub user: Option<String>,
+    pub response_format: ResponseFormat,
+    /// Include per-token log probabilities in the response.
+    pub logprobs: bool,
+    /// Number of alternative tokens reported per position (top_logprobs for
+    /// chat, `logprobs: N` for completions). Capped at MAX_TOP_LOGPROBS.
+    pub top_logprobs: usize,
 }
 
 impl Default for Params {
@@ -46,8 +65,30 @@ impl Default for Params {
             include_usage: false,
             enable_thinking: true, // Qwen3.5-9B / 4B default
             tools: None,
+            n: 1,
+            user: None,
+            response_format: ResponseFormat::Text,
+            logprobs: false,
+            top_logprobs: 0,
         }
     }
+}
+
+/// A single token's log probability (used for top_logprobs entries).
+#[derive(Clone, Debug)]
+pub struct Logprob {
+    pub token: String,
+    pub token_id: u32,
+    pub logprob: f32,
+}
+
+/// Log probability of a generated token plus its most likely alternatives.
+#[derive(Clone, Debug)]
+pub struct TokenLogprob {
+    pub token: String,
+    pub token_id: u32,
+    pub logprob: f32,
+    pub top: Vec<Logprob>,
 }
 
 pub struct GenResult {
@@ -57,6 +98,9 @@ pub struct GenResult {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub finish_reason: String,
+    /// One entry per generated completion token (empty unless `logprobs` is on).
+    /// Delimiters and stop tokens are excluded, matching `completion_tokens`.
+    pub logprobs: Vec<TokenLogprob>,
 }
 
 /// Qwen3.5 added-token ids used as reasoning delimiters.
@@ -293,10 +337,33 @@ impl Engine {
         params: &Params,
         split_reasoning: bool,
         start_in_reasoning: bool,
-        mut on_token: F,
+        on_token: F,
     ) -> Result<GenResult, String>
     where
         F: FnMut(&str, bool) -> bool,
+    {
+        self.generate_inner(
+            prompt_ids,
+            params,
+            split_reasoning,
+            start_in_reasoning,
+            on_token,
+            |_| {},
+        )
+    }
+
+    fn generate_inner<F, G>(
+        &self,
+        prompt_ids: Vec<u32>,
+        params: &Params,
+        split_reasoning: bool,
+        start_in_reasoning: bool,
+        mut on_token: F,
+        mut on_logprob: G,
+    ) -> Result<GenResult, String>
+    where
+        F: FnMut(&str, bool) -> bool,
+        G: FnMut(&TokenLogprob),
     {
         let prompt_tokens = prompt_ids.len();
         if prompt_tokens == 0 {
@@ -327,6 +394,7 @@ impl Engine {
                 prompt_tokens,
                 completion_tokens: 0,
                 finish_reason: "length".into(),
+                logprobs: Vec::new(),
             });
         }
 
@@ -349,6 +417,7 @@ impl Engine {
 
         let mut rng = Rng::new(params.seed.unwrap_or_else(default_seed));
         let mut completion: Vec<u32> = Vec::with_capacity(max_tokens);
+        let mut logprobs: Vec<TokenLogprob> = Vec::new();
         let mut router =
             OutputRouter::new(split_reasoning, start_in_reasoning, params.stop.clone());
         let mut finish = String::from("length");
@@ -404,7 +473,24 @@ impl Engine {
                 }
                 continue;
             }
+            // Compute logprobs from the same (penalty-adjusted) distribution
+            // that `sample` used, before sampling transforms (temperature,
+            // top-k, top-p) are applied — the vLLM/SGLang convention.
+            let lp_info = params.logprobs.then(|| {
+                logprob_info(
+                    &logits,
+                    params,
+                    &completion,
+                    tok,
+                    params.top_logprobs,
+                    &self.tokenizer,
+                )
+            });
             completion.push(tok);
+            if let Some(info) = lp_info {
+                on_logprob(&info);
+                logprobs.push(info);
+            }
 
             // Decode bytes are assembled into complete UTF-8 characters, then
             // routed through the stop-string tail buffer before streaming.
@@ -448,6 +534,7 @@ impl Engine {
             prompt_tokens,
             completion_tokens: completion.len(),
             finish_reason: finish,
+            logprobs,
         })
     }
 
@@ -460,9 +547,24 @@ impl Engine {
     where
         F: FnMut(&str, bool) -> bool,
     {
+        self.run_chat_inner(messages, params, on_token, |_| {})
+    }
+
+    pub fn run_chat_inner<F, G>(
+        &self,
+        messages: &[Message],
+        params: &Params,
+        on_token: F,
+        on_logprob: G,
+    ) -> Result<GenResult, String>
+    where
+        F: FnMut(&str, bool) -> bool,
+        G: FnMut(&TokenLogprob),
+    {
         // With `tools`, Qwen3.5 injects a tool-definition preamble into the
         // system turn (merged with any user-supplied system message).
-        let mut rendered: Vec<Message> = messages.to_vec();
+        let mut rendered: Vec<Message> =
+            apply_response_format_chat(messages, params.response_format);
         if let Some(tools) = &params.tools {
             let mut sys = tools_system_prompt(tools);
             if rendered.first().is_some_and(|m| m.role == "system") {
@@ -484,7 +586,14 @@ impl Engine {
         }
         let prompt = apply_chat_template(&rendered, true, params.enable_thinking);
         let prompt_ids = self.tokenizer.encode(&prompt);
-        self.generate(prompt_ids, params, true, params.enable_thinking, on_token)
+        self.generate_inner(
+            prompt_ids,
+            params,
+            true,
+            params.enable_thinking,
+            on_token,
+            on_logprob,
+        )
     }
 
     pub fn run_completion<F>(
@@ -496,8 +605,23 @@ impl Engine {
     where
         F: FnMut(&str, bool) -> bool,
     {
-        let prompt_ids = self.tokenizer.encode(prompt);
-        self.generate(prompt_ids, params, false, false, on_token)
+        self.run_completion_inner(prompt, params, on_token, |_| {})
+    }
+
+    pub fn run_completion_inner<F, G>(
+        &self,
+        prompt: &str,
+        params: &Params,
+        on_token: F,
+        on_logprob: G,
+    ) -> Result<GenResult, String>
+    where
+        F: FnMut(&str, bool) -> bool,
+        G: FnMut(&TokenLogprob),
+    {
+        let prompt = apply_response_format_text(prompt, params.response_format);
+        let prompt_ids = self.tokenizer.encode(&prompt);
+        self.generate_inner(prompt_ids, params, false, false, on_token, on_logprob)
     }
 }
 
@@ -509,16 +633,25 @@ fn is_stop_token(tok: u32, tokz: &Tokenizer) -> bool {
 /// `history` is the tokens generated so far; each distinct token in it gets
 /// its logit divided by `repetition_penalty` (positive) or multiplied (negative),
 /// which breaks greedy repetition loops when the penalty is > 1.
-fn sample(logits: &[f32], params: &Params, rng: &mut Rng, history: &[u32]) -> u32 {
+fn prepare_logits<'a>(
+    logits: &'a [f32],
+    params: &Params,
+    history: &[u32],
+    buf: &'a mut Vec<f32>,
+) -> &'a [f32] {
     let rep = params.repetition_penalty;
     let need_copy = (rep > 0.0 && rep != 1.0)
         || params.presence_penalty != 0.0
         || params.frequency_penalty != 0.0
         || !params.logit_bias.is_empty();
     // Only copy the logits when some logit adjustment actually applies.
-    let mut penalized;
-    let logits = if need_copy {
-        penalized = logits.to_vec();
+    if !need_copy {
+        return logits;
+    }
+    buf.clear();
+    buf.extend_from_slice(logits);
+    {
+        let penalized = &mut buf[..];
         let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for &t in history {
             let i = t as usize;
@@ -549,10 +682,16 @@ fn sample(logits: &[f32], params: &Params, rng: &mut Rng, history: &[u32]) -> u3
                 penalized[i] += bias;
             }
         }
-        &penalized[..]
-    } else {
-        logits
-    };
+    }
+    buf
+}
+
+/// Sample after applying logit processors (penalties and bias), sharing that
+/// work with `logprob_info` so reported probabilities match the distribution
+/// the token was drawn from.
+fn sample(logits: &[f32], params: &Params, rng: &mut Rng, history: &[u32]) -> u32 {
+    let mut buf = Vec::new();
+    let logits = prepare_logits(logits, params, history, &mut buf);
 
     let temp = params.temperature;
     if temp <= 0.0 {
@@ -636,6 +775,103 @@ fn argmax(v: &[f32]) -> u32 {
         }
     }
     best as u32
+}
+
+/// Hard cap aligned with OpenAI (`top_logprobs` <= 20, `n` <= 128).
+const MAX_TOP_LOGPROBS: usize = 20;
+const MAX_N: usize = 128;
+const JSON_HINT: &str =
+    "\n\nRespond with a single valid JSON object and nothing else. Do not use markdown code fences.";
+
+/// JSON mode is best-effort: we strengthen the prompt but cannot constrain the
+/// decoder without a grammar engine. No output validation/retry is attempted.
+fn apply_response_format_text<'a>(
+    prompt: &'a str,
+    fmt: ResponseFormat,
+) -> std::borrow::Cow<'a, str> {
+    if fmt != ResponseFormat::JsonObject {
+        return std::borrow::Cow::Borrowed(prompt);
+    }
+    let mut out = String::with_capacity(prompt.len() + JSON_HINT.len());
+    out.push_str(prompt);
+    out.push_str(JSON_HINT);
+    std::borrow::Cow::Owned(out)
+}
+
+fn apply_response_format_chat(messages: &[Message], fmt: ResponseFormat) -> Vec<Message> {
+    let mut out = messages.to_vec();
+    if fmt != ResponseFormat::JsonObject {
+        return out;
+    }
+    if let Some(last) = out.last_mut() {
+        if last.role == "user" {
+            last.content.push_str(JSON_HINT);
+            return out;
+        }
+    }
+    out.push(Message {
+        role: "user".into(),
+        content: JSON_HINT.trim_start().to_string(),
+        ..Default::default()
+    });
+    out
+}
+
+/// Each choice gets a distinct RNG stream; with a supplied seed choice 0 keeps
+/// that exact seed and later choices use increasing seeds. Greedy (temp 0)
+/// requests still produce identical choices, as with OpenAI.
+fn choice_seeds(params: &Params, n: usize) -> Vec<Option<u64>> {
+    let base = params.seed.unwrap_or_else(default_seed);
+    (0..n).map(|i| Some(base.wrapping_add(i as u64))).collect()
+}
+
+/// Log probability of `tok` plus the `top_n` most likely alternatives, taken
+/// from the same processed logits used for sampling (before temperature/top-p).
+fn logprob_info(
+    logits: &[f32],
+    params: &Params,
+    history: &[u32],
+    tok: u32,
+    top_n: usize,
+    tokz: &Tokenizer,
+) -> TokenLogprob {
+    let mut buf = Vec::new();
+    let p = prepare_logits(logits, params, history, &mut buf);
+    let (max, sum) = if p.is_empty() {
+        (0.0f64, 1.0f64)
+    } else {
+        let max = p.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let max = if max.is_finite() { max } else { 0.0 };
+        let sum: f64 = p.iter().map(|&v| (v as f64 - max).exp()).sum();
+        (max, sum)
+    };
+    let lp = |v: f32| (v as f64 - max - sum.ln()) as f32;
+
+    let mut top: Vec<(usize, f32)> = p.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    let k = top_n.min(top.len());
+    if k < top.len() {
+        top.select_nth_unstable_by(k, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    top.truncate(k);
+    top.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top = top
+        .into_iter()
+        .map(|(id, v)| Logprob {
+            token: tokz.decode(&[id as u32], false),
+            token_id: id as u32,
+            logprob: lp(v),
+        })
+        .collect();
+
+    let id = (tok as usize).min(p.len().saturating_sub(1));
+    TokenLogprob {
+        token: tokz.decode(&[tok], false),
+        token_id: tok,
+        logprob: p.get(id).map(|&v| lp(v)).unwrap_or(f32::NEG_INFINITY),
+        top,
+    }
 }
 
 /// Parse a `stop` field that may be a string, array of strings, or null.
@@ -788,7 +1024,18 @@ fn check_model(body: &Json, engine: &Engine) -> Result<(), (u16, String)> {
     Ok(())
 }
 
-fn parse_params(body: &Json, engine: &Engine) -> Result<Params, (u16, String)> {
+pub(crate) fn parse_params(body: &Json, engine: &Engine) -> Result<Params, (u16, String)> {
+    parse_params_inner(body, engine, true)
+}
+
+pub(crate) fn parse_completion_params(
+    body: &Json,
+    engine: &Engine,
+) -> Result<Params, (u16, String)> {
+    parse_params_inner(body, engine, false)
+}
+
+fn parse_params_inner(body: &Json, engine: &Engine, chat: bool) -> Result<Params, (u16, String)> {
     let bad = |msg: &str| json_error(400, msg, "invalid_request_error");
     let mut p = Params {
         enable_thinking: engine.default_enable_thinking,
@@ -866,6 +1113,68 @@ fn parse_params(body: &Json, engine: &Engine) -> Result<Params, (u16, String)> {
         .get("tools")
         .and_then(|v| v.as_arr())
         .map(|a| Json::Arr(a.to_vec()));
+
+    if let Some(v) = json_int(body, "n")? {
+        if !(1..=MAX_N as i64).contains(&v) {
+            return Err(bad(&format!("n must be in [1, {}]", MAX_N)));
+        }
+        p.n = v as usize;
+    }
+    match body.get("user") {
+        None | Some(Json::Null) => {}
+        Some(Json::Str(s)) => p.user = Some(s.clone()),
+        Some(_) => return Err(bad("user must be a string")),
+    }
+    if let Some(v) = body.get("response_format") {
+        if !v.is_null() {
+            let ty = v
+                .get("type")
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| bad("response_format.type must be a string"))?;
+            p.response_format = match ty {
+                "text" => ResponseFormat::Text,
+                "json_object" => ResponseFormat::JsonObject,
+                other => {
+                    return Err(bad(&format!(
+                        "unsupported response_format type '{}' (supported: text, json_object)",
+                        other
+                    )))
+                }
+            };
+        }
+    }
+    if chat {
+        // Chat uses `logprobs: bool` + `top_logprobs: 0..=20`.
+        match body.get("logprobs") {
+            None | Some(Json::Null) => {}
+            Some(Json::Bool(v)) => p.logprobs = *v,
+            Some(_) => return Err(bad("logprobs must be a boolean for chat completions")),
+        }
+        if let Some(v) = json_int(body, "top_logprobs")? {
+            if !(0..=MAX_TOP_LOGPROBS as i64).contains(&v) {
+                return Err(bad(&format!(
+                    "top_logprobs must be in [0, {}]",
+                    MAX_TOP_LOGPROBS
+                )));
+            }
+            p.top_logprobs = v as usize;
+        }
+        if p.top_logprobs > 0 && !p.logprobs {
+            return Err(bad("top_logprobs requires logprobs: true"));
+        }
+    } else {
+        // Completions use `logprobs: N` (N alternatives per token).
+        if let Some(v) = json_int(body, "logprobs")? {
+            if !(0..=MAX_TOP_LOGPROBS as i64).contains(&v) {
+                return Err(bad(&format!(
+                    "logprobs must be in [0, {}]",
+                    MAX_TOP_LOGPROBS
+                )));
+            }
+            p.logprobs = true;
+            p.top_logprobs = v as usize;
+        }
+    }
     Ok(p)
 }
 
@@ -875,7 +1184,7 @@ fn want_stream(body: &Json) -> bool {
         .unwrap_or(false)
 }
 
-fn parse_messages(body: &Json) -> Result<Vec<Message>, (u16, String)> {
+pub(crate) fn parse_messages(body: &Json) -> Result<Vec<Message>, (u16, String)> {
     let arr = body
         .get("messages")
         .and_then(|v| v.as_arr())
@@ -944,16 +1253,99 @@ fn parse_messages(body: &Json) -> Result<Vec<Message>, (u16, String)> {
 }
 
 fn usage_json(r: &GenResult) -> Json {
+    usage_from(std::slice::from_ref(r))
+}
+
+/// For `n > 1` OpenAI usage is the total across all choices.
+fn usage_from(results: &[GenResult]) -> Json {
+    let prompt: usize = results.iter().map(|r| r.prompt_tokens).sum();
+    let completion: usize = results.iter().map(|r| r.completion_tokens).sum();
     Json::Obj(vec![
-        ("prompt_tokens".into(), Json::Num(r.prompt_tokens as f64)),
-        (
-            "completion_tokens".into(),
-            Json::Num(r.completion_tokens as f64),
-        ),
+        ("prompt_tokens".into(), Json::Num(prompt as f64)),
+        ("completion_tokens".into(), Json::Num(completion as f64)),
         (
             "total_tokens".into(),
-            Json::Num((r.prompt_tokens + r.completion_tokens) as f64),
+            Json::Num((prompt + completion) as f64),
         ),
+    ])
+}
+
+fn logprob_json(l: &Logprob) -> Json {
+    Json::Obj(vec![
+        ("token".into(), Json::Str(l.token.clone())),
+        ("token_id".into(), Json::Num(l.token_id as f64)),
+        (
+            "logprob".into(),
+            if l.logprob.is_finite() {
+                Json::Num(l.logprob as f64)
+            } else {
+                Json::Null
+            },
+        ),
+    ])
+}
+
+fn token_logprob_json(t: &TokenLogprob) -> Json {
+    Json::Obj(vec![
+        ("token".into(), Json::Str(t.token.clone())),
+        ("token_id".into(), Json::Num(t.token_id as f64)),
+        (
+            "logprob".into(),
+            if t.logprob.is_finite() {
+                Json::Num(t.logprob as f64)
+            } else {
+                Json::Null
+            },
+        ),
+        (
+            "top_logprobs".into(),
+            Json::Arr(t.top.iter().map(logprob_json).collect()),
+        ),
+    ])
+}
+
+/// Chat choices carry `logprobs.content`, an array aligned with the output tokens.
+fn chat_logprobs_json(tokens: &[TokenLogprob]) -> Json {
+    Json::Obj(vec![(
+        "content".into(),
+        Json::Arr(tokens.iter().map(token_logprob_json).collect()),
+    )])
+}
+
+/// Completions use the parallel-array shape with byte `text_offset`s.
+fn completion_logprobs_json(tokens: &[TokenLogprob]) -> Json {
+    let mut texts = Vec::new();
+    let mut logps = Vec::new();
+    let mut tops = Vec::new();
+    let mut offsets = Vec::new();
+    let mut offset = 0usize;
+    for t in tokens {
+        texts.push(Json::Str(t.token.clone()));
+        logps.push(if t.logprob.is_finite() {
+            Json::Num(t.logprob as f64)
+        } else {
+            Json::Null
+        });
+        tops.push(Json::Arr(
+            t.top
+                .iter()
+                .map(|x| {
+                    if x.logprob.is_finite() {
+                        Json::Num(x.logprob as f64)
+                    } else {
+                        Json::Null
+                    }
+                })
+                .collect(),
+        ));
+        offsets.push(Json::Num(offset as f64));
+        offset += t.token.len();
+    }
+    Json::Obj(vec![
+        ("tokens".into(), Json::Arr(texts)),
+        ("token_logprobs".into(), Json::Arr(logps)),
+        ("top_logprobs".into(), Json::Arr(tops)),
+        ("text_offset".into(), Json::Arr(offsets)),
     ])
 }
 
@@ -961,10 +1353,12 @@ fn usage_json(r: &GenResult) -> Json {
 fn chat_chunk_json(
     id: &str,
     model: &str,
+    index: usize,
     delta_role: Option<&str>,
     content: Option<&str>,
     reasoning: Option<&str>,
     finish: Option<&str>,
+    logprobs: Option<Json>,
     usage: Option<Json>,
 ) -> Json {
     let mut delta: Vec<(String, Json)> = Vec::new();
@@ -977,8 +1371,8 @@ fn chat_chunk_json(
     if let Some(r) = reasoning {
         delta.push(("reasoning_content".into(), Json::Str(r.into())));
     }
-    let choice = Json::Obj(vec![
-        ("index".into(), Json::Num(0.0)),
+    let mut choice: Vec<(String, Json)> = vec![
+        ("index".into(), Json::Num(index as f64)),
         ("delta".into(), Json::Obj(delta)),
         (
             "finish_reason".into(),
@@ -987,13 +1381,16 @@ fn chat_chunk_json(
                 None => Json::Null,
             },
         ),
-    ]);
+    ];
+    if let Some(lp) = logprobs {
+        choice.push(("logprobs".into(), lp));
+    }
     let mut obj = vec![
         ("id".into(), Json::Str(id.into())),
         ("object".into(), Json::Str("chat.completion.chunk".into())),
         ("created".into(), Json::Num(now())),
         ("model".into(), Json::Str(model.into())),
-        ("choices".into(), Json::Arr(vec![choice])),
+        ("choices".into(), Json::Arr(vec![Json::Obj(choice)])),
     ];
     if let Some(u) = usage {
         obj.push(("usage".into(), u));
@@ -1009,7 +1406,108 @@ fn chat_chunk(
     reasoning: Option<&str>,
     finish: Option<&str>,
 ) -> String {
-    chat_chunk_json(id, model, delta_role, content, reasoning, finish, None).to_string()
+    chat_chunk_json(
+        id, model, 0, delta_role, content, reasoning, finish, None, None,
+    )
+    .to_string()
+}
+
+/// Non-streaming chat choice, including optional tool calls and logprobs.
+fn chat_choice(r: &GenResult, index: usize, logprobs: bool) -> Json {
+    let (clean_text, calls) = parse_tool_calls(&r.text);
+    let finish = if calls.is_empty() {
+        r.finish_reason.clone()
+    } else {
+        "tool_calls".to_string()
+    };
+    let mut message: Vec<(String, Json)> = vec![
+        ("role".into(), Json::Str("assistant".into())),
+        ("content".into(), Json::Str(clean_text)),
+    ];
+    if !r.reasoning_content.is_empty() {
+        message.push((
+            "reasoning_content".into(),
+            Json::Str(r.reasoning_content.clone()),
+        ));
+    }
+    if !calls.is_empty() {
+        let arr: Vec<Json> = calls
+            .iter()
+            .map(|c| {
+                Json::Obj(vec![
+                    ("id".into(), Json::Str(c.id.clone())),
+                    ("type".into(), Json::Str("function".into())),
+                    (
+                        "function".into(),
+                        Json::Obj(vec![
+                            ("name".into(), Json::Str(c.name.clone())),
+                            ("arguments".into(), Json::Str(c.arguments.clone())),
+                        ]),
+                    ),
+                ])
+            })
+            .collect();
+        message.push(("tool_calls".into(), Json::Arr(arr)));
+    }
+    Json::Obj(vec![
+        ("index".into(), Json::Num(index as f64)),
+        ("message".into(), Json::Obj(message)),
+        ("finish_reason".into(), Json::Str(finish)),
+        (
+            "logprobs".into(),
+            if logprobs {
+                chat_logprobs_json(&r.logprobs)
+            } else {
+                Json::Null
+            },
+        ),
+    ])
+}
+
+fn completion_choice(r: &GenResult, index: usize, logprobs: bool) -> Json {
+    Json::Obj(vec![
+        ("text".into(), Json::Str(r.text.clone())),
+        ("index".into(), Json::Num(index as f64)),
+        (
+            "logprobs".into(),
+            if logprobs {
+                completion_logprobs_json(&r.logprobs)
+            } else {
+                Json::Null
+            },
+        ),
+        ("finish_reason".into(), Json::Str(r.finish_reason.clone())),
+    ])
+}
+
+fn completion_chunk_json(
+    id: &str,
+    model: &str,
+    index: usize,
+    text: &str,
+    logprobs: Option<Json>,
+    finish: Option<&str>,
+    usage: Option<Json>,
+) -> Json {
+    let mut choice: Vec<(String, Json)> = vec![
+        ("text".into(), Json::Str(text.into())),
+        ("index".into(), Json::Num(index as f64)),
+        ("logprobs".into(), logprobs.unwrap_or(Json::Null)),
+    ];
+    if let Some(f) = finish {
+        choice.push(("finish_reason".into(), Json::Str(f.into())));
+    }
+    let mut obj = vec![
+        ("id".into(), Json::Str(id.into())),
+        ("object".into(), Json::Str("text_completion".into())),
+        ("created".into(), Json::Num(now())),
+        ("model".into(), Json::Str(model.into())),
+        ("choices".into(), Json::Arr(vec![Json::Obj(choice)])),
+    ];
+    if let Some(u) = usage {
+        obj.push(("usage".into(), u));
+    }
+    Json::Obj(obj)
 }
 
 pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
@@ -1045,115 +1543,161 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
     let stream_mode = want_stream(&body);
     let id = gen_id("chatcmpl");
     let model_name = engine.model_name.clone();
+    let seeds = choice_seeds(&params, params.n);
 
     if stream_mode {
         let mut sse = Streamer::new(stream, 200, "text/event-stream");
-        // First chunk carries the role.
-        sse.write_chunk(&format!(
-            "data: {}\n\n",
-            chat_chunk(&id, &model_name, Some("assistant"), None, None, None)
-        ));
-        let res = engine.run_chat(&messages, &params, |chunk, is_reasoning| {
-            if chunk.is_empty() {
-                return true;
-            }
-            let (content, reasoning) = if is_reasoning {
-                (None, Some(chunk))
-            } else {
-                (Some(chunk), None)
-            };
-            sse.write_chunk(&format!(
+        let mut results: Vec<GenResult> = Vec::with_capacity(params.n);
+        // Both callbacks need to write chunks; a RefCell shares the borrow.
+        let sse_cell = RefCell::new(&mut sse);
+        let mut failed = false;
+        for (i, seed) in seeds.iter().enumerate() {
+            let mut p = params.clone();
+            p.seed = *seed;
+            // OpenAI sends a separate role chunk for every choice.
+            sse_cell.borrow_mut().write_chunk(&format!(
                 "data: {}\n\n",
-                chat_chunk(&id, &model_name, None, content, reasoning, None)
-            ))
-        });
-        match res {
-            Ok(r) => {
-                let usage = params.include_usage.then(|| usage_json(&r));
-                // Tool-call deltas are not streamed separately; the XML text
-                // is emitted as content. At least report the correct reason.
-                let finish = if parse_tool_calls(&r.text).1.is_empty() {
-                    r.finish_reason.as_str()
-                } else {
-                    "tool_calls"
-                };
-                sse.write_chunk(&format!(
-                    "data: {}\n\n",
-                    chat_chunk_json(&id, &model_name, None, None, None, Some(finish), usage)
-                ));
-                sse.write_chunk("data: [DONE]\n\n");
-                sse.end();
-            }
-            Err(e) => {
-                sse.write_chunk(&format!(
-                    "data: {}\n\n",
-                    json_error(500, &e, "server_error").1
-                ));
-                sse.end();
+                chat_chunk_json(
+                    &id,
+                    &model_name,
+                    i,
+                    Some("assistant"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None
+                )
+            ));
+            let res = engine.run_chat_inner(
+                &messages,
+                &p,
+                |chunk, is_reasoning| {
+                    if chunk.is_empty() {
+                        return true;
+                    }
+                    let (content, reasoning) = if is_reasoning {
+                        (None, Some(chunk))
+                    } else {
+                        (Some(chunk), None)
+                    };
+                    sse_cell.borrow_mut().write_chunk(&format!(
+                        "data: {}\n\n",
+                        chat_chunk_json(
+                            &id,
+                            &model_name,
+                            i,
+                            None,
+                            content,
+                            reasoning,
+                            None,
+                            None,
+                            None
+                        )
+                    ))
+                },
+                |lp| {
+                    if p.logprobs {
+                        sse_cell.borrow_mut().write_chunk(&format!(
+                            "data: {}\n\n",
+                            chat_chunk_json(
+                                &id,
+                                &model_name,
+                                i,
+                                None,
+                                None,
+                                None,
+                                None,
+                                Some(chat_logprobs_json(std::slice::from_ref(lp))),
+                                None
+                            )
+                        ));
+                    }
+                },
+            );
+            match res {
+                Ok(r) => {
+                    // Tool-call deltas are not streamed separately; the XML
+                    // text is emitted as content. At least report the reason.
+                    let finish = if parse_tool_calls(&r.text).1.is_empty() {
+                        r.finish_reason.as_str()
+                    } else {
+                        "tool_calls"
+                    };
+                    sse_cell.borrow_mut().write_chunk(&format!(
+                        "data: {}\n\n",
+                        chat_chunk_json(
+                            &id,
+                            &model_name,
+                            i,
+                            None,
+                            None,
+                            None,
+                            Some(finish),
+                            None,
+                            None
+                        )
+                    ));
+                    results.push(r);
+                }
+                Err(e) => {
+                    sse_cell.borrow_mut().write_chunk(&format!(
+                        "data: {}\n\n",
+                        json_error(500, &e, "server_error").1
+                    ));
+                    failed = true;
+                    break;
+                }
             }
         }
+        let sse = sse_cell.into_inner();
+        if failed {
+            sse.write_chunk("data: [DONE]\n\n");
+            sse.end();
+            return;
+        }
+        // Final chunk carries aggregate usage (OpenAI uses choices: []).
+        let mut final_chunk: Vec<(String, Json)> = vec![
+            ("id".into(), Json::Str(id.clone())),
+            ("object".into(), Json::Str("chat.completion.chunk".into())),
+            ("created".into(), Json::Num(now())),
+            ("model".into(), Json::Str(model_name.clone())),
+            ("choices".into(), Json::Arr(Vec::new())),
+        ];
+        if params.include_usage {
+            final_chunk.push(("usage".into(), usage_from(&results)));
+        }
+        sse.write_chunk(&format!("data: {}\n\n", Json::Obj(final_chunk)));
+        sse.write_chunk("data: [DONE]\n\n");
+        sse.end();
     } else {
-        let res = engine.run_chat(&messages, &params, |_, _| true);
-        match res {
-            Ok(r) => {
-                let usage = usage_json(&r);
-                let (clean_text, calls) = parse_tool_calls(&r.text);
-                let finish = if calls.is_empty() {
-                    r.finish_reason.clone()
-                } else {
-                    "tool_calls".to_string()
-                };
-                let mut message = vec![
-                    ("role".into(), Json::Str("assistant".into())),
-                    ("content".into(), Json::Str(clean_text)),
-                ];
-                // Only include reasoning_content when there is a thinking trace,
-                // matching vLLM/SGLang behavior.
-                if !r.reasoning_content.is_empty() {
-                    message.push(("reasoning_content".into(), Json::Str(r.reasoning_content)));
+        let mut results: Vec<GenResult> = Vec::with_capacity(params.n);
+        for seed in &seeds {
+            let mut p = params.clone();
+            p.seed = *seed;
+            match engine.run_chat(&messages, &p, |_, _| true) {
+                Ok(r) => results.push(r),
+                Err(e) => {
+                    let (s, b) = json_error(500, &e, "server_error");
+                    respond(&mut stream, s, "application/json", &b);
+                    return;
                 }
-                if !calls.is_empty() {
-                    let arr: Vec<Json> = calls
-                        .iter()
-                        .map(|c| {
-                            Json::Obj(vec![
-                                ("id".into(), Json::Str(c.id.clone())),
-                                ("type".into(), Json::Str("function".into())),
-                                (
-                                    "function".into(),
-                                    Json::Obj(vec![
-                                        ("name".into(), Json::Str(c.name.clone())),
-                                        ("arguments".into(), Json::Str(c.arguments.clone())),
-                                    ]),
-                                ),
-                            ])
-                        })
-                        .collect();
-                    message.push(("tool_calls".into(), Json::Arr(arr)));
-                }
-                let resp = Json::Obj(vec![
-                    ("id".into(), Json::Str(id)),
-                    ("object".into(), Json::Str("chat.completion".into())),
-                    ("created".into(), Json::Num(now())),
-                    ("model".into(), Json::Str(model_name)),
-                    (
-                        "choices".into(),
-                        Json::Arr(vec![Json::Obj(vec![
-                            ("index".into(), Json::Num(0.0)),
-                            ("message".into(), Json::Obj(message)),
-                            ("finish_reason".into(), Json::Str(finish)),
-                            ("logprobs".into(), Json::Null),
-                        ])]),
-                    ),
-                    ("usage".into(), usage),
-                ]);
-                respond(&mut stream, 200, "application/json", &resp.to_string());
-            }
-            Err(e) => {
-                let (s, b) = json_error(500, &e, "server_error");
-                respond(&mut stream, s, "application/json", &b);
             }
         }
+        let choices: Vec<Json> = results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| chat_choice(r, i, params.logprobs))
+            .collect();
+        let resp = Json::Obj(vec![
+            ("id".into(), Json::Str(id)),
+            ("object".into(), Json::Str("chat.completion".into())),
+            ("created".into(), Json::Num(now())),
+            ("model".into(), Json::Str(model_name)),
+            ("choices".into(), Json::Arr(choices)),
+            ("usage".into(), usage_from(&results)),
+        ]);
+        respond(&mut stream, 200, "application/json", &resp.to_string());
     }
 }
 
@@ -1190,7 +1734,7 @@ pub fn handle_completions(mut stream: TcpStream, req: Request, engine: &Arc<Engi
         respond(&mut stream, s, "application/json", &b);
         return;
     }
-    let params = match parse_params(&body, engine) {
+    let params = match parse_completion_params(&body, engine) {
         Ok(p) => p,
         Err(e) => {
             let (s, b) = e;
@@ -1201,88 +1745,102 @@ pub fn handle_completions(mut stream: TcpStream, req: Request, engine: &Arc<Engi
     let stream_mode = want_stream(&body);
     let id = gen_id("cmpl");
     let model_name = engine.model_name.clone();
+    let seeds = choice_seeds(&params, params.n);
 
     if stream_mode {
         let mut sse = Streamer::new(stream, 200, "text/event-stream");
-        let res = engine.run_completion(&prompt, &params, |chunk, _| {
-            if chunk.is_empty() {
-                return true;
-            }
-            let c = Json::Obj(vec![
-                ("text".into(), Json::Str(chunk.to_string())),
-                ("index".into(), Json::Num(0.0)),
-                ("logprobs".into(), Json::Null),
-            ]);
-            sse.write_chunk(&format!(
-                "data: {}\n\n",
-                Json::Obj(vec![
-                    ("id".into(), Json::Str(id.clone())),
-                    ("object".into(), Json::Str("text_completion".into())),
-                    ("created".into(), Json::Num(now())),
-                    ("model".into(), Json::Str(model_name.clone())),
-                    ("choices".into(), Json::Arr(vec![c])),
-                ])
-            ))
-        });
-        match res {
-            Ok(r) => {
-                let usage = params.include_usage.then(|| usage_json(&r));
-                let c = Json::Obj(vec![
-                    ("text".into(), Json::Str(String::new())),
-                    ("index".into(), Json::Num(0.0)),
-                    ("logprobs".into(), Json::Null),
-                    ("finish_reason".into(), Json::Str(r.finish_reason)),
-                ]);
-                let mut final_chunk = vec![
-                    ("id".into(), Json::Str(id)),
-                    ("object".into(), Json::Str("text_completion".into())),
-                    ("created".into(), Json::Num(now())),
-                    ("model".into(), Json::Str(model_name)),
-                    ("choices".into(), Json::Arr(vec![c])),
-                ];
-                if let Some(u) = usage {
-                    final_chunk.push(("usage".into(), u));
+        let mut results: Vec<GenResult> = Vec::with_capacity(params.n);
+        let sse_cell = RefCell::new(&mut sse);
+        let mut failed = false;
+        for (i, seed) in seeds.iter().enumerate() {
+            let mut p = params.clone();
+            p.seed = *seed;
+            let res = engine.run_completion_inner(
+                &prompt,
+                &p,
+                |chunk, _| {
+                    if chunk.is_empty() {
+                        return true;
+                    }
+                    sse_cell.borrow_mut().write_chunk(&format!(
+                        "data: {}\n\n",
+                        completion_chunk_json(&id, &model_name, i, chunk, None, None, None)
+                    ))
+                },
+                |lp| {
+                    if p.logprobs {
+                        sse_cell.borrow_mut().write_chunk(&format!(
+                            "data: {}\n\n",
+                            completion_chunk_json(
+                                &id,
+                                &model_name,
+                                i,
+                                "",
+                                Some(completion_logprobs_json(std::slice::from_ref(lp))),
+                                None,
+                                None
+                            )
+                        ));
+                    }
+                },
+            );
+            match res {
+                Ok(r) => {
+                    let finish = r.finish_reason.clone();
+                    results.push(r);
+                    let usage =
+                        (params.include_usage && i + 1 == params.n).then(|| usage_from(&results));
+                    sse_cell.borrow_mut().write_chunk(&format!(
+                        "data: {}\n\n",
+                        completion_chunk_json(&id, &model_name, i, "", None, Some(&finish), usage)
+                    ));
                 }
-                sse.write_chunk(&format!("data: {}\n\n", Json::Obj(final_chunk)));
-                sse.write_chunk("data: [DONE]\n\n");
-                sse.end();
-            }
-            Err(e) => {
-                sse.write_chunk(&format!(
-                    "data: {}\n\n",
-                    json_error(500, &e, "server_error").1
-                ));
-                sse.end();
+                Err(e) => {
+                    sse_cell.borrow_mut().write_chunk(&format!(
+                        "data: {}\n\n",
+                        json_error(500, &e, "server_error").1
+                    ));
+                    failed = true;
+                    break;
+                }
             }
         }
+        let sse = sse_cell.into_inner();
+        if failed {
+            sse.write_chunk("data: [DONE]\n\n");
+            sse.end();
+            return;
+        }
+        sse.write_chunk("data: [DONE]\n\n");
+        sse.end();
     } else {
-        let res = engine.run_completion(&prompt, &params, |_, _| true);
-        match res {
-            Ok(r) => {
-                let usage = usage_json(&r);
-                let resp = Json::Obj(vec![
-                    ("id".into(), Json::Str(id)),
-                    ("object".into(), Json::Str("text_completion".into())),
-                    ("created".into(), Json::Num(now())),
-                    ("model".into(), Json::Str(model_name)),
-                    (
-                        "choices".into(),
-                        Json::Arr(vec![Json::Obj(vec![
-                            ("text".into(), Json::Str(r.text)),
-                            ("index".into(), Json::Num(0.0)),
-                            ("logprobs".into(), Json::Null),
-                            ("finish_reason".into(), Json::Str(r.finish_reason)),
-                        ])]),
-                    ),
-                    ("usage".into(), usage),
-                ]);
-                respond(&mut stream, 200, "application/json", &resp.to_string());
-            }
-            Err(e) => {
-                let (s, b) = json_error(500, &e, "server_error");
-                respond(&mut stream, s, "application/json", &b);
+        let mut results: Vec<GenResult> = Vec::with_capacity(params.n);
+        for seed in &seeds {
+            let mut p = params.clone();
+            p.seed = *seed;
+            match engine.run_completion(&prompt, &p, |_, _| true) {
+                Ok(r) => results.push(r),
+                Err(e) => {
+                    let (s, b) = json_error(500, &e, "server_error");
+                    respond(&mut stream, s, "application/json", &b);
+                    return;
+                }
             }
         }
+        let choices: Vec<Json> = results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| completion_choice(r, i, params.logprobs))
+            .collect();
+        let resp = Json::Obj(vec![
+            ("id".into(), Json::Str(id)),
+            ("object".into(), Json::Str("text_completion".into())),
+            ("created".into(), Json::Num(now())),
+            ("model".into(), Json::Str(model_name)),
+            ("choices".into(), Json::Arr(choices)),
+            ("usage".into(), usage_from(&results)),
+        ]);
+        respond(&mut stream, 200, "application/json", &resp.to_string());
     }
 }
 
@@ -1577,6 +2135,185 @@ mod tests {
         // max_completion_tokens overrides max_tokens.
         let j = crate::json::parse(r#"{"max_tokens":0,"max_completion_tokens":64}"#).unwrap();
         assert_eq!(parse_params(&j, &tiny_engine()).unwrap().max_tokens, 64);
+    }
+
+    #[test]
+    fn parse_new_api_fields() {
+        let engine = tiny_engine();
+        let j = crate::json::parse(
+            r#"{"n":3,"user":"u1","response_format":{"type":"json_object"},"logprobs":true,"top_logprobs":4}"#,
+        )
+        .unwrap();
+        let p = parse_params(&j, &engine).unwrap();
+        assert_eq!(p.n, 3);
+        assert_eq!(p.user.as_deref(), Some("u1"));
+        assert_eq!(p.response_format, ResponseFormat::JsonObject);
+        assert!(p.logprobs);
+        assert_eq!(p.top_logprobs, 4);
+
+        // Completions use `logprobs: N` rather than a boolean.
+        let j = crate::json::parse(r#"{"logprobs":2,"n":2}"#).unwrap();
+        let p = parse_completion_params(&j, &engine).unwrap();
+        assert!(p.logprobs);
+        assert_eq!(p.top_logprobs, 2);
+        assert_eq!(p.n, 2);
+
+        for body in [
+            r#"{"n":0}"#,
+            r#"{"n":129}"#,
+            r#"{"user":5}"#,
+            r#"{"response_format":{"type":"json_schema"}}"#,
+            r#"{"response_format":{}}"#,
+            r#"{"logprobs":"yes"}"#,
+            r#"{"top_logprobs":21,"logprobs":true}"#,
+            r#"{"top_logprobs":1}"#, // requires logprobs: true
+        ] {
+            let j = crate::json::parse(body).unwrap();
+            assert!(parse_params(&j, &engine).is_err(), "body={}", body);
+        }
+        let j = crate::json::parse(r#"{"logprobs":21}"#).unwrap();
+        assert!(parse_completion_params(&j, &engine).is_err());
+        // `null` is treated as "not provided" everywhere.
+        let j =
+            crate::json::parse(r#"{"n":null,"user":null,"logprobs":null,"response_format":null}"#)
+                .unwrap();
+        let p = parse_params(&j, &engine).unwrap();
+        assert_eq!(p.n, 1);
+        assert!(p.user.is_none());
+        assert!(!p.logprobs);
+    }
+
+    #[test]
+    fn logprob_info_matches_log_softmax_and_applies_penalties() {
+        let tokz = Tokenizer::tiny();
+        let p = Params::default();
+        let logits = [1.0f32, 2.0, 3.0, 4.0];
+        let info = logprob_info(&logits, &p, &[], 3, 2, &tokz);
+        let max = 4.0f64;
+        let sum: f64 = logits.iter().map(|&v| (v as f64 - max).exp()).sum();
+        let expected = (4.0f64 - max) - sum.ln();
+        assert!((info.logprob as f64 - expected).abs() < 1e-5);
+        assert_eq!(info.token_id, 3);
+        assert_eq!(info.top.len(), 2);
+        assert_eq!(info.top[0].token_id, 3); // highest logit first
+        assert!(info.top[0].logprob >= info.top[1].logprob);
+
+        // top_n is capped by the vocabulary size.
+        assert_eq!(logprob_info(&logits, &p, &[], 0, 99, &tokz).top.len(), 4);
+
+        // Repetition penalties are applied before logprobs are computed.
+        let mut penalized = Params {
+            repetition_penalty: 2.0,
+            ..Default::default()
+        };
+        penalized.temperature = 0.0;
+        let before = logprob_info(&logits, &p, &[], 3, 0, &tokz).logprob;
+        let after = logprob_info(&logits, &penalized, &[3], 3, 0, &tokz).logprob;
+        assert!(after < before, "before={} after={}", before, after);
+    }
+
+    #[test]
+    fn choice_seeds_and_response_format_hints() {
+        let p = Params {
+            seed: Some(123),
+            ..Default::default()
+        };
+        assert_eq!(choice_seeds(&p, 3), vec![Some(123), Some(124), Some(125)]);
+
+        assert_eq!(apply_response_format_text("hi", ResponseFormat::Text), "hi");
+        let hinted = apply_response_format_text("hi", ResponseFormat::JsonObject);
+        assert!(hinted.starts_with("hi"));
+        assert!(hinted.contains("valid JSON object"));
+
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: "hi".into(),
+            ..Default::default()
+        }];
+        let out = apply_response_format_chat(&msgs, ResponseFormat::JsonObject);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].content.contains("valid JSON object"));
+        // A trailing assistant turn gets a fresh user turn with the hint.
+        let msgs = vec![Message {
+            role: "assistant".into(),
+            content: "hi".into(),
+            ..Default::default()
+        }];
+        let out = apply_response_format_chat(&msgs, ResponseFormat::JsonObject);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].role, "user");
+    }
+
+    #[test]
+    fn http_chat_n_choices_and_logprobs() {
+        let addr = start_server();
+        let payload = r#"{"model":"tiny-model","messages":[{"role":"user","content":"hi"}],"max_tokens":4,"temperature":0,"enable_thinking":false,"n":2,"logprobs":true,"top_logprobs":1,"seed":7}"#;
+        let r = post(addr, "/v1/chat/completions", payload);
+        assert_eq!(status(&r), 200, "{}", r);
+        let j = crate::json::parse(body(&r)).unwrap();
+        let choices = j.get("choices").unwrap().as_arr().unwrap();
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].get("index").unwrap().as_f64(), Some(0.0));
+        assert_eq!(choices[1].get("index").unwrap().as_f64(), Some(1.0));
+        let usage = j.get("usage").unwrap();
+        let total = usage.get("total_tokens").unwrap().as_f64().unwrap() as usize;
+        let mut reported = 0;
+        for c in choices {
+            let lp = c
+                .get("logprobs")
+                .unwrap()
+                .get("content")
+                .unwrap()
+                .as_arr()
+                .unwrap();
+            assert!(!lp.is_empty());
+            assert_eq!(
+                lp[0].get("top_logprobs").unwrap().as_arr().unwrap().len(),
+                1
+            );
+            reported += lp.len();
+        }
+        // Every emitted completion token has one logprob entry per choice.
+        assert_eq!(
+            total,
+            usage.get("prompt_tokens").unwrap().as_f64().unwrap() as usize + reported
+        );
+    }
+
+    #[test]
+    fn http_completions_logprobs_array_shape() {
+        let addr = start_server();
+        let payload = r#"{"model":"tiny-model","prompt":"hi","max_tokens":4,"temperature":0,"logprobs":2,"n":2}"#;
+        let r = post(addr, "/v1/completions", payload);
+        assert_eq!(status(&r), 200, "{}", r);
+        let j = crate::json::parse(body(&r)).unwrap();
+        let choices = j.get("choices").unwrap().as_arr().unwrap();
+        assert_eq!(choices.len(), 2);
+        let lp = choices[0].get("logprobs").unwrap();
+        let texts = lp.get("tokens").unwrap().as_arr().unwrap();
+        let values = lp.get("token_logprobs").unwrap().as_arr().unwrap();
+        let offsets = lp.get("text_offset").unwrap().as_arr().unwrap();
+        assert_eq!(texts.len(), values.len());
+        assert_eq!(texts.len(), offsets.len());
+        assert_eq!(
+            lp.get("top_logprobs").unwrap().as_arr().unwrap()[0]
+                .as_arr()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn http_stream_emits_logprob_deltas() {
+        let addr = start_server();
+        let payload = r#"{"model":"tiny-model","messages":[{"role":"user","content":"hi"}],"max_tokens":4,"temperature":0,"enable_thinking":false,"stream":true,"logprobs":true,"top_logprobs":1}"#;
+        let r = post(addr, "/v1/chat/completions", payload);
+        assert_eq!(status(&r), 200, "{}", r);
+        let b = body(&r);
+        assert!(b.contains("\"top_logprobs\""));
+        assert!(b.contains("\"logprob\""));
+        assert!(b.contains("data: [DONE]"));
     }
 
     #[test]

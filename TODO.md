@@ -105,7 +105,7 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 
 ## API & Protocol Compatibility
 
-- [x] **(P1) Full OpenAI parameter coverage (partial):** `presence_penalty`, `frequency_penalty`, `logit_bias`, `stop_token_ids`, and `stream_options.include_usage` are implemented. Still open: `logprobs`, `n`, `user`, `response_format`.
+- [x] **(P1) Full OpenAI parameter coverage.** Added `logprobs` / `top_logprobs` (chat: bool + 0..=20; completions: integer, parallel-array shape; SSE deltas), `n` (1..=128, sequential choices with per-choice seeds), `user` (validated, no-op), and `response_format` (`text` / `json_object`; best-effort prompt hint, no constrained decoding; `json_schema` rejected). Together with `presence_penalty`, `frequency_penalty`, `logit_bias`, `stop_token_ids`, and `stream_options.include_usage`, all documented request parameters are now covered.
 - [x] **(P1) Proper usage accounting** for streamed responses. Final chunk includes `usage` when `stream_options.include_usage` is set.
 - [x] **(P1) Separate `reasoning_content` field.** Done — thinking traces go to `reasoning_content` (message field / SSE delta), answer to `content`, matching vLLM/SGLang.
 - [x] **(P2) `stop` as token-id array.** Done — `stop_token_ids` plus numeric arrays in `stop`.
@@ -134,7 +134,7 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 - [x] **(P1) Tool calling (non-streaming).** Done — OpenAI `tools` are rendered into the Qwen3.5 system preamble, assistant `tool_calls` into `<function=...>` XML, and generated `<tool_call>` blocks are parsed back into `tool_calls` with `finish_reason: "tool_calls"`. **Still open:** proper SSE `tool_calls` deltas (streaming currently emits the XML as content).
 - [x] **(P1) `enable_thinking` model-size defaults.** Done — see Model & Architecture Support above.
 - [ ] **(P2) Multi-modal content parts** (`content: [{type: "text", ...}]`) — currently only plain strings.
-- [x] **(P2) `reasoning_content` on responses.** Done (see API section); the `Message` input struct still lacks a `reasoning_content` field for multi-turn history.
+- [x] **(P2) `reasoning_content` on responses.** Done (see API section); `Message` also accepts `reasoning_content` on input for multi-turn history.
 - [ ] **(P3) Full Jinja2 subset** or a template engine (hard with zero deps; likely not worth it).
 
 ---
@@ -155,7 +155,7 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 - [x] **(P1) CI: aarch64 Linux build.** Done — native `ubuntu-24.04-arm` runner for `aarch64-unknown-linux-gnu` (no cross-compilation needed). macOS Intel (`macos-13`) target removed.
 - [x] **(P2) CI: run `cargo test` on Windows/macOS.** All matrix jobs run `cargo test`; verified in `ci.yml`.
 - [ ] **(P2) Publish crates.io release** (currently GitHub-only).
-- [ ] **(P3) Fuzzing harness** for JSON/HTTP parsers using `cargo fuzz` (would need a dev-dependency; conflicts with zero-dep goal — keep optional).
+- [x] **(P3) Fuzzing harness.** `src/fuzz.rs` runs deterministic, seeded random inputs through the JSON, HTTP, regex, chat, tokenizer and API-parameter parsers on every `cargo test` (no new dependency). `cargo fuzz` with libfuzzer remains optional if deeper coverage is needed.
 
 ---
 
@@ -163,10 +163,10 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 
 1. **Reduce embedding memory** — the f32 `embed_tokens` matrix is now the largest allocation. f16 storage + lazy row conversion is the next memory win.
 2. **Run the end-to-end benchmark** with a real model: `EXLLAMA_BENCH_MODEL=/path cargo test --release bench_generation_throughput -- --ignored --nocapture`.
-3. **Remaining API completeness** — `logprobs`, `n`, `user`, `response_format`.
-4. **`enable_thinking` model-size defaults** — flip to false for 0.8B/2B.
-5. **Tool calling** — the most-requested OpenAI feature for Qwen3.5 chat models.
-6. **Manual SSE validation** with a real OpenAI client / `curl -N` (automated framing tests already pass).
+3. **Manual SSE validation** with a real OpenAI client / `curl -N` against a real model (automated framing tests already pass).
+4. **Streaming `tool_calls` deltas** instead of emitting the XML as text content.
+5. **Real-model validation on other sizes (2B / 4B / 9B) and MUL1 codebooks** — currently only the 0.8B 8-bpw MCG model has been exercised end to end.
+6. **Optional:** batching / continuous inference, KV-cache quantization, vision support.
 
 ---
 

@@ -23,7 +23,7 @@ This document is a complete orienteering guide for AI agents (or humans) continu
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build                      # debug
 cargo build --release            # optimized binary at target/release/exllama-server
-cargo test                       # 45 unit tests (4 ignored)
+cargo test                       # 82 unit tests (4 ignored)
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings   # must pass (CI enforces)
 ```
@@ -48,7 +48,7 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 | OPTIONS | any | 204 (CORS preflight) |
 
 ### API parameters (chat & completions)
-`temperature` (default 0.7), `top_p` (1.0), `top_k` (0 = off), `max_tokens` / `max_completion_tokens`, `stop` (string or array), `stop_token_ids`, `seed`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `logit_bias` (token-id → bias), `stream` (bool), `stream_options.include_usage`, and for chat: `enable_thinking` (bool, default **true** for 9B/4B). `model` is validated against the server name. Invalid parameters are rejected with a 400.
+`temperature` (default 0.7), `top_p` (1.0), `top_k` (0 = off), `max_tokens` / `max_completion_tokens`, `stop` (string or array), `stop_token_ids`, `seed`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `logit_bias` (token-id → bias), `stream` (bool), `stream_options.include_usage`, `n` (1..=128), `user` (validated, no-op), `response_format` (`text` / `json_object`; best-effort hint, no constrained decoding), `logprobs` + `top_logprobs` (chat: bool + 0..=20; completions: integer with parallel-array response), and for chat: `enable_thinking` (bool, default **true** for 9B/4B). `model` is validated against the server name. Invalid parameters are rejected with a 400. `n` choices are generated sequentially (per-choice seeds derived from `seed`); with greedy decoding they are identical. Logprobs use the penalty-adjusted distribution before temperature/top-k/top-p and exclude reasoning delimiters and stop tokens.
 
 ---
 
@@ -64,7 +64,7 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 ### `src/http.rs` — Minimal HTTP/1.1 server
 - `Request { method, path, headers, body }` — parsed by `read_request()` (64 KiB header cap, 8 MiB body cap, rejects duplicate/invalid Content-Length).
 - `respond()` — writes a complete response with Content-Length and CORS headers.
-- `Streamer` — chunked SSE writer with `Cache-Control: no-cache`; `write_chunk()` returns false on a broken connection so generation aborts; `end()` writes `0\r\n\r\n`.
+- `Streamer` — chunked SSE writer with `Cache-Control: no-cache`; `write_chunk()` returns false on a broken connection so generation aborts; `end(&mut self)` writes `0\r\n\r\n` (takes `&mut self` so callers sharing the stream with generation callbacks can still finish it).
 - `serve(listener, handler)` — accept loop; one OS thread per connection (capped at 64), 600 s read/write timeouts. Handler signature: `Fn(TcpStream, Request)` (takes ownership of the stream).
 
 ### `src/json.rs` — JSON parser/serializer
@@ -129,7 +129,9 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 
 ### `src/server.rs` — Inference engine + API handlers
 - `Engine { model: Mutex<Model>, tokenizer, model_name, default_max_tokens, threads, default_enable_thinking }`.
-- `GenResult { text, reasoning_content, prompt_tokens, completion_tokens, finish_reason }`.
+- `GenResult { text, reasoning_content, prompt_tokens, completion_tokens, finish_reason, logprobs }`.
+- `Params` (Clone) adds `n`, `user`, `response_format`, `logprobs`, `top_logprobs`; `parse_params_inner(body, engine, chat)` handles the different chat/completions shapes (`logprobs` bool vs integer). `ResponseFormat::JsonObject` adds a best-effort prompt hint (`apply_response_format_chat/text`); no constrained decoding.
+- `generate_inner()` is the core loop; `generate()` wraps it with a no-op logprob callback. `run_chat_inner()` / `run_completion_inner()` likewise wrap `run_chat()` / `run_completion()` and thread an `on_logprob` callback through for SSE deltas. `prepare_logits()` (penalties/bias) is shared by `sample()` and `logprob_info()` so reported probabilities match the sampled distribution; `choice_seeds()` derives one RNG stream per choice for `n > 1`.
 - `generate()` — core loop:
   1. `model.reset()`, `logits = model.forward(&prompt_ids)` (prefill).
   2. Each step: `sample()` → check stop token → decode incrementally → `on_token(chunk, is_reasoning)` → `logits = model.forward(&[tok])`.
@@ -174,6 +176,9 @@ See §6 for the full math. Key items:
 - `rms_norm()` — zero-centered: `x * rsqrt(mean(x²)+eps) * (1+w)`.
 - `rms_norm_gated()` — `norm(x) * w * silu(gate)`, applied **per value head** (groups of `linear_value_head_dim`); normalizing over the whole concatenated vector was a bug that broke linear attention.
 - `forward_full_attn()`, `forward_linear_attn()`, `forward_token()`, `forward(&[u32])`.
+
+### `src/fuzz.rs` — deterministic fuzz smoke tests (`#[cfg(test)]` only)
+- Seeded LCG drives random inputs through `json::parse` (with parse→serialize→parse roundtrip), `http::read_request` (real loopback sockets), `regex::Regex::compile`/`match_at`/`pre_tokenize`, `server::parse_params` / `parse_completion_params` / `parse_messages`, `apply_chat_template`, and the tokenizer. No external crate; every `cargo test` run includes it. Any panic is a bug; parse errors are expected.
 
 ### `tests/` — manual API test scripts
 Shell scripts for end-to-end checks against a running server (not `cargo test`):
@@ -332,7 +337,8 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 
 - **Memory vs speed:** `--weight-mode` trades RAM for tokens/s. `f32` (default): quantized linears decoded to f32 at load (~4× on-disk, fast). `f16`: ~2× on-disk, near-f32 speed. `packed`: ~1× on-disk but ~10+ s/token on CPU — unusable interactively. On CPU, SIMD on `dot()` would not help the packed path; its bottleneck is codebook decode, not the MACs. Tied-embedding models skip the lm_head decode (plain embedding matrix used directly). Peak RAM during load includes raw shard bytes plus decoded caches (in `f32` mode, several times on-disk); the old "≈ 2× on-disk" claim was inaccurate. Plain 2-D tensors are decoded once (previously stored in both `vectors` and `weights`), trellis byte ranges are compacted away after the linear pass, and untied embedding tables are stored as fp16 with per-row decode. Tied models (0.8B) still keep the ~1 GB f32 embedding for `lm_head`.
 - **No GPU:** CPU only; large models are slow.
-- **Single-request generation:** `Engine.model` is a mutex; concurrent requests serialize.
+- **Single-request generation:** `Engine.model` is a mutex; concurrent requests serialize. `n > 1` therefore generates choices sequentially (linear cost), not as a batch.
+- **API fidelity limits:** `response_format: json_object` only adds a prompt hint — there is no grammar/constrained decoding or JSON validation. Streaming tool calls are emitted as XML text content (no `tool_calls` deltas). Chat `top_logprobs` is capped at 20 (completions accept up to 20 as an extension; OpenAI allows 5). Logprobs exclude reasoning delimiters and stop tokens, so their count matches `completion_tokens`, not every token sampled internally.
 - **No full Jinja template engine:** chat template covers text-only common cases; tool-call arguments and advanced Jinja features (e.g. `tojson` of tool definitions) are not implemented.
 - **No Unicode NFC normalization:** tokenizer assumes input is already NFC (chat content typically is).
 - **No vision inference:** vision tensors are dequantized-skipped and ignored.
@@ -356,14 +362,16 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 | `exl3::tests::codebook_decode_matches_reference` | All 3 codebooks vs numpy reference |
 | `exl3::tests::half_roundtrip` | fp16 conversion correctness |
 | `exl3::tests::tile_perm_matches_reference` | Tile permutation vs reference |
+| `server::tests` | Sampling equivalence, logprobs vs log-softmax, parameter validation, `n` choices, SSE framing/usage/logprob deltas, HTTP responses |
+| `fuzz::tests` | Seeded random inputs against JSON/HTTP/regex/chat/tokenizer/API parsers (no panics) |
 
-Run `cargo test` — 72 pass, 4 ignored on the current state.
+Run `cargo test` — 82 pass, 4 ignored on the current state.
 
 ---
 
 ## 10. Git / CI State
 
-- Branch `main`, latest release tag `v0.3.0`, placeholder author identity.
+- Branch `main`, latest release tag `v0.3.0`, placeholder author identity. Four local commits ahead of `origin` after the Phase 0–3 improvement passes (not pushed): `d0c5cb4` (hardening), `30d4f55` (chat/API fidelity), `12baa8b` (memory/threading), and the pending Phase 3 commit (API completeness + fuzz harness).
 - `.github/workflows/ci.yml`: build + `cargo test` on push/PR for `ubuntu-latest` (linux x86_64), `ubuntu-24.04-arm` (linux arm64), `macos-latest` (arm64, with `gpu-metal`), `windows-latest` (x86_64). fmt check; clippy `-D warnings` (Linux); uploads artifacts. The macOS build compiles the GPU backend; GPU runtime correctness is not exercised on CI runners.
 - `.github/workflows/release.yml`: on `v*` tags, builds all 4 targets (macOS with `gpu-metal`), packages, publishes GitHub Release.
 - `.github/workflows/release-gpu.yml`: manually triggered (`workflow_dispatch`, optional tag input). Installs CUDA toolkit via `Jimver/cuda-toolkit@v0.2.21` (12.6.0) on Linux/Windows, builds with `--features gpu-cuda`, attaches to a release by tag. Separate from main CI because stock runners have no nvcc (candle-kernels/cudarc need it; `fallback-latest` only fixes cudarc version detection, not candle-kernels' nvcc requirement).

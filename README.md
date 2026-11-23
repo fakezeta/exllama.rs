@@ -141,6 +141,40 @@ discourages repetition in both greedy and sampled decoding.
 
 Streaming: add `"stream": true` to receive SSE chunks terminated by `data: [DONE]`.
 
+#### Logprobs, multiple choices, and response format
+
+```json
+{
+  "messages": [{"role": "user", "content": "Hello!"}],
+  "logprobs": true,
+  "top_logprobs": 2,
+  "n": 2,
+  "seed": 42,
+  "response_format": {"type": "json_object"}
+}
+```
+
+- `logprobs: true` plus `top_logprobs` (0–20) adds `choices[].logprobs.content[]`
+  with one entry per generated token (`token`, `token_id`, `logprob`, and the top
+  alternatives). In streaming mode each token is emitted as a separate
+  `logprobs` delta. For `/v1/completions` the parameter is an integer
+  (`"logprobs": 2`) and the response uses the parallel-array shape
+  (`tokens`, `token_logprobs`, `top_logprobs`, `text_offset`).
+  Probabilities come from the logits after repetition/presence/frequency/bias
+  penalties but before temperature/top-k/top-p sampling transforms. Reasoning
+  delimiters and stop tokens are excluded, matching `completion_tokens`.
+- `n` (1–128) returns that many choices. Choices are generated **sequentially**
+  (the model is mutex-guarded), so cost scales linearly; each choice gets its own
+  RNG stream derived from `seed`. With greedy decoding (`temperature: 0`) all
+  choices are identical, as with OpenAI. SSE chunks carry the choice `index`, and
+  usage is the sum across choices.
+- `user` is accepted and validated but otherwise ignored (OpenAI uses it for
+  abuse monitoring).
+- `response_format` accepts `{"type": "text"}` (default) and
+  `{"type": "json_object"}`. JSON mode adds a "respond with a single JSON object"
+  hint to the prompt; it is **best-effort** — there is no constrained decoding or
+  output validation, and `json_schema` is rejected with a 400.
+
 ### Completions
 
 ```bash
@@ -156,7 +190,7 @@ GET /v1/models
 GET /health   (or /)
 ```
 
-Supported request parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `max_completion_tokens`, `seed`, `stop`, `stop_token_ids`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `stream`, `stream_options.include_usage`, `enable_thinking`, `tools`. Assistant messages may carry `reasoning_content` and `tool_calls`; `content` may be a string or an array of text parts. The `model` field is validated against the server's `--name`.
+Supported request parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `max_completion_tokens`, `seed`, `stop`, `stop_token_ids`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `stream`, `stream_options.include_usage`, `enable_thinking`, `tools`, `logprobs`, `top_logprobs` (chat only), `n`, `user`, `response_format`. Assistant messages may carry `reasoning_content` and `tool_calls`; `content` may be a string or an array of text parts. The `model` field is validated against the server's `--name`. Unknown fields are ignored.
 
 ## How it works
 
@@ -171,7 +205,7 @@ Supported request parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `m
 cargo test
 ```
 
-Tests cover JSON parsing, regex/pre-tokenizer behavior, chat-template rendering (including committed golden prompts in `tests/golden/`), tool-call parsing, tokenizer encoding against the real Qwen3.5 tokenizer, EXL3 codebook/tile-layout correctness against the reference implementation, sampling, and end-to-end HTTP/SSE behavior against a tiny synthetic model (no model download required). For throughput benchmarking with a real model, see `bench_generation_throughput` in `src/server.rs`.
+Tests cover JSON parsing, regex/pre-tokenizer behavior, chat-template rendering (including committed golden prompts in `tests/golden/`), tool-call parsing, tokenizer encoding against the real Qwen3.5 tokenizer, EXL3 codebook/tile-layout correctness against the reference implementation, sampling, logprobs, `n`-choice handling, parameter validation, end-to-end HTTP/SSE behavior against a tiny synthetic model (no model download required), and deterministic dependency-free fuzz smoke tests for the JSON/HTTP/regex/tokenizer/API parsers (`src/fuzz.rs`). For throughput benchmarking with a real model, see `bench_generation_throughput` in `src/server.rs`.
 
 For manual end-to-end checks against a **running server**, see [`tests/README.md`](tests/README.md). It contains smoke-test and diagnostic shell scripts (`test_api.sh`, `test_diag.sh`, `test_sample.sh`, `test_prompts.sh`) that exercise the OpenAI-compatible endpoints with curl.
 

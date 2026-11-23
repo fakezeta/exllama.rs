@@ -9,6 +9,8 @@
 mod chat;
 mod compute;
 mod exl3;
+#[cfg(test)]
+mod fuzz;
 mod http;
 mod json;
 mod model;
