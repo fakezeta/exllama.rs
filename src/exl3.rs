@@ -1191,6 +1191,11 @@ fn read_f16_matrix(shards: &Shards, name: &str) -> Option<F16Matrix> {
 
 pub struct Exl3Model {
     pub config: Json,
+    /// Tensor prefix detected from the shards (`model.` or
+    /// `model.language_model.`). Kept here so `Model` does not have to
+    /// re-detect it from loaded tensors — the embedding may live in
+    /// `embeddings_f16` rather than `weights` for untied models.
+    pub prefix: String,
     /// Plain (unquantized) 2-D tensors in `(out_features, in_features)` layout.
     pub weights: HashMap<String, Matrix>,
     /// Embedding tables stored as fp16 (2 bytes/weight), decoded per row on
@@ -1417,6 +1422,7 @@ impl Exl3Model {
         );
         Ok(Exl3Model {
             config,
+            prefix: prefix.to_string(),
             weights,
             embeddings_f16,
             linears,

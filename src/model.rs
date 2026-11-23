@@ -120,16 +120,13 @@ impl Model {
         let num_layers = cfg_num(tc, "num_hidden_layers", 32);
         let rope = tc.get("rope_parameters").unwrap_or(tc);
 
-        // Detect tensor prefix.
-        let has_language = ex
-            .weights
-            .contains_key("model.language_model.embed_tokens.weight")
-            || ex.w("model.language_model.embed_tokens.weight").is_some();
-        let prefix = if has_language {
-            "model.language_model.".to_string()
-        } else {
-            "model.".to_string()
-        };
+        // Use the prefix detected from the shards by `Exl3Model::load`.
+        // Re-detecting it from `weights` used to break untied multimodal
+        // models: their embedding lives in `embeddings_f16`, so the
+        // `model.language_model.embed_tokens.weight` key was absent and the
+        // prefix silently fell back to `model.`, causing a "missing embedding
+        // tensor" error at the first token of every request (v0.4.1 bug).
+        let prefix = ex.prefix.clone();
 
         let config = ModelConfig {
             architecture: arch,
@@ -689,19 +686,14 @@ impl Model {
         Ok(y)
     }
 
-    fn forward_token(&mut self, token: u32) -> Result<Vec<f32>, String> {
-        let num_layers = self.config.num_layers;
-        let hs = self.config.hidden_size;
-        let vocab = self.config.vocab_size;
-        let eps = self.config.rms_norm_eps;
-        let layer_types = self.config.layer_types.clone();
-        let intv = self.config.full_attention_interval;
-
-        // Embedding lookup. Untied models store the table as fp16 and decode
-        // just one row; tied models keep the f32 matrix (also used by lm_head).
+    /// Look up one embedding row. Untied models store the table as fp16 and
+    /// decode just one row; tied models keep the f32 matrix (also used by the
+    /// tied lm_head). The prefixed fp16 key is tried first, so a multimodal
+    /// checkpoint (`model.language_model.`) resolves correctly.
+    fn embedding_row(&self, token: u32) -> Result<Vec<f32>, String> {
         let id = token as usize;
         let embed_name = format!("{}embed_tokens.weight", self.prefix);
-        let mut x = if let Some(emb) = self
+        if let Some(emb) = self
             .embeddings_f16
             .get(&embed_name)
             .or_else(|| self.embeddings_f16.get("model.embed_tokens.weight"))
@@ -712,19 +704,29 @@ impl Model {
                     token, emb.rows
                 ));
             }
-            emb.row_f32(id)
-        } else {
-            let embed = self
-                .w("embed_tokens.weight")
-                .ok_or_else(|| "missing embedding tensor `embed_tokens.weight`".to_string())?;
-            if id >= embed.rows {
-                return Err(format!(
-                    "token id {} is outside embedding range ({} rows)",
-                    token, embed.rows
-                ));
-            }
-            embed.row(id).to_vec()
-        };
+            return Ok(emb.row_f32(id));
+        }
+        let embed = self
+            .w("embed_tokens.weight")
+            .ok_or_else(|| "missing embedding tensor `embed_tokens.weight`".to_string())?;
+        if id >= embed.rows {
+            return Err(format!(
+                "token id {} is outside embedding range ({} rows)",
+                token, embed.rows
+            ));
+        }
+        Ok(embed.row(id).to_vec())
+    }
+
+    fn forward_token(&mut self, token: u32) -> Result<Vec<f32>, String> {
+        let num_layers = self.config.num_layers;
+        let hs = self.config.hidden_size;
+        let vocab = self.config.vocab_size;
+        let eps = self.config.rms_norm_eps;
+        let layer_types = self.config.layer_types.clone();
+        let intv = self.config.full_attention_interval;
+
+        let mut x = self.embedding_row(token)?;
 
         let pos = self.position;
         let mut full_idx = 0usize;
@@ -894,5 +896,32 @@ impl Model {
             }],
             linear_states: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedding_row_resolves_multimodal_fp16_embedding() {
+        let mut m = Model::tiny();
+        // Untied multimodal checkpoint: there is no f32 embedding in
+        // `weights`; the fp16 table lives under the language-model prefix.
+        m.weights.remove("model.embed_tokens.weight");
+        m.prefix = "model.language_model.".into();
+        m.embeddings_f16.insert(
+            "model.language_model.embed_tokens.weight".into(),
+            F16Matrix {
+                rows: 2,
+                cols: 4,
+                data: vec![0x3c00; 8], // fp16 1.0
+            },
+        );
+        assert_eq!(m.embedding_row(1).unwrap(), vec![1.0f32; 4]);
+
+        // A wrong prefix must fail loudly rather than mis-tokenize.
+        m.prefix = "model.".into();
+        assert!(m.embedding_row(0).is_err());
     }
 }
