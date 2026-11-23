@@ -34,13 +34,20 @@ impl Request {
 /// Read a full HTTP request (request line, headers, body).
 pub fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
     let mut reader = BufReader::new(stream);
+    // Cap the *whole* header block while reading it. `read_line` on an
+    // unbounded reader would happily buffer a multi-gigabyte line before the
+    // header-size check below ever ran (a slow-client OOM vector).
+    let mut limited = (&mut reader).take(MAX_HEADER_BYTES as u64 + 1);
     let mut request_line = String::new();
-    if reader
+    if limited
         .read_line(&mut request_line)
         .map_err(|e| e.to_string())?
         == 0
     {
         return Err("empty request".into());
+    }
+    if request_line.len() > MAX_HEADER_BYTES {
+        return Err("request line too large".into());
     }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().ok_or("bad request line")?.to_string();
@@ -55,7 +62,7 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
     let mut header_bytes = request_line.len();
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+        if limited.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
             break;
         }
         header_bytes += line.len();
@@ -82,6 +89,8 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
             headers.push((k, v));
         }
     }
+    // `limited` is no longer used; NLL releases the header borrow here so the
+    // body can be read from the underlying reader below.
     let content_length = content_length.unwrap_or(0);
 
     let mut body = vec![0u8; content_length];
@@ -240,5 +249,55 @@ pub fn serve(
             }
             Err(e) => eprintln!("[http] accept error: {}", e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A newline-free flood must be rejected by the header cap, not buffered
+    /// into an unbounded String before the cap is checked.
+    #[test]
+    fn request_line_is_bounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream)
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(&vec![b'A'; 2 * MAX_HEADER_BYTES]).unwrap();
+        drop(client); // EOF so read_line returns with the truncated line
+        let err = match server.join().unwrap() {
+            Ok(_) => panic!("overlong request line was accepted"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("too large"),
+            "expected the header cap to reject the line, got {:?}",
+            err
+        );
+    }
+
+    /// A normal request still parses correctly through the bounded reader.
+    #[test]
+    fn bounded_reader_parses_normal_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream)
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .write_all(b"POST /v1/chat/completions?x=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody")
+            .unwrap();
+        let req = server.join().unwrap().unwrap();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/v1/chat/completions");
+        assert_eq!(req.query, "x=1");
+        assert_eq!(req.body, b"body");
+        assert_eq!(req.header("host"), Some("localhost"));
     }
 }

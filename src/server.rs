@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ResponseFormat {
@@ -46,6 +47,9 @@ pub struct Params {
     /// Number of alternative tokens reported per position (top_logprobs for
     /// chat, `logprobs: N` for completions). Capped at MAX_TOP_LOGPROBS.
     pub top_logprobs: usize,
+    /// Internal wall-clock deadline override. Never set from the API; tests
+    /// use it to exercise the deadline path without waiting minutes.
+    pub deadline: Option<Instant>,
 }
 
 impl Default for Params {
@@ -70,9 +74,14 @@ impl Default for Params {
             response_format: ResponseFormat::Text,
             logprobs: false,
             top_logprobs: 0,
+            deadline: None,
         }
     }
 }
+
+/// A single generation holds the model mutex, so bound its wall-clock time
+/// regardless of the requested token count.
+const MAX_GENERATION_SECONDS: u64 = 300;
 
 /// A single token's log probability (used for top_logprobs entries).
 #[derive(Clone, Debug)]
@@ -425,7 +434,14 @@ impl Engine {
         let debug = std::env::var("EXLLAMA_DEBUG").is_ok();
         const DECODE_BATCH: usize = 16;
         let decode_start = std::time::Instant::now();
+        let deadline = params
+            .deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(MAX_GENERATION_SECONDS));
         for (step, _) in (0..max_tokens).enumerate() {
+            if Instant::now() >= deadline {
+                finish = "length".into();
+                break;
+            }
             if debug && step < 5 {
                 let mut stats = logits.iter().fold(
                     (f32::INFINITY, f32::NEG_INFINITY, 0usize, 0usize),
@@ -488,7 +504,6 @@ impl Engine {
             });
             completion.push(tok);
             if let Some(info) = lp_info {
-                on_logprob(&info);
                 logprobs.push(info);
             }
 
@@ -499,6 +514,14 @@ impl Engine {
             } else {
                 false
             };
+            // Emit the logprob delta *after* this token's content delta. The
+            // old order put logprobs before content, which is not how OpenAI
+            // chunks a token's output position.
+            if params.logprobs {
+                if let Some(info) = logprobs.last() {
+                    on_logprob(info);
+                }
+            }
             if stopped {
                 finish = "stop".into();
                 break;
@@ -1081,8 +1104,10 @@ fn parse_params_inner(body: &Json, engine: &Engine, chat: bool) -> Result<Params
         p.seed = Some(v as u64);
     }
     if let Some(v) = json_f32(body, "repetition_penalty")? {
-        if v < 0.0 {
-            return Err(bad("repetition_penalty must be >= 0"));
+        // Zero used to silently disable the penalty; reject it so a typo
+        // cannot quietly change decoding behavior.
+        if !v.is_finite() || v <= 0.0 {
+            return Err(bad("repetition_penalty must be a finite number > 0"));
         }
         p.repetition_penalty = v;
     }
@@ -1349,6 +1374,106 @@ fn completion_logprobs_json(tokens: &[TokenLogprob]) -> Json {
     ])
 }
 
+/// Incrementally extracts Qwen3.5 `<tool_call>` blocks from streamed answer
+/// text. Content before a block streams normally; text inside a block is
+/// withheld until it closes, then reported as a parsed call so SSE can emit
+/// OpenAI `tool_calls` deltas rather than raw XML.
+struct ToolCallStreamer {
+    pending: String,
+    next_index: usize,
+}
+
+impl ToolCallStreamer {
+    const OPEN: &'static str = "<tool_call>";
+    const CLOSE: &'static str = "</tool_call>";
+
+    fn new() -> Self {
+        Self {
+            pending: String::new(),
+            next_index: 0,
+        }
+    }
+
+    /// Returns (plain content to stream, completed calls as (index, name,
+    /// arguments JSON text)).
+    fn push(&mut self, chunk: &str) -> (String, Vec<(usize, String, String)>) {
+        self.pending.push_str(chunk);
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        loop {
+            let Some(open) = self.pending.find(Self::OPEN) else {
+                // Hold back the longest suffix that is also a prefix of the
+                // opening tag; it may complete in a later chunk. A fixed
+                // hold-back would leak earlier text into the content stream.
+                let max = self.pending.len().min(Self::OPEN.len() - 1);
+                let mut hold = 0;
+                for n in (1..=max).rev() {
+                    let start = self.pending.len() - n;
+                    if self.pending.is_char_boundary(start)
+                        && Self::OPEN.starts_with(&self.pending[start..])
+                    {
+                        hold = n;
+                        break;
+                    }
+                }
+                let safe = self.pending.len() - hold;
+                if safe > 0 {
+                    content.push_str(&self.pending[..safe]);
+                    self.pending.drain(..safe);
+                }
+                return (content, calls);
+            };
+            content.push_str(&self.pending[..open]);
+            let after_open = open + Self::OPEN.len();
+            let Some(close_rel) = self.pending[after_open..].find(Self::CLOSE) else {
+                // Keep the opening marker and everything after it buffered.
+                self.pending.drain(..open);
+                return (content, calls);
+            };
+            let close = after_open + close_rel + Self::CLOSE.len();
+            let block = self.pending[open..close].to_string();
+            self.pending.drain(..close);
+            if let Some(call) = crate::chat::parse_one_tool_call(&block, self.next_index) {
+                calls.push((self.next_index, call.name, call.arguments));
+                self.next_index += 1;
+            }
+        }
+    }
+
+    /// Flush any trailing text that did not form a tool call.
+    fn finish(&mut self) -> String {
+        std::mem::take(&mut self.pending)
+    }
+
+    fn any_calls(&self) -> bool {
+        self.next_index > 0
+    }
+}
+
+/// One OpenAI `tool_calls` delta entry. `id`/`name` appear only in the first
+/// fragment for a call; later fragments carry just `arguments`.
+fn tool_call_delta(
+    index: usize,
+    id: Option<&str>,
+    name: Option<&str>,
+    arguments: Option<&str>,
+) -> Json {
+    let mut function: Vec<(String, Json)> = Vec::new();
+    if let Some(n) = name {
+        function.push(("name".into(), Json::Str(n.into())));
+    }
+    if let Some(a) = arguments {
+        function.push(("arguments".into(), Json::Str(a.into())));
+    }
+    let mut call: Vec<(String, Json)> = vec![("index".into(), Json::Num(index as f64))];
+    if let Some(id) = id {
+        call.push(("id".into(), Json::Str(id.into())));
+    }
+    call.push(("type".into(), Json::Str("function".into())));
+    call.push(("function".into(), Json::Obj(function)));
+    Json::Arr(vec![Json::Obj(call)])
+}
+
 #[allow(clippy::too_many_arguments)]
 fn chat_chunk_json(
     id: &str,
@@ -1360,6 +1485,7 @@ fn chat_chunk_json(
     finish: Option<&str>,
     logprobs: Option<Json>,
     usage: Option<Json>,
+    tool_calls: Option<Json>,
 ) -> Json {
     let mut delta: Vec<(String, Json)> = Vec::new();
     if let Some(r) = delta_role {
@@ -1370,6 +1496,9 @@ fn chat_chunk_json(
     }
     if let Some(r) = reasoning {
         delta.push(("reasoning_content".into(), Json::Str(r.into())));
+    }
+    if let Some(tc) = tool_calls {
+        delta.push(("tool_calls".into(), tc));
     }
     let mut choice: Vec<(String, Json)> = vec![
         ("index".into(), Json::Num(index as f64)),
@@ -1407,7 +1536,7 @@ fn chat_chunk(
     finish: Option<&str>,
 ) -> String {
     chat_chunk_json(
-        id, model, 0, delta_role, content, reasoning, finish, None, None,
+        id, model, 0, delta_role, content, reasoning, finish, None, None, None,
     )
     .to_string()
 }
@@ -1510,6 +1639,19 @@ fn completion_chunk_json(
     Json::Obj(obj)
 }
 
+/// Final SSE chunk with `choices: []` and aggregate usage, matching the
+/// OpenAI convention also used by the chat endpoint.
+fn completion_usage_chunk(id: &str, model: &str, usage: Json) -> Json {
+    Json::Obj(vec![
+        ("id".into(), Json::Str(id.into())),
+        ("object".into(), Json::Str("text_completion".into())),
+        ("created".into(), Json::Num(now())),
+        ("model".into(), Json::Str(model.into())),
+        ("choices".into(), Json::Arr(Vec::new())),
+        ("usage".into(), usage),
+    ])
+}
+
 pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
     let body: Json = match parse_body(&req) {
         Ok(b) => b,
@@ -1550,10 +1692,16 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
         let mut results: Vec<GenResult> = Vec::with_capacity(params.n);
         // Both callbacks need to write chunks; a RefCell shares the borrow.
         let sse_cell = RefCell::new(&mut sse);
+        let emit = |json: Json| {
+            sse_cell
+                .borrow_mut()
+                .write_chunk(&format!("data: {}\n\n", json));
+        };
         let mut failed = false;
         for (i, seed) in seeds.iter().enumerate() {
             let mut p = params.clone();
             p.seed = *seed;
+            let mut tool_stream = ToolCallStreamer::new();
             // OpenAI sends a separate role chunk for every choice.
             sse_cell.borrow_mut().write_chunk(&format!(
                 "data: {}\n\n",
@@ -1562,6 +1710,7 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
                     &model_name,
                     i,
                     Some("assistant"),
+                    None,
                     None,
                     None,
                     None,
@@ -1576,25 +1725,75 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
                     if chunk.is_empty() {
                         return true;
                     }
-                    let (content, reasoning) = if is_reasoning {
-                        (None, Some(chunk))
-                    } else {
-                        (Some(chunk), None)
-                    };
-                    sse_cell.borrow_mut().write_chunk(&format!(
-                        "data: {}\n\n",
-                        chat_chunk_json(
+                    if is_reasoning {
+                        emit(chat_chunk_json(
                             &id,
                             &model_name,
                             i,
                             None,
-                            content,
-                            reasoning,
+                            None,
+                            Some(chunk),
                             None,
                             None,
-                            None
-                        )
-                    ))
+                            None,
+                            None,
+                        ));
+                        return true;
+                    }
+                    // Strip `<tool_call>` XML from the content stream and
+                    // report the parsed calls as OpenAI tool-call deltas.
+                    let (content, calls) = tool_stream.push(chunk);
+                    if !content.is_empty() {
+                        emit(chat_chunk_json(
+                            &id,
+                            &model_name,
+                            i,
+                            None,
+                            Some(&content),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        ));
+                    }
+                    for (tc_index, name, arguments) in calls {
+                        let call_id = format!("call_{}", tc_index);
+                        emit(chat_chunk_json(
+                            &id,
+                            &model_name,
+                            i,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(tool_call_delta(tc_index, Some(&call_id), Some(&name), None)),
+                        ));
+                        // OpenAI streams arguments in fragments.
+                        let mut rest = arguments.as_str();
+                        while !rest.is_empty() {
+                            let mut end = rest.len().min(64);
+                            while end > 0 && !rest.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            emit(chat_chunk_json(
+                                &id,
+                                &model_name,
+                                i,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                Some(tool_call_delta(tc_index, None, None, Some(&rest[..end]))),
+                            ));
+                            rest = &rest[end..];
+                        }
+                    }
+                    true
                 },
                 |lp| {
                     if p.logprobs {
@@ -1609,6 +1808,7 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
                                 None,
                                 None,
                                 Some(chat_logprobs_json(std::slice::from_ref(lp))),
+                                None,
                                 None
                             )
                         ));
@@ -1617,26 +1817,40 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
             );
             match res {
                 Ok(r) => {
-                    // Tool-call deltas are not streamed separately; the XML
-                    // text is emitted as content. At least report the reason.
-                    let finish = if parse_tool_calls(&r.text).1.is_empty() {
-                        r.finish_reason.as_str()
-                    } else {
-                        "tool_calls"
-                    };
-                    sse_cell.borrow_mut().write_chunk(&format!(
-                        "data: {}\n\n",
-                        chat_chunk_json(
+                    // Flush any trailing plain text the streamer held back
+                    // while waiting for a possible tool-call marker.
+                    let tail = tool_stream.finish();
+                    if !tail.is_empty() {
+                        emit(chat_chunk_json(
                             &id,
                             &model_name,
                             i,
                             None,
+                            Some(&tail),
                             None,
                             None,
-                            Some(finish),
                             None,
-                            None
-                        )
+                            None,
+                            None,
+                        ));
+                    }
+                    let finish =
+                        if tool_stream.any_calls() || !parse_tool_calls(&r.text).1.is_empty() {
+                            "tool_calls"
+                        } else {
+                            r.finish_reason.as_str()
+                        };
+                    emit(chat_chunk_json(
+                        &id,
+                        &model_name,
+                        i,
+                        None,
+                        None,
+                        None,
+                        Some(finish),
+                        None,
+                        None,
+                        None,
                     ));
                     results.push(r);
                 }
@@ -1788,11 +2002,9 @@ pub fn handle_completions(mut stream: TcpStream, req: Request, engine: &Arc<Engi
                 Ok(r) => {
                     let finish = r.finish_reason.clone();
                     results.push(r);
-                    let usage =
-                        (params.include_usage && i + 1 == params.n).then(|| usage_from(&results));
                     sse_cell.borrow_mut().write_chunk(&format!(
                         "data: {}\n\n",
-                        completion_chunk_json(&id, &model_name, i, "", None, Some(&finish), usage)
+                        completion_chunk_json(&id, &model_name, i, "", None, Some(&finish), None)
                     ));
                 }
                 Err(e) => {
@@ -1810,6 +2022,13 @@ pub fn handle_completions(mut stream: TcpStream, req: Request, engine: &Arc<Engi
             sse.write_chunk("data: [DONE]\n\n");
             sse.end();
             return;
+        }
+        // Like chat, usage goes in its own final chunk with no choices.
+        if params.include_usage {
+            sse.write_chunk(&format!(
+                "data: {}\n\n",
+                completion_usage_chunk(&id, &model_name, usage_from(&results))
+            ));
         }
         sse.write_chunk("data: [DONE]\n\n");
         sse.end();
@@ -1928,6 +2147,26 @@ mod tests {
         resp.split_once("\r\n\r\n").unwrap().1
     }
 
+    /// Extract the JSON payloads from a chunked SSE response body, in order.
+    fn sse_chunks(b: &str) -> Vec<Json> {
+        let mut out = Vec::new();
+        let mut rest = b;
+        while let Some(pos) = rest.find("data: ") {
+            rest = &rest[pos + "data: ".len()..];
+            if rest.starts_with("[DONE]") {
+                break;
+            }
+            let Some(end) = rest.find("\n\n") else {
+                break;
+            };
+            if let Ok(j) = crate::json::parse(&rest[..end]) {
+                out.push(j);
+            }
+            rest = &rest[end + 2..];
+        }
+        out
+    }
+
     #[test]
     fn repetition_penalty_breaks_greedy_loop() {
         let mut params = Params {
@@ -1984,6 +2223,27 @@ mod tests {
         assert!(engine
             .generate(vec![], &params, false, false, |_, _| true)
             .is_err());
+    }
+
+    #[test]
+    fn generation_deadline_stops_before_first_token() {
+        let engine = tiny_engine();
+        let params = Params {
+            temperature: 0.0,
+            max_tokens: 64,
+            enable_thinking: false,
+            deadline: Some(Instant::now()), // already expired
+            ..Default::default()
+        };
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "hi".into(),
+            ..Default::default()
+        }];
+        let res = engine.run_chat(&messages, &params, |_, _| true).unwrap();
+        assert_eq!(res.completion_tokens, 0);
+        assert_eq!(res.finish_reason, "length");
+        assert!(res.logprobs.is_empty());
     }
 
     #[test]
@@ -2122,6 +2382,7 @@ mod tests {
             r#"{"top_p": 0}"#,
             r#"{"seed": -1}"#,
             r#"{"repetition_penalty": -1}"#,
+            r#"{"repetition_penalty": 0}"#,
         ] {
             let j = crate::json::parse(body).unwrap();
             assert!(parse_params(&j, &tiny_engine()).is_err(), "body={}", body);
@@ -2314,6 +2575,129 @@ mod tests {
         assert!(b.contains("\"top_logprobs\""));
         assert!(b.contains("\"logprob\""));
         assert!(b.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn http_stream_logprob_delta_follows_content_delta() {
+        let addr = start_server();
+        let payload = r#"{"model":"tiny-model","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"temperature":0,"enable_thinking":false,"stream":true,"logprobs":true,"top_logprobs":0}"#;
+        let r = post(addr, "/v1/chat/completions", payload);
+        assert_eq!(status(&r), 200, "{}", r);
+        let mut content_at = None;
+        let mut logprob_at = None;
+        for (i, chunk) in sse_chunks(body(&r)).iter().enumerate() {
+            let Some(choice) = chunk
+                .get("choices")
+                .and_then(|v| v.as_arr())
+                .and_then(|a| a.first())
+            else {
+                continue;
+            };
+            if content_at.is_none() && choice.get("delta").and_then(|d| d.get("content")).is_some()
+            {
+                content_at = Some(i);
+            }
+            if logprob_at.is_none() && choice.get("logprobs").is_some() {
+                logprob_at = Some(i);
+            }
+        }
+        let content_at = content_at.expect("no content delta in stream");
+        let logprob_at = logprob_at.expect("no logprob delta in stream");
+        assert!(
+            content_at < logprob_at,
+            "content delta {} should precede logprob delta {}",
+            content_at,
+            logprob_at
+        );
+    }
+
+    #[test]
+    fn http_completions_stream_usage_is_final_empty_choices_chunk() {
+        let addr = start_server();
+        let payload = r#"{"model":"tiny-model","prompt":"hi","max_tokens":4,"temperature":0,"stream":true,"stream_options":{"include_usage":true},"logprobs":1}"#;
+        let r = post(addr, "/v1/completions", payload);
+        assert_eq!(status(&r), 200, "{}", r);
+        let chunks = sse_chunks(body(&r));
+        assert!(chunks.len() > 1);
+        // No earlier chunk carries usage.
+        for c in &chunks[..chunks.len() - 1] {
+            assert!(c.get("usage").is_none(), "early usage chunk: {}", c);
+        }
+        let last = chunks.last().unwrap();
+        assert!(last
+            .get("choices")
+            .and_then(|v| v.as_arr())
+            .is_some_and(|a| a.is_empty()));
+        assert!(last
+            .get("usage")
+            .and_then(|u| u.get("total_tokens"))
+            .is_some());
+    }
+
+    #[test]
+    fn tool_call_streamer_extracts_blocks_across_chunks() {
+        let mut s = ToolCallStreamer::new();
+        let (c1, calls1) = s.push("Before <tool_");
+        assert_eq!(c1, "Before "); // partial marker held back
+        assert!(calls1.is_empty());
+
+        let (c2, calls2) = s.push(
+            "call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\nAfter",
+        );
+        assert_eq!(c2, "\nAfter");
+        assert_eq!(calls2.len(), 1);
+        assert_eq!(calls2[0].0, 0);
+        assert_eq!(calls2[0].1, "get_weather");
+        assert_eq!(calls2[0].2, r#"{"city":"Paris"}"#);
+        assert!(s.any_calls());
+        assert_eq!(s.finish(), "");
+    }
+
+    #[test]
+    fn tool_call_delta_has_openai_shape() {
+        let first = tool_call_delta(2, Some("call_2"), Some("f"), None);
+        let arr = first.as_arr().unwrap();
+        assert_eq!(arr.len(), 1);
+        let call = &arr[0];
+        assert_eq!(call.get("index").unwrap().as_f64(), Some(2.0));
+        assert_eq!(call.get("id").unwrap().as_str(), Some("call_2"));
+        assert_eq!(call.get("type").unwrap().as_str(), Some("function"));
+        let f = call.get("function").unwrap();
+        assert_eq!(f.get("name").unwrap().as_str(), Some("f"));
+        assert!(f.get("arguments").is_none());
+
+        let second = tool_call_delta(2, None, None, Some("{\"x\":1}"));
+        let call = &second.as_arr().unwrap()[0];
+        assert!(call.get("id").is_none());
+        assert_eq!(
+            call.get("function")
+                .unwrap()
+                .get("arguments")
+                .unwrap()
+                .as_str(),
+            Some("{\"x\":1}")
+        );
+
+        // The delta is placed inside the choice's `delta` object.
+        let chunk = chat_chunk_json(
+            "id",
+            "model",
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(first),
+        );
+        assert!(chunk
+            .get("choices")
+            .and_then(|v| v.as_arr())
+            .and_then(|a| a.first())
+            .and_then(|c| c.get("delta"))
+            .and_then(|d| d.get("tool_calls"))
+            .is_some());
     }
 
     #[test]

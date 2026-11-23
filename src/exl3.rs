@@ -199,9 +199,9 @@ fn half_f32(bits: u16) -> f32 {
 /// the lookup table. Avoids materialising a full-size f32 scratch per matmul.
 #[inline]
 fn dot_f16(x: &[f32], w: &[u16]) -> f32 {
-    let n = x.len().min(w.len());
+    assert_eq!(x.len(), w.len(), "dot_f16: length mismatch");
     let mut acc = 0.0f32;
-    for k in 0..n {
+    for k in 0..x.len() {
         acc += x[k] * half_f32(w[k]);
     }
     acc

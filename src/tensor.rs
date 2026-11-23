@@ -75,14 +75,27 @@ mod tests {
         assert_eq!(m.row_f32(0), vec![1.0, 2.0, 3.0]);
         assert_eq!(m.row_f32(1), vec![-1.5, 0.0, 0.25]);
     }
+
+    #[test]
+    fn dot_requires_equal_lengths() {
+        assert_eq!(dot(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]), 32.0);
+        let result = std::panic::catch_unwind(|| dot(&[1.0, 2.0], &[3.0]));
+        assert!(
+            result.is_err(),
+            "a length mismatch must not be silently truncated"
+        );
+    }
 }
 
 /// Dot product of two equal-length slices.
 #[inline(always)]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    let n = a.len().min(b.len());
+    // Silently truncating to the shorter slice hid shape bugs (a wrong-sized
+    // projection looked like a plausible answer). All callers pass equal
+    // lengths; enforce that invariant in every build, not just debug.
+    assert_eq!(a.len(), b.len(), "dot: length mismatch");
     let mut acc = 0.0f32;
-    for k in 0..n {
+    for k in 0..a.len() {
         acc += a[k] * b[k];
     }
     acc

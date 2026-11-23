@@ -7,16 +7,18 @@ module. It complements `TODO.md`: that file tracks individual checked-off tasks,
 while this file groups the *open* work into executable phases with acceptance
 criteria.
 
-> **Status:** Phase 0 is **implemented and verified** (see the completion notes
-> below); Phases 1–3 remain plans. Commit only on explicit approval.
+> **Status:** Phases 0 and 1 are **implemented and verified** (see the
+> completion notes below); Phases 2–3 remain plans. Commit only on explicit
+> approval.
 
 ## Baseline (at time of review)
 
 - Branch `main`, tag `v0.4.2`, working tree clean at review time.
 - At review: `cargo test` **84 passed, 4 ignored**. After Phase 0:
-  **88 passed, 10 ignored** (6 real-model / `/tmp` fixtures now explicitly
-  ignored with reasons, 4 benchmarks). `cargo fmt --all -- --check` and
-  `cargo clippy --all-targets -- -D warnings` remain clean.
+  **88 passed, 10 ignored**. After Phase 1: **99 passed, 10 ignored** (6
+  real-model / `/tmp` fixtures explicitly ignored with reasons, 4 benchmarks).
+  `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`
+  remain clean.
 - The **forward math is correct**. `src/model.rs` matches both `AGENTS.md` §6
   and the upstream HuggingFace `modeling_qwen3_5.py` / `modeling_qwen3_next.py`
   reference on every subtlety checked: q_proj `[query|gate]` per-head
@@ -91,6 +93,9 @@ tests silently return early when `/tmp` files are absent.
    both the request line and headers, and reject overlong lines.
    *Acceptance:* fuzz test with a >64 KiB newline-free request line returns
    an error without unbounded allocation.
+   **Done:** the request line and headers are read through
+   `Read::take(MAX_HEADER_BYTES + 1)`; overlong lines return "request line too
+   large". `http::tests` covers both the flood and a normal request.
 
 5. **Serialize global threadpool `run()` calls.** `threadpool::run()`
    (`src/threadpool.rs:78`) uses one global `POOL` and a per-call `Barrier`.
@@ -101,6 +106,9 @@ tests silently return early when `/tmp` files are absent.
    worker does not help (the block is `Barrier::wait()`).
    *Acceptance:* a stress test issues concurrent `matmul_t` calls from
    multiple threads and completes without hanging.
+   **Done:** a global `RUN_LOCK` serializes whole `run()` calls (recovering
+   from a poisoned lock); `threadpool::tests::concurrent_runs_complete_without_deadlock`
+   exercises 8 callers x 50 batches.
 
 6. **Strengthen `dot()` and CLI validation.**
    - `tensor::dot()` (`src/tensor.rs:82`) uses `a.len().min(b.len())`, silently
@@ -111,6 +119,9 @@ tests silently return early when `/tmp` files are absent.
      Clamp `--context-size` (and thread count) at startup.
    *Acceptance:* mismatched dot inputs are caught in tests; CLI parsing tests
    cover oversized context values.
+   **Done:** `dot()` and `dot_f16()` assert equal lengths; `parse_cli()` now
+   uses one iterator (no double index bump) and clamps context to
+   `1..=1_000_000` and threads to `1..=1024`. Tests cover both.
 
 7. **Align SSE streaming with OpenAI.**
    - Emit the `logprobs` delta in the **same chunk as** the content delta (or
@@ -122,6 +133,10 @@ tests silently return early when `/tmp` files are absent.
      of only XML text with `finish_reason: "tool_calls"` (~1620-1626).
    *Acceptance:* a recorded SSE transcript matches the OpenAI SDK's expected
    chunk shape; add assertions in `server::tests`.
+   **Done:** logprob deltas now follow the content delta; `/v1/completions`
+   emits a final `choices: []` usage chunk; `ToolCallStreamer` + `tool_call_delta`
+   emit indexed name/argument deltas and keep XML out of content. Assertions
+   cover chunk ordering, usage placement, streamer parsing and delta shape.
 
 8. **Tighten generation semantics.**
    - Reject `repetition_penalty <= 0` (currently `0` silently disables the
@@ -134,6 +149,10 @@ tests silently return early when `/tmp` files are absent.
      cannot hold the mutex-bound model indefinitely.
    *Acceptance:* invalid penalties return 400; a deadline test terminates a
    long generation; `completion_tokens` behavior is documented and tested.
+   **Done:** `repetition_penalty` must be finite and `> 0`; a 300 s
+   `MAX_GENERATION_SECONDS` deadline is checked each step (with an internal
+   `Params.deadline` override for tests); reasoning delimiters were explicitly
+   documented as excluded from `completion_tokens` in `README.md` / `AGENTS.md`.
 
 9. **Bound regex quantifier allocations.** `Re::Quant` (`src/regex.rs`, ~164-196)
    builds `reachable: Vec<Vec<usize>>` with one entry per repetition, capped at
@@ -144,6 +163,10 @@ tests silently return early when `/tmp` files are absent.
    for the 8 MiB body-cap threat model.
    *Acceptance:* a pathological pattern returns an error or bounded-time
    result instead of unbounded allocation.
+   **Done:** unbounded quantifiers cap at `MAX_QUANT_REPEATS = 4096` and a
+   `WorkBudget` of 1M steps is threaded through `possible_ends` / `all_seq_ends`;
+   `regex::tests::unbounded_quantifier_is_bounded` covers a long run and a
+   crafted `(a+)+b` pattern.
 
 ---
 
@@ -194,8 +217,9 @@ tests silently return early when `/tmp` files are absent.
 
 ## Suggested execution order
 
-**Phase 0 is complete** → **Phase 1 → Phase 2 → Phase 3**. Phase 0 was
-low-risk, closed the most dangerous gap (untested core guarantees) and makes
-every later change safer. Start the remaining work with Phase 1 item 4 (the
-bounded HTTP request line), then item 5 (threadpool deadlock). Do not commit
-until the user explicitly approves.
+**Phase 0 and Phase 1 are complete** → **Phase 2 → Phase 3**. Phase 1 closed
+the request-line OOM vector, the threadpool cross-call deadlock, silent
+dimension mismatches, SSE ordering/usage/tool-call gaps, unbounded generation
+and the regex DoS vector. Start the remaining work with Phase 2 item 10
+(reusing post-prefill state for `n > 1`) and measure before changing matmul
+paths. Do not commit until the user explicitly approves.

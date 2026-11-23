@@ -11,7 +11,7 @@ The JSON parser, HTTP server, tokenizer, regex engine, PRNG and EXL3 dequantizer
 - **Qwen3.5 text decoder** — full attention (GQA + partial RoPE) and linear attention (Gated DeltaNet), SwiGLU MLP, zero-centered RMSNorm.
 - **Configurable context size** and thread count from the CLI.
 - **Thinking mode** — Qwen3.5 `<think>` blocks, configurable via `enable_thinking` in chat requests (default follows model size: off for 0.8B/2B, on for 4B/9B).
-- **Tool calling** — OpenAI `tools` / assistant `tool_calls` are rendered into Qwen3.5's XML format; generated tool calls are parsed back into `tool_calls` response fields. Streaming emits tool-call text as content (no separate deltas yet).
+- **Tool calling** — OpenAI `tools` / assistant `tool_calls` are rendered into Qwen3.5's XML format; generated tool calls are parsed back into `tool_calls` response fields. Streaming emits indexed `tool_calls` deltas (name + argument fragments) and withholds the XML from `content`.
 - **Cross-platform** — Linux, macOS, and Windows (see [CI](#continuous-integration)).
 
 ## Requirements
@@ -136,10 +136,16 @@ The `reasoning_content` field is omitted when there is no thinking trace.
 > `repetition_penalty: 1.1` to break the loop. The `tests/test_api.sh` thinking
 > test does exactly this.
 
-`repetition_penalty` (> 1) divides the logit of already-generated tokens, which
-discourages repetition in both greedy and sampled decoding.
+`repetition_penalty` must be a finite number `> 0` (values `> 1` divide the
+logit of already-generated tokens, discouraging repetition in both greedy and
+sampled decoding).
 
 Streaming: add `"stream": true` to receive SSE chunks terminated by `data: [DONE]`.
+Each token's `logprobs` delta follows its content delta; with
+`stream_options.include_usage`, both endpoints finish with a final chunk whose
+`choices` array is empty and which carries aggregate `usage`. Tool calls are
+streamed as indexed `tool_calls` deltas. A single generation is capped at 300 s
+of wall-clock time so a stalled request cannot block other clients.
 
 #### Logprobs, multiple choices, and response format
 
@@ -162,7 +168,9 @@ Streaming: add `"stream": true` to receive SSE chunks terminated by `data: [DONE
   (`tokens`, `token_logprobs`, `top_logprobs`, `text_offset`).
   Probabilities come from the logits after repetition/presence/frequency/bias
   penalties but before temperature/top-k/top-p sampling transforms. Reasoning
-  delimiters and stop tokens are excluded, matching `completion_tokens`.
+  delimiters (`<think>` / `</think>`) and stop tokens are excluded, matching
+  `completion_tokens`; delimiters still consume a forward step so the model
+  state stays aligned.
 - `n` (1–128) returns that many choices. Choices are generated **sequentially**
   (the model is mutex-guarded), so cost scales linearly; each choice gets its own
   RNG stream derived from `seed`. With greedy decoding (`temperature: 0`) all
@@ -205,7 +213,7 @@ Supported request parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `m
 cargo test
 ```
 
-Tests cover JSON parsing, regex/pre-tokenizer behavior, chat-template rendering (including committed golden prompts in `tests/golden/`), tool-call parsing, EXL3 codebook/tile-layout correctness against the reference implementation, sampling, logprobs, `n`-choice handling, parameter validation, end-to-end HTTP/SSE behavior against a tiny synthetic model, and deterministic dependency-free fuzz smoke tests for the JSON/HTTP/regex/tokenizer/API parsers (`src/fuzz.rs`). Two suites need no model download and always run: `exl3::synthetic_tests` verifies all three `--weight-mode` paths against full dequantization for every EXL3 codebook using an in-memory fixture, and `model::tests` holds hand-computed golden tests for the decoder math (RMSNorm, RoPE, q_proj interleaving, GQA, DeltaNet). Tests that need `/tmp` reference files (real tokenizer / real EXL3 layer) are explicitly `#[ignore]`d with reasons — run them with `cargo test -- --ignored` when those files exist. Current totals: 88 passed, 10 ignored. For throughput benchmarking with a real model, see `bench_generation_throughput` in `src/server.rs`.
+Tests cover JSON parsing, regex/pre-tokenizer behavior, chat-template rendering (including committed golden prompts in `tests/golden/`), tool-call parsing, EXL3 codebook/tile-layout correctness against the reference implementation, sampling, logprobs, `n`-choice handling, parameter validation, end-to-end HTTP/SSE behavior against a tiny synthetic model, and deterministic dependency-free fuzz smoke tests for the JSON/HTTP/regex/tokenizer/API parsers (`src/fuzz.rs`). Two suites need no model download and always run: `exl3::synthetic_tests` verifies all three `--weight-mode` paths against full dequantization for every EXL3 codebook using an in-memory fixture, and `model::tests` holds hand-computed golden tests for the decoder math (RMSNorm, RoPE, q_proj interleaving, GQA, DeltaNet). Tests that need `/tmp` reference files (real tokenizer / real EXL3 layer) are explicitly `#[ignore]`d with reasons — run them with `cargo test -- --ignored` when those files exist. Current totals: 99 passed, 10 ignored. For throughput benchmarking with a real model, see `bench_generation_throughput` in `src/server.rs`.
 
 For manual end-to-end checks against a **running server**, see [`tests/README.md`](tests/README.md). It contains smoke-test and diagnostic shell scripts (`test_api.sh`, `test_diag.sh`, `test_sample.sh`, `test_prompts.sh`) that exercise the OpenAI-compatible endpoints with curl.
 

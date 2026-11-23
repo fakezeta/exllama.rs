@@ -7,9 +7,17 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Barrier, OnceLock};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// The pool is global. A `run()` dispatches jobs to distinct workers and then
+/// blocks on a per-call barrier; if two callers interleave their sends, a
+/// worker can be stuck in one call's `BarrierGuard` while another call's job
+/// waits behind it. Serializing whole runs removes that cross-call cycle.
+/// Generation is already serialized by `Engine.model`, so this costs nothing
+/// in normal server operation.
+static RUN_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct Pool {
     senders: Vec<Sender<Job>>,
@@ -85,6 +93,8 @@ pub fn run(jobs: Vec<Job>) {
         }
         return;
     };
+    // Recover from a poisoned lock rather than disabling matmuls permanently.
+    let _run_guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let width = pool.senders.len();
     let mut jobs = jobs.into_iter();
     // Run every job; if there are more than workers, process them in batches.
@@ -144,5 +154,34 @@ mod tests {
         }
         run(jobs);
         assert_eq!(counter.load(Ordering::Relaxed), 4);
+    }
+
+    /// Concurrent callers must never interleave jobs around each other's
+    /// barriers. Without dispatch serialization this can hang; with it, every
+    /// job from every caller completes exactly once.
+    #[test]
+    fn concurrent_runs_complete_without_deadlock() {
+        init(4);
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let counter = counter.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    let mut jobs: Vec<Job> = Vec::new();
+                    for _ in 0..4 {
+                        let c = counter.clone();
+                        jobs.push(Box::new(move || {
+                            c.fetch_add(1, Ordering::Relaxed);
+                        }));
+                    }
+                    run(jobs);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker caller panicked");
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 8 * 50 * 4);
     }
 }

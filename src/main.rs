@@ -81,57 +81,62 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         weight_mode: "f32".into(),
         compute: "auto".into(),
     };
-    let mut i = 1;
-    while i < args.len() {
-        let a = &args[i];
-        let mut next = || {
-            i += 1;
-            args.get(i)
+    // A single iterator owns argument advancement. The old code incremented
+    // `i` both inside a value closure and after each match arm — easy to
+    // break when adding a flag.
+    const MAX_CONTEXT_SIZE: usize = 1_000_000;
+    const MAX_THREADS: usize = 1024;
+    let mut iter = args.iter().skip(1);
+    while let Some(a) = iter.next() {
+        let mut value = || {
+            iter.next()
                 .cloned()
-                .ok_or_else(|| "missing value for flag".to_string())
+                .ok_or_else(|| format!("missing value for {}", a))
         };
         match a.as_str() {
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
             }
-            "-m" | "--model" => cli.model = next()?,
+            "-m" | "--model" => cli.model = value()?,
             "-c" | "--context-size" => {
-                cli.context_size = next()?.parse().map_err(|_| "invalid --context-size")?
+                cli.context_size = value()?.parse().map_err(|_| "invalid --context-size")?
             }
-            "-p" | "--port" => cli.port = next()?.parse().map_err(|_| "invalid --port")?,
-            "--host" => cli.host = next()?,
-            "--tokenizer" => cli.tokenizer = Some(next()?),
+            "-p" | "--port" => cli.port = value()?.parse().map_err(|_| "invalid --port")?,
+            "--host" => cli.host = value()?,
+            "--tokenizer" => cli.tokenizer = Some(value()?),
             "--max-tokens" => {
-                cli.max_tokens = next()?.parse().map_err(|_| "invalid --max-tokens")?
+                cli.max_tokens = value()?.parse().map_err(|_| "invalid --max-tokens")?
             }
-            "--threads" => cli.threads = next()?.parse().map_err(|_| "invalid --threads")?,
-            "--name" => cli.name = Some(next()?),
+            "--threads" => cli.threads = value()?.parse().map_err(|_| "invalid --threads")?,
+            "--name" => cli.name = Some(value()?),
             "--weight-mode" => {
-                cli.weight_mode = next()?;
+                cli.weight_mode = value()?;
                 if !matches!(cli.weight_mode.as_str(), "f32" | "f16" | "packed") {
                     return Err("--weight-mode must be f32, f16, or packed".into());
                 }
             }
             "--compute" => {
-                cli.compute = next()?;
+                cli.compute = value()?;
                 if !matches!(cli.compute.as_str(), "auto" | "blas" | "gpu" | "scalar") {
                     return Err("--compute must be auto, blas, gpu, or scalar".into());
                 }
             }
             _ => return Err(format!("unknown argument: {}", a)),
         }
-        i += 1;
     }
     if cli.model.is_empty() {
         print_usage();
         return Err("--model is required".into());
     }
-    if cli.context_size == 0 {
-        return Err("--context-size must be > 0".into());
+    if cli.context_size == 0 || cli.context_size > MAX_CONTEXT_SIZE {
+        return Err(format!(
+            "--context-size must be in 1..={}",
+            MAX_CONTEXT_SIZE
+        ));
     }
-    if cli.threads == 0 {
-        return Err("--threads must be > 0".into());
+    if cli.threads == 0 || cli.threads > MAX_THREADS {
+        return Err(format!("--threads must be in 1..={}", MAX_THREADS));
     }
     if cli.max_tokens == 0 {
         return Err("--max-tokens must be > 0".into());
@@ -311,6 +316,14 @@ mod tests {
         assert!(parse_cli(&args(&["-c", "0"])).is_err());
         assert!(parse_cli(&args(&["--threads", "0"])).is_err());
         assert!(parse_cli(&args(&["--max-tokens", "0"])).is_err());
+    }
+
+    #[test]
+    fn cli_rejects_oversized_sizes() {
+        // Without an upper bound these values overflow KV-cache/thread
+        // allocations with a confusing panic instead of a clear CLI error.
+        assert!(parse_cli(&args(&["-c", "999999999999"])).is_err());
+        assert!(parse_cli(&args(&["--threads", "999999"])).is_err());
     }
 
     #[test]

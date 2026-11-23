@@ -23,7 +23,7 @@ This document is a complete orienteering guide for AI agents (or humans) continu
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build                      # debug
 cargo build --release            # optimized binary at target/release/exllama-server
-cargo test                       # 88 unit tests (10 ignored: real-model / /tmp fixtures + benchmarks)
+cargo test                       # 99 unit tests (10 ignored: real-model / /tmp fixtures + benchmarks)
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings   # must pass (CI enforces)
 ```
@@ -48,14 +48,14 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 | OPTIONS | any | 204 (CORS preflight) |
 
 ### API parameters (chat & completions)
-`temperature` (default 0.7), `top_p` (1.0), `top_k` (0 = off), `max_tokens` / `max_completion_tokens`, `stop` (string or array), `stop_token_ids`, `seed`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `logit_bias` (token-id → bias), `stream` (bool), `stream_options.include_usage`, `n` (1..=128), `user` (validated, no-op), `response_format` (`text` / `json_object`; best-effort hint, no constrained decoding), `logprobs` + `top_logprobs` (chat: bool + 0..=20; completions: integer with parallel-array response), and for chat: `enable_thinking` (bool, default **true** for 9B/4B). `model` is validated against the server name. Invalid parameters are rejected with a 400. `n` choices are generated sequentially (per-choice seeds derived from `seed`); with greedy decoding they are identical. Logprobs use the penalty-adjusted distribution before temperature/top-k/top-p and exclude reasoning delimiters and stop tokens.
+`temperature` (default 0.7), `top_p` (1.0), `top_k` (0 = off), `max_tokens` / `max_completion_tokens`, `stop` (string or array), `stop_token_ids`, `seed`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `logit_bias` (token-id → bias), `stream` (bool), `stream_options.include_usage`, `n` (1..=128), `user` (validated, no-op), `response_format` (`text` / `json_object`; best-effort hint, no constrained decoding), `logprobs` + `top_logprobs` (chat: bool + 0..=20; completions: integer with parallel-array response), and for chat: `enable_thinking` (bool, default **true** for 9B/4B). `model` is validated against the server name. Invalid parameters are rejected with a 400 (`repetition_penalty` must be finite and `> 0`). `n` choices are generated sequentially (per-choice seeds derived from `seed`); with greedy decoding they are identical. Logprobs use the penalty-adjusted distribution before temperature/top-k/top-p and exclude reasoning delimiters and stop tokens. A single generation has a 300-second wall-clock deadline (see `MAX_GENERATION_SECONDS`) so one stalled request cannot hold the model mutex forever.
 
 ---
 
 ## 3. Module Map
 
 ### `src/main.rs` — CLI + routing
-- `Cli` struct + `parse_cli()` — hand-rolled arg parser (`-m/--model`, `-c/--context-size`, `-p/--port`, `--host`, `--tokenizer`, `--max-tokens`, `--threads`, `--name`).
+- `Cli` struct + `parse_cli()` — hand-rolled arg parser (`-m/--model`, `-c/--context-size`, `-p/--port`, `--host`, `--tokenizer`, `--max-tokens`, `--threads`, `--name`, `--weight-mode`, `--compute`). A single iterator owns argument advancement (no manual index increments); `--context-size` is clamped to `1..=1_000_000` and `--threads` to `1..=1024`.
 - `main()` — loads `Model`, `Tokenizer`, builds `Engine`, wraps in `Arc`, binds `TcpListener`, calls `http::serve`.
 - `route()` — dispatches HTTP requests (see table above).
 - `models_json()` — builds `/v1/models` response.
@@ -66,6 +66,7 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 - `respond()` — writes a complete response with Content-Length and CORS headers.
 - `Streamer` — chunked SSE writer with `Cache-Control: no-cache`; `write_chunk()` returns false on a broken connection so generation aborts; `end(&mut self)` writes `0\r\n\r\n` (takes `&mut self` so callers sharing the stream with generation callbacks can still finish it).
 - `serve(listener, handler)` — accept loop; one OS thread per connection (capped at 64), 600 s read/write timeouts. Handler signature: `Fn(TcpStream, Request)` (takes ownership of the stream).
+- `read_request()` reads the request line and headers through `Read::take(MAX_HEADER_BYTES + 1)` so a newline-free flood is rejected instead of buffered without limit. Body is capped at 8 MiB.
 
 ### `src/json.rs` — JSON parser/serializer
 - `Json` enum: `Null, Bool(bool), Num(f64), Str(String), Arr(Vec<Json>), Obj(Vec<(String, Json)>)` (no separate Float variant).
@@ -78,11 +79,13 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 - `Matrix { rows, cols, data: Vec<f32> }` — row-major. **Weights are stored `(out_features, in_features)`**; a linear computes `y = x @ W^T` via `matmul_t`.
 - `F16Matrix { rows, cols, data: Vec<u16> }` — fp16 embedding storage; `row_f32(row)` decodes one row on lookup (used for untied models).
 - `matmul_t(x, x_rows, x_cols, w, y, nthreads)` — splits work over the persistent pool (over rows if many input rows, over output neurons otherwise).
+- `dot(a, b)` asserts equal lengths in every build (previously `min(a.len(), b.len())` silently hid shape bugs); `exl3::dot_f16` does the same.
 - **Rust 1.100 quirk:** `NonNull<f32>` and `*mut f32` are NOT `Send`. Workaround: `SharedPtr(*mut f32)` newtype with `unsafe impl Send`, `#[derive(Clone, Copy)]`, and a safe `write_at(offset, value)` method. Closures capture `SharedPtr` **by value** (Copy). Do not revert to raw pointers. Immutable inputs cross threads via `threadpool::SendSlice<T>`.
 
 ### `src/threadpool.rs` — Persistent worker pool
 - `init(threads)` spawns a fixed set of workers (called from `main` with `--threads`); `run(jobs)` dispatches `Box<dyn FnOnce() + Send>` jobs through std channels and waits on a `Barrier` before returning.
 - Jobs execute sequentially if `init` was never called (unit tests). A `BarrierGuard` releases the barrier even if a job panics, and the worker catches panics so the pool survives.
+- A global `RUN_LOCK` serializes complete `run()` calls: concurrent callers used to interleave jobs on the same workers and could deadlock across per-call barriers (a worker blocked in one call's guard cannot run another call's queued job). Generation is already serialized by `Engine.model`, so this costs nothing in normal operation.
 - Used by `tensor::matmul_t_scalar` and `QuantLinear::matmul` (f16/packed paths) instead of spawning scoped threads per call.
 
 ### `src/compute.rs` — Compute backend selection
@@ -99,9 +102,10 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 ### `src/regex.rs` — Minimal backtracking regex engine
 - `Regex::compile(pattern)` → `Regex` with `match_at` and `pre_tokenize` (isolated matches; used by tokenizer).
 - Supports: alternation (`|`), concat, groups `(?:...)`, lookaheads `(?=...)`, `(?!...)`, inline case-insensitive `(?i:...)`, greedy and lazy quantifiers (`* + ? {n} {n,m}`, each with optional trailing `?`), character classes with ranges, escapes, `\s \d \w \S \D \W`, Unicode property classes `\p{L} \p{M} \p{N} \p{P} \p{S} \p{Z} \p{C}` (including inside `[...]`).
+- Untrusted patterns are bounded: unbounded quantifiers cap at `MAX_QUANT_REPEATS = 4096` and each `match_at` gets a `MAX_MATCH_WORK = 1_000_000` step budget threaded through `possible_ends`/`all_seq_ends`. This prevents the old O(input-length) `Vec<Vec<usize>>` allocation and nested-quantifier blowups.
 - `pre_tokenize()` implements **isolated** split behavior: matches are kept, gaps are dropped. This is exactly what the Qwen3.5 `Split` pre-tokenizer needs.
 - Grouped subexpressions backtrack fully (`all_seq_ends`), so patterns like `(?:ab?|c)bb` match correctly.
-- 9 tests, including `test_qwen_style` with the exact Qwen3.5 pattern and expected word lists.
+- 10 tests, including `test_qwen_style` with the exact Qwen3.5 pattern and expected word lists, and `unbounded_quantifier_is_bounded` for the work caps.
 
 ### `src/tokenizer.rs` — Byte-level BPE tokenizer
 - `Tokenizer::load(path)` — reads `tokenizer.json`: vocab, merges, byte_encoder, added_tokens, pre-tokenizer pattern. Unknown pre-tokenizer shapes are rejected (no silent `\s+` fallback); added tokens from the sibling `tokenizer_config.json` (`added_tokens_decoder`) are merged; `id_to_token` is built in sorted-id order for deterministic decode.
@@ -123,25 +127,25 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
   - User: `<|im_start|>user\n{trim}<|im_end|>\n`
   - Assistant: prefers an explicit `reasoning_content`; otherwise splits reasoning from content if `</think>` present. If `idx > last_query_index` emits `<think>\n{reasoning}\n</think>\n\n{body}`. Assistant `tool_calls` render as Qwen3.5 XML (`<tool_call><function=...><parameter=...>...`).
   - Tool messages: grouped into one user turn with `<tool_response>` blocks.
-  - `tools_system_prompt()` builds the system preamble for OpenAI `tools`; `parse_tool_calls()` extracts generated `<tool_call>` blocks into response fields (streaming still emits the XML as content).
+  - `tools_system_prompt()` builds the system preamble for OpenAI `tools`; `parse_tool_calls()` extracts generated `<tool_call>` blocks into response fields. Streaming uses `ToolCallStreamer` in `server.rs` to strip the XML from content and emit indexed `tool_calls` deltas instead.
   - Generation prompt: `<|im_start|>assistant\n` + `<think>\n` (thinking on) or `<think>\n\n</think>\n\n` (off).
 - `enable_thinking` default is model-size-aware: `hidden_size >= 2560` → true (9B/4B), otherwise false (0.8B/2B); an explicit config value wins. `Params` seeds its default from `Engine.default_enable_thinking`.
 
 ### `src/server.rs` — Inference engine + API handlers
 - `Engine { model: Mutex<Model>, tokenizer, model_name, default_max_tokens, threads, default_enable_thinking }`.
 - `GenResult { text, reasoning_content, prompt_tokens, completion_tokens, finish_reason, logprobs }`.
-- `Params` (Clone) adds `n`, `user`, `response_format`, `logprobs`, `top_logprobs`; `parse_params_inner(body, engine, chat)` handles the different chat/completions shapes (`logprobs` bool vs integer). `ResponseFormat::JsonObject` adds a best-effort prompt hint (`apply_response_format_chat/text`); no constrained decoding.
+- `Params` (Clone) adds `n`, `user`, `response_format`, `logprobs`, `top_logprobs` and an internal `deadline: Option<Instant>` override (never set by the API; used by tests). `parse_params_inner(body, engine, chat)` handles the different chat/completions shapes (`logprobs` bool vs integer). `ResponseFormat::JsonObject` adds a best-effort prompt hint (`apply_response_format_chat/text`); no constrained decoding.
 - `generate_inner()` is the core loop; `generate()` wraps it with a no-op logprob callback. `run_chat_inner()` / `run_completion_inner()` likewise wrap `run_chat()` / `run_completion()` and thread an `on_logprob` callback through for SSE deltas. `prepare_logits()` (penalties/bias) is shared by `sample()` and `logprob_info()` so reported probabilities match the sampled distribution; `choice_seeds()` derives one RNG stream per choice for `n > 1`.
 - `generate()` — core loop:
   1. `model.reset()`, `logits = model.forward(&prompt_ids)` (prefill).
-  2. Each step: `sample()` → check stop token → decode incrementally → `on_token(chunk, is_reasoning)` → `logits = model.forward(&[tok])`.
+  2. Each step: check the 300 s deadline → `sample()` → check stop token → decode incrementally → `on_token(chunk, is_reasoning)` → emit the token's `on_logprob` delta (after the content chunk) → `logits = model.forward(&[tok])`.
   3. Stops on EOS or matching `stop` strings; strips the matched stop string from output.
   4. `flush_utf8()` buffers incomplete multibyte chars across token boundaries (avoids char-boundary panics).
   5. When `split_reasoning=true`, tokens 248068/248069 (`<think>`/`</think>`) toggle `in_reasoning` and are never emitted; they **are still fed through the model** so state stays aligned. `OutputRouter` handles toggling and buffered text; reasoning text accumulates in `GenResult.reasoning_content`, answer text in `GenResult.text`.
 - `run_chat()` / `run_completion()` — render prompt, tokenize, call `generate()`. **Chat uses `add_generation_prompt=true`** (critical: model needs `<think>\n` to start) and `split_reasoning=true`; completions use `split_reasoning=false`.
 - `sample()` — repetition penalty (divides logits of already-generated tokens by `repetition_penalty` > 1, HashSet dedup), presence/frequency penalties, `logit_bias`, then temperature (≤0 = argmax), top-k, top-p nucleus sampling. The default path (no top-k, top_p=1) uses an allocation-free two-pass categorical draw; other paths use one candidate vector with partial selection. `generate()` passes completion history into `sample()`.
 - Progress logging to stderr: `[load]` per 16 linears + totals in `exl3.rs::load`; `[prompt] processed/total (tok/s)` per 32-token prefill batch; `[decode] N tokens generated (tok/s)` every 16 tokens; `[done]` final summary. Constants `PROMPT_BATCH=32`, `DECODE_BATCH=16` in `server.rs`.
-- `handle_chat()` / `handle_completions()` — parse JSON body, build SSE chunks or JSON responses. SSE uses `chat_chunk()` / completion chunk builders; terminates with `data: [DONE]`.
+- `handle_chat()` / `handle_completions()` — parse JSON body, build SSE chunks or JSON responses. SSE uses `chat_chunk()` / completion chunk builders; terminates with `data: [DONE]`. With `stream_options.include_usage`, both endpoints emit a final `choices: []` chunk carrying aggregate usage. `ToolCallStreamer` incrementally strips `<tool_call>` XML from the answer stream and `tool_call_delta()` emits indexed OpenAI tool-call deltas (name + argument fragments).
 - `Params` includes `enable_thinking`, penalties, `logit_bias`, stop token ids and `include_usage`. `parse_params()` validates all fields and returns 400 on bad input.
 - `OutputRouter` owns UTF-8 assembly, stream toggling and stop-string tail buffering; `on_token` returns false to abort generation when the client disconnects. RoPE tables and DeltaNet head scratch are precomputed/reused for throughput.
 
@@ -339,7 +343,7 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 - **Memory vs speed:** `--weight-mode` trades RAM for tokens/s. `f32` (default): quantized linears decoded to f32 at load (~4× on-disk, fast). `f16`: ~2× on-disk, near-f32 speed. `packed`: ~1× on-disk but ~10+ s/token on CPU — unusable interactively. On CPU, SIMD on `dot()` would not help the packed path; its bottleneck is codebook decode, not the MACs. Tied-embedding models skip the lm_head decode (plain embedding matrix used directly). Peak RAM during load includes raw shard bytes plus decoded caches (in `f32` mode, several times on-disk); the old "≈ 2× on-disk" claim was inaccurate. Plain 2-D tensors are decoded once (previously stored in both `vectors` and `weights`), trellis byte ranges are compacted away after the linear pass, and untied embedding tables are stored as fp16 with per-row decode. Tied models (0.8B) still keep the ~1 GB f32 embedding for `lm_head`.
 - **No GPU:** CPU only; large models are slow.
 - **Single-request generation:** `Engine.model` is a mutex; concurrent requests serialize. `n > 1` therefore generates choices sequentially (linear cost), not as a batch.
-- **API fidelity limits:** `response_format: json_object` only adds a prompt hint — there is no grammar/constrained decoding or JSON validation. Streaming tool calls are emitted as XML text content (no `tool_calls` deltas). Chat `top_logprobs` is capped at 20 (completions accept up to 20 as an extension; OpenAI allows 5). Logprobs exclude reasoning delimiters and stop tokens, so their count matches `completion_tokens`, not every token sampled internally.
+- **API fidelity limits:** `response_format: json_object` only adds a prompt hint — there is no grammar/constrained decoding or JSON validation. Streaming tool calls now produce indexed `tool_calls` deltas (name + argument fragments) with the XML withheld from content, but tool-call arguments are still assembled with the simple `<parameter=...>` parser, not full JSON streaming. Chat `top_logprobs` is capped at 20 (completions accept up to 20 as an extension; OpenAI allows 5). Logprobs exclude reasoning delimiters and stop tokens, so their count matches `completion_tokens`, not every token sampled internally; `<think>`/`</think>` also consume a forward step but are not counted in `completion_tokens`.
 - **No full Jinja template engine:** chat template covers text-only common cases; tool-call arguments and advanced Jinja features (e.g. `tojson` of tool definitions) are not implemented.
 - **No Unicode NFC normalization:** tokenizer assumes input is already NFC (chat content typically is).
 - **No vision inference:** vision tensors are dequantized-skipped and ignored.
@@ -367,10 +371,14 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 | `exl3::synthetic_tests::matmul_matches_dequant_*` | Fresh-clone-safe equivalence of all three `--weight-mode` paths vs full dequant, for 3INST / MCG / MUL1 (integer + half-bitrate); no `/tmp` fixtures |
 | `exl3::real_model_tests` | Real layer-0 dequant + matmul checks; `#[ignore]`d (require `/tmp/unstable_*.bin`) |
 | `model::tests` | Golden tests for RMSNorm, per-head RMSNormGated, partial RoPE, q_proj interleaving, GQA grouping/gate, DeltaNet recurrence, plus fp16 embedding resolution |
-| `server::tests` | Sampling equivalence, logprobs vs log-softmax, parameter validation, `n` choices, SSE framing/usage/logprob deltas, HTTP responses |
+| `server::tests` | Sampling equivalence, logprobs vs log-softmax, parameter validation, `n` choices, SSE framing/usage/logprob ordering, tool-call streaming deltas, deadline, HTTP responses |
+| `http::tests` | Bounded request line and normal request parsing through the bounded reader |
+| `threadpool::tests` | Concurrent `run()` calls complete without deadlock |
+| `tensor::tests` | `dot()` rejects length mismatches |
+| `regex::tests::unbounded_quantifier_is_bounded` | Quantifier repeat/work caps on long and nested-pattern inputs |
 | `fuzz::tests` | Seeded random inputs against JSON/HTTP/regex/chat/tokenizer/API parsers (no panics) |
 
-Run `cargo test` — 88 pass, 10 ignored on the current state. The ignored set
+Run `cargo test` — 99 pass, 10 ignored on the current state. The ignored set
 is 6 real-model / `/tmp`-fixture tests (now explicitly marked with reasons) plus
 4 benchmarks. On a fresh clone the dequantization/matmul guarantee is still
 verified by the committed synthetic fixtures.

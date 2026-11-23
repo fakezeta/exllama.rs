@@ -63,7 +63,7 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     (clean, calls)
 }
 
-fn parse_one_tool_call(block: &str, index: usize) -> Option<ToolCall> {
+pub(crate) fn parse_one_tool_call(block: &str, index: usize) -> Option<ToolCall> {
     let name_start = block.find("<function=")? + "<function=".len();
     let name_end = block[name_start..].find('>')? + name_start;
     let name = block[name_start..name_end].trim().to_string();

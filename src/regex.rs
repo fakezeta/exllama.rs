@@ -9,6 +9,33 @@
 //!
 //! Semantics are leftmost-first (Perl/Python-like) via backtracking.
 
+/// Bounds for untrusted patterns. `tokenizer.json` can be user-supplied; an
+/// unbounded quantifier over a long input used to allocate one `Vec` per
+/// repetition (~24 bytes each), and nested quantifiers could multiply that
+/// work. These caps keep matching bounded in time and memory.
+const MAX_QUANT_REPEATS: usize = 4096;
+const MAX_MATCH_WORK: usize = 1_000_000;
+
+struct WorkBudget {
+    left: usize,
+}
+
+impl WorkBudget {
+    fn new() -> Self {
+        Self {
+            left: MAX_MATCH_WORK,
+        }
+    }
+
+    fn spend(&mut self) -> bool {
+        if self.left == 0 {
+            return false;
+        }
+        self.left -= 1;
+        true
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UProp {
     L, // letter
@@ -108,27 +135,45 @@ impl Regex {
 }
 
 fn match_seq(items: &[Re], text: &[char], pos: usize, ci: bool) -> Option<usize> {
-    all_seq_ends(items, text, pos, ci).into_iter().next()
+    let mut budget = WorkBudget::new();
+    all_seq_ends(items, text, pos, ci, &mut budget)
+        .into_iter()
+        .next()
 }
 
 /// Every end position reachable by matching a whole sequence, in
 /// leftmost-first priority order. Returning only the *first* end here used to
 /// discard backtracking alternatives for grouped subexpressions (e.g.
 /// `(?:ab?|c)bb` on `"abb"` failed because the group never tried end=1).
-fn all_seq_ends(items: &[Re], text: &[char], pos: usize, ci: bool) -> Vec<usize> {
+fn all_seq_ends(
+    items: &[Re],
+    text: &[char],
+    pos: usize,
+    ci: bool,
+    budget: &mut WorkBudget,
+) -> Vec<usize> {
     if items.is_empty() {
         return vec![pos];
     }
     let mut out = Vec::new();
-    for end in possible_ends(&items[0], text, pos, ci) {
-        out.extend(all_seq_ends(&items[1..], text, end, ci));
+    for end in possible_ends(&items[0], text, pos, ci, budget) {
+        out.extend(all_seq_ends(&items[1..], text, end, ci, budget));
     }
     out
 }
 
 /// All end positions reachable by matching `re` at `pos`, in greedy
 /// leftmost-first order. `ci` enables case-insensitive literal matching.
-fn possible_ends(re: &Re, text: &[char], pos: usize, ci: bool) -> Vec<usize> {
+fn possible_ends(
+    re: &Re,
+    text: &[char],
+    pos: usize,
+    ci: bool,
+    budget: &mut WorkBudget,
+) -> Vec<usize> {
+    if !budget.spend() {
+        return Vec::new(); // work cap hit: treat this branch as a non-match
+    }
     match re {
         Re::Char(c) => {
             if pos < text.len() && (text[pos] == *c || (ci && ci_eq(text[pos], *c))) {
@@ -147,12 +192,13 @@ fn possible_ends(re: &Re, text: &[char], pos: usize, ci: bool) -> Vec<usize> {
         Re::Alt(alts) => {
             let mut out = Vec::new();
             for a in alts {
-                out.extend(possible_ends(a, text, pos, ci));
+                out.extend(possible_ends(a, text, pos, ci, budget));
             }
             out
         }
-        Re::Seq(items) => all_seq_ends(items, text, pos, ci),
+        Re::Seq(items) => all_seq_ends(items, text, pos, ci, budget),
         Re::Lookahead(inner, positive) => {
+            // A fresh budget for the nested match keeps lookaheads independent.
             let matched = match_seq(&[(**inner).clone()], text, pos, ci).is_some();
             if matched == *positive {
                 vec![pos]
@@ -160,12 +206,12 @@ fn possible_ends(re: &Re, text: &[char], pos: usize, ci: bool) -> Vec<usize> {
                 Vec::new()
             }
         }
-        Re::Ci(inner) => possible_ends(inner, text, pos, true),
+        Re::Ci(inner) => possible_ends(inner, text, pos, true, budget),
         Re::Quant(inner, min, max, lazy) => {
             let min = *min;
             let max = *max;
             let inner_re = &**inner;
-            let max_count = max.unwrap_or(text.len() + 1);
+            let max_count = max.unwrap_or(text.len() + 1).min(MAX_QUANT_REPEATS);
             // reachable[k] = end positions after matching `inner` k times.
             let mut reachable: Vec<Vec<usize>> = vec![vec![pos]];
             for k in 0..=max_count {
@@ -175,7 +221,7 @@ fn possible_ends(re: &Re, text: &[char], pos: usize, ci: bool) -> Vec<usize> {
                 }
                 let mut next = Vec::new();
                 for p in cur {
-                    next.extend(possible_ends(inner_re, text, p, ci));
+                    next.extend(possible_ends(inner_re, text, p, ci, budget));
                 }
                 reachable.push(next);
             }
@@ -685,6 +731,28 @@ mod tests {
             Some(3)
         );
         assert_eq!(re.match_at(&"ac".chars().collect::<Vec<char>>(), 0), None);
+    }
+
+    #[test]
+    fn unbounded_quantifier_is_bounded() {
+        // A long whitespace run used to allocate one Vec per repetition
+        // (~8 MiB of input -> ~200 MB of transient Vec headers).
+        let re = Regex::compile(r"\s+").unwrap();
+        let text = " ".repeat(2 * MAX_QUANT_REPEATS);
+        let chars: Vec<char> = text.chars().collect();
+        assert_eq!(re.match_at(&chars, 0), Some(MAX_QUANT_REPEATS));
+
+        // A crafted nested quantifier must terminate quickly instead of
+        // multiplying work exponentially.
+        let bad = Regex::compile(r"(a+)+b").unwrap();
+        let text = "a".repeat(256);
+        let chars: Vec<char> = text.chars().collect();
+        let start = std::time::Instant::now();
+        let _ = bad.match_at(&chars, 0);
+        assert!(
+            start.elapsed().as_secs() < 5,
+            "nested quantifier did not terminate promptly"
+        );
     }
 
     #[test]

@@ -61,11 +61,12 @@ checked off with a short note; open items are unchecked.
   grouping/scale/gate and the DeltaNet recurrence (with decay). `model.rs`
   now has 7 unit tests.
 - [x] **(P1) Fix doc drift.** Done — `AGENTS.md` counts/line numbers, `TODO.md`
-  stale "next steps", and this plan's baseline are updated to 88 passed /
-  10 ignored.
-- [ ] **(P1) Bounded request-line reading.** See plan Phase 1 #4: `read_request`
-  (`http.rs`) reads the request line with no cap; OOM vector with a long
-  newline-free line. Use `Read::take` on both request line and headers.
+  stale "next steps", and this plan's baseline are updated to 99 passed /
+  10 ignored (88 after Phase 0).
+- [x] **(P1) Bounded request-line reading.** Done — see plan Phase 1 #4:
+  `read_request()` reads the request line and headers through
+  `Read::take(MAX_HEADER_BYTES + 1)` and rejects overlong lines. `http::tests`
+  covers a 128 KiB newline-free flood and a normal request.
 
 ### Resolved during real-model validation (for the record)
 
@@ -111,13 +112,12 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 - [ ] **(P2) Batched / continuous inference.** `Engine.model` is a `Mutex<Model>` and serializes all requests. Add a request queue, or support `n > 1` by expanding the prompt batch.
 - [ ] **(P2) KV cache quantization.** Cache is f32 `(ctx, heads, head_dim)`; f16 or int8 could double context within the same RAM.
 - [x] **(P2) Precompute RoPE cos/sin tables.** Done — tables built once at load; DeltaNet per-head scratch is also reused.
-- [ ] **(P1) Guard the global threadpool against concurrent `run()` calls.** See
-  plan Phase 1 #5: `threadpool::run()` shares one pool and a per-call barrier;
-  interleaved sends from two callers can deadlock. Serialize dispatch (or give
-  each call disjoint workers) and add a concurrency stress test.
-- [ ] **(P1) Catch dimension mismatches in `tensor::dot()`.** See plan Phase 1
-  #6: `a.len().min(b.len())` silently masks a wrong-length input. Assert equal
-  lengths (or add a checked variant) without slowing the hot loop.
+- [x] **(P1) Guard the global threadpool against concurrent `run()` calls.** Done
+  — see plan Phase 1 #5: a global `RUN_LOCK` serializes whole `run()` calls,
+  with a concurrency stress test covering 8 callers.
+- [x] **(P1) Catch dimension mismatches in `tensor::dot()`.** Done — see plan
+  Phase 1 #6: `dot()` and `exl3::dot_f16()` assert equal lengths; `parse_cli()`
+  uses one iterator and clamps context size / thread count. Tests added.
 - [ ] **(P2) Reuse post-prefill state for `n > 1`.** See plan Phase 2 #10: each
   choice currently re-prefills the whole prompt; snapshot/restore after prefill
   so `n=8` is not 8x the work.
@@ -148,15 +148,15 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
   logit of already-generated tokens by the penalty (positive logits) / multiplies
   (negative), with HashSet dedup so repeated history doesn't stack. Breaks
   greedy repetition loops when set > 1. Unit test added.
-- [ ] **(P1) Align SSE streaming with OpenAI.** See plan Phase 1 #7: emit the
-  `logprobs` delta in the same chunk as (or after) the content delta, not
-  before it; give `/v1/completions` a final empty-choices `usage` chunk like
-  chat does; stream indexed `tool_calls` deltas instead of XML-as-content.
-- [ ] **(P1) Generation deadline / hard output cap.** See plan Phase 1 #8: a
-  slow client can hold the mutex-guarded model indefinitely within the 600 s
-  read timeout. Reject `repetition_penalty <= 0` (currently `0` silently
-  disables it) and decide/document whether reasoning delimiters count toward
-  `completion_tokens`.
+- [x] **(P1) Align SSE streaming with OpenAI.** Done — see plan Phase 1 #7:
+  logprob deltas follow content; `/v1/completions` emits a final `choices: []`
+  usage chunk; `ToolCallStreamer` emits indexed `tool_calls` deltas (name +
+  argument fragments) without leaking the XML into content. Tests assert
+  chunk ordering, usage placement and delta shape.
+- [x] **(P1) Generation deadline / hard output cap.** Done — see plan Phase 1
+  #8: `repetition_penalty` must be finite and `> 0`; a 300 s deadline is
+  checked each step; reasoning delimiters are documented as excluded from
+  `completion_tokens`. Deadline path covered by a test.
 - [ ] **(P3) Anthropic-compatible API** (`/v1/messages`) as a secondary endpoint.
 
 ---
@@ -167,17 +167,16 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 - [ ] **(P2) `chat_template` from tokenizer.json.** Template is hard-coded in `chat.rs`; read/interpret it (or at least verify it matches).
 - [x] **(P2) Added tokens from `added_tokens_decoder`.** Done — ids found only in the sibling `tokenizer_config.json` are loaded and protected.
 - [ ] **(P2) Byte-fallback / BPE edge cases.** Fuzz `bpe_encode_word` against Python `tokenizers` with random UTF-8.
-- [ ] **(P1) Bound regex quantifier allocations / ReDoS.** See plan Phase 1 #9:
-  `Re::Quant` builds a `Vec<Vec<usize>>` per repetition up to
-  `text.len() + 1`; the shipped Qwen pattern is linear, but a crafted
-  `tokenizer.json` with nested quantifiers can blow up memory/time. Prefer
-  iterative end-set generation with a cap and validate untrusted patterns.
+- [x] **(P1) Bound regex quantifier allocations / ReDoS.** Done — see plan
+  Phase 1 #9: unbounded quantifiers cap at `MAX_QUANT_REPEATS = 4096` and a
+  `WorkBudget` (1M steps) is threaded through the matcher. Test covers a long
+  whitespace run and a crafted `(a+)+b` pattern.
 
 ---
 
 ## Chat Template
 
-- [x] **(P1) Tool calling (non-streaming).** Done — OpenAI `tools` are rendered into the Qwen3.5 system preamble, assistant `tool_calls` into `<function=...>` XML, and generated `<tool_call>` blocks are parsed back into `tool_calls` with `finish_reason: "tool_calls"`. **Still open:** proper SSE `tool_calls` deltas (streaming currently emits the XML as content) — see plan Phase 1 #7.
+- [x] **(P1) Tool calling (streaming + non-streaming).** Done — OpenAI `tools` are rendered into the Qwen3.5 system preamble, assistant `tool_calls` into `<function=...>` XML, and generated `<tool_call>` blocks are parsed back into `tool_calls` with `finish_reason: "tool_calls"`. Streaming emits indexed `tool_calls` deltas (see plan Phase 1 #7).
 - [x] **(P1) `enable_thinking` model-size defaults.** Done — see Model & Architecture Support above.
 - [ ] **(P2) Multi-modal content parts** (`content: [{type: "text", ...}]`) — currently only plain strings.
 - [x] **(P2) `reasoning_content` on responses.** Done (see API section); `Message` also accepts `reasoning_content` on input for multi-turn history.
@@ -208,18 +207,15 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 ## Suggested Next Steps (ordered)
 
 The authoritative phased plan (with acceptance criteria) is
-[`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md). **Phase 0 is complete**; execute
-the remaining phases in this order:
+[`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md). **Phases 0 and 1 are complete**;
+execute the remaining phases in this order:
 
-1. **Phase 1 — robustness & streaming fidelity (start here).** Bound the HTTP request line,
-   guard the global threadpool against concurrent `run()`, align SSE chunk
-   ordering / completion `usage` / tool-call deltas, add a generation deadline,
-   and bound regex quantifier allocations.
-2. **Phase 2 — performance (measure first).** Reuse post-prefill state for
-   `n > 1`, then batching, f16 KV cache / tied embeddings, GPU cache key fix.
-3. **Phase 3 — exploration.** Vision, other architectures, NFC / `chat_template`
+1. **Phase 2 — performance (start here, measure first).** Reuse post-prefill
+   state for `n > 1`, then batching, f16 KV cache / tied embeddings, GPU cache
+   key fix.
+2. **Phase 3 — exploration.** Vision, other architectures, NFC / `chat_template`
    loading, structured logging, Anthropic endpoint.
-4. **Manual validation still worth doing:** the end-to-end benchmark
+3. **Manual validation still worth doing:** the end-to-end benchmark
    (`EXLLAMA_BENCH_MODEL=/path cargo test --release bench_generation_throughput -- --ignored --nocapture`),
    a real-client SSE smoke test (`curl -N`), and real-model runs on 2B/4B/9B
    and MUL1 codebooks (only the 0.8B 8-bpw MCG model has been exercised).
