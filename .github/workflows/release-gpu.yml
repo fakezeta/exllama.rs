@@ -36,7 +36,9 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive: exllama-server-linux-x86_64-gpu-cuda.tar.gz
-          - os: windows-latest
+          # windows-latest now ships VS 2026 (MSVC 14.52), whose STL requires
+          # CUDA 13.4+. CUDA 12.6 supports VS 2022, which is on windows-2022.
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
             archive: exllama-server-windows-x86_64-gpu-cuda.zip
 
