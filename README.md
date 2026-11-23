@@ -7,7 +7,7 @@ The JSON parser, HTTP server, tokenizer, regex engine, PRNG and EXL3 dequantizer
 ## Features
 
 - **Hand-written core** — JSON parser/serializer, HTTP server, BPE tokenizer, regex engine, PRNG, and EXL3 dequantizer need no crates. Linear algebra uses `matrixmultiply` (SIMD BLAS kernel) and optionally `candle` for GPU; see [Compute backends](#compute-backends).
-- **OpenAI-compatible API** — `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/health`, with streaming SSE (`stream: true`).
+- **OpenAI-compatible API** — `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`, with streaming SSE (`stream: true`).
 - **Qwen3.5 text decoder** — full attention (GQA + partial RoPE) and linear attention (Gated DeltaNet), SwiGLU MLP, zero-centered RMSNorm.
 - **Configurable context size** and thread count from the CLI.
 - **Thinking mode** — Qwen3.5 `<think>` blocks, configurable via `enable_thinking` in chat requests.
@@ -92,7 +92,7 @@ By default, `--tokenizer` is looked up next to the model file. Run `--help` for 
 > - `f16` — decode into fp16 (codebook outputs are natively fp16, so lossless). ~2× on-disk, slightly slower than f32.
 > - `packed` — keep weights in their on-disk form and decode tiles on every matmul. ~1× on-disk RAM but **very slow** (~10+ s/token on CPU) — use only when memory is the hard constraint.
 >
-> For tied-embedding models (`tie_word_embeddings=true`, e.g. Qwen3.5-0.8B), `lm_head` uses the plain embedding matrix directly, avoiding a decode of the largest weight. Peak RAM during load is briefly ~2× on-disk while shards are copied.
+> For tied-embedding models (`tie_word_embeddings=true`, e.g. Qwen3.5-0.8B), `lm_head` uses the plain embedding matrix directly, avoiding a decode of the largest weight. Peak RAM during load includes the raw shard bytes plus the decoded weight caches; in `f32` mode that is several times the on-disk size.
 
 ## API
 
@@ -162,7 +162,7 @@ Supported request parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `m
 1. **Model loading** — EXL3 files are standard safetensors. Each quantized linear stores a packed tail-biting trellis plus input/output sign vectors (`suh`/`svh`). Depending on `--weight-mode`, W_hat is decoded once at load into an f32/f16 cache (default f32) or kept packed.
 2. **Quantized matmul** — the normalized Sylvester-Hadamard transforms are applied to the *input* and *output* vectors (not the weight matrix), so a linear needs only its W_hat in the rotated basis. `--weight-mode` decides how W_hat is stored: decoded to f32/f16 at load (fast) or kept packed and decoded per matmul (slow, minimum RAM). All three paths are verified equivalent to full reconstruction by `quantized_matmul_matches_f32_dequant`. A few O(1) optimizations (codebook LUTs, precomputed tile permutation, stack buffers) keep the packed path from being unusable.
 3. **Tokenizer** — byte-level BPE with the Qwen3.5 pre-tokenizer regex, added-token protection (so `<|im_start|>` and `<think>` remain single tokens), and byte fallback.
-4. **Inference** — one OS thread per HTTP connection; the model is guarded by a mutex. Prefill processes the prompt in 32-token batches; decoding emits one token at a time with KV cache (full attention) and recurrent state (linear attention). Matmul optionally splits work across threads. The server prints progress to stderr: `[load]` during model load, `[prompt] X/N tokens (tok/s)` per prefill batch, and `[decode] N tokens generated (tok/s)` every 16 tokens, with a final `[done]` summary.
+4. **Inference** — one OS thread per HTTP connection; the model is guarded by a mutex. Prefill processes the prompt one token at a time (logged in 32-token groups); decoding emits one token at a time with KV cache (full attention) and recurrent state (linear attention). Matmul optionally splits work across threads. The server prints progress to stderr: `[load]` during model load, `[prompt] X/N tokens (tok/s)` per prefill batch, and `[decode] N tokens generated (tok/s)` every 16 tokens, with a final `[done]` summary.
 
 ## Testing
 

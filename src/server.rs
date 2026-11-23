@@ -292,7 +292,10 @@ impl Engine {
         F: FnMut(&str, bool) -> bool,
     {
         let prompt_tokens = prompt_ids.len();
-        let max_tokens = if params.max_tokens == 0 {
+        if prompt_tokens == 0 {
+            return Err("empty prompt: no tokens to generate from".into());
+        }
+        let requested_tokens = if params.max_tokens == 0 {
             self.default_max_tokens
         } else {
             params.max_tokens
@@ -300,6 +303,25 @@ impl Engine {
 
         let mut model = self.model.lock().unwrap_or_else(|e| e.into_inner());
         model.reset();
+        // Clamp the generation budget to the room left in the KV cache.
+        // Otherwise the final `forward(&[tok])` can cross context_size and
+        // fail with a 500 after the client has already received many tokens.
+        let available = model.context_size().saturating_sub(prompt_tokens);
+        let max_tokens = requested_tokens.min(available);
+        if max_tokens == 0 {
+            eprintln!(
+                "[done] 0 tokens (prompt fills context: {}/{}) finish_reason=length",
+                prompt_tokens,
+                model.context_size()
+            );
+            return Ok(GenResult {
+                text: String::new(),
+                reasoning_content: String::new(),
+                prompt_tokens,
+                completion_tokens: 0,
+                finish_reason: "length".into(),
+            });
+        }
 
         // Prompt prefill in batches so we can report progress + tok/s.
         const PROMPT_BATCH: usize = 32;
@@ -817,6 +839,13 @@ fn parse_messages(body: &Json) -> Result<Vec<Message>, (u16, String)> {
         .get("messages")
         .and_then(|v| v.as_arr())
         .ok_or_else(|| json_error(400, "messages is required", "invalid_request_error"))?;
+    if arr.is_empty() {
+        return Err(json_error(
+            400,
+            "messages must not be empty",
+            "invalid_request_error",
+        ));
+    }
     let mut out = Vec::new();
     for m in arr {
         let role = m
@@ -1052,6 +1081,11 @@ pub fn handle_completions(mut stream: TcpStream, req: Request, engine: &Arc<Engi
             return;
         }
     };
+    if prompt.is_empty() {
+        let (s, b) = json_error(400, "prompt must not be empty", "invalid_request_error");
+        respond(&mut stream, s, "application/json", &b);
+        return;
+    }
     let params = match parse_params(&body) {
         Ok(p) => p,
         Err(e) => {
@@ -1242,6 +1276,45 @@ mod tests {
         assert_eq!(sample(&logits, &params, &mut rng, &[5]), 4);
         // Repeated history entries must not stack (HashSet dedup).
         assert_eq!(sample(&logits, &params, &mut rng, &[5, 5, 5]), 4);
+    }
+
+    #[test]
+    fn generation_is_clamped_to_remaining_context() {
+        let engine = Engine::new(
+            crate::model::Model::tiny(),
+            Tokenizer::tiny(),
+            "tiny-model".into(),
+            64,
+            1,
+        );
+        let params = Params {
+            temperature: 0.0,
+            max_tokens: 1000,
+            enable_thinking: false,
+            ..Default::default()
+        };
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let res = engine.run_chat(&messages, &params, |_, _| true).unwrap();
+        assert!(res.completion_tokens > 0);
+        assert!(res.completion_tokens <= 64 - res.prompt_tokens);
+        assert_eq!(res.finish_reason, "length");
+
+        // A prompt that already fills the context returns cleanly instead of
+        // failing in `forward` on the first decode step.
+        let full = engine
+            .generate(vec![0u32; 64], &params, false, false, |_, _| true)
+            .unwrap();
+        assert_eq!(full.completion_tokens, 0);
+        assert_eq!(full.finish_reason, "length");
+        assert!(full.text.is_empty());
+
+        // An empty prompt has no distribution to sample from.
+        assert!(engine
+            .generate(vec![], &params, false, false, |_, _| true)
+            .is_err());
     }
 
     #[test]
@@ -1614,6 +1687,8 @@ mod tests {
                 r#"{"model":"wrong","messages":[{"role":"user","content":"hi"}]}"#,
             ),
             ("/v1/completions", "{}"),
+            ("/v1/chat/completions", r#"{"messages":[]}"#),
+            ("/v1/completions", r#"{"prompt":""}"#),
         ];
         for (path, payload) in cases {
             let r = post(addr, path, payload);

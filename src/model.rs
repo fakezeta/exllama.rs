@@ -220,6 +220,10 @@ impl Model {
         &self.config
     }
 
+    pub fn context_size(&self) -> usize {
+        self.context_size
+    }
+
     pub fn reset(&mut self) {
         self.position = 0;
         for s in &mut self.full_states {

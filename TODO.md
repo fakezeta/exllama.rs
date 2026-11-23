@@ -29,6 +29,10 @@ checked off with a short note; open items are unchecked.
   `server::tests` verify chunk framing, `[DONE]`, `reasoning_content` deltas,
   usage chunks, and CORS against a tiny synthetic model. Real-client
   compatibility (`curl -N` / OpenAI SDK) still worth a manual smoke test.
+- [x] **(P0) Phase 0 hardening.** JSON parser depth cap + strict strings;
+  checked safetensors headers and trellis-width validation; context-budget
+  clamping and empty-input rejection; single-decode of plain 2-D tensors;
+  half-integer (MUL1) unpack reference test. Regression tests added.
 
 ### Resolved during real-model validation (for the record)
 
@@ -60,8 +64,9 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 - [ ] **(P1) Reduce embedding memory.** `embed_tokens` is still a plain f32
   matrix (~1 GB for 0.8B, ~4 GB for 9B). Store as f16 and convert rows on
   lookup, or keep the raw safetensors bytes and decode single rows lazily.
-  Note: quantized linear trellises are now freed after decode, so this is the
-  largest remaining allocation.
+  Note: quantized linear trellises are freed after decode and plain 2-D tensors
+  are no longer double-stored (they used to be kept in both `vectors` and
+  `weights`), so this is the largest remaining allocation.
 - [ ] **(P2) Speed up the `packed` mode.** Its bottleneck is codebook decode
   (not the dot product), so SIMD on `dot()` won't help. O(1) window extraction,
   decode LUTs and stack buffers are already in place; further gains need SIMD

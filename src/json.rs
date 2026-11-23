@@ -35,20 +35,20 @@ impl Json {
 
     pub fn as_i64(&self) -> Option<i64> {
         match self {
-            Json::Num(n) => Some(*n as i64),
-            Json::Bool(b) => Some(*b as i64),
+            // JSON booleans are not numbers; callers that want a numeric field
+            // must validate the variant explicitly (e.g. via `json_int`).
+            Json::Num(n) if n.is_finite() => Some(*n as i64),
             _ => None,
         }
     }
 
     pub fn as_usize(&self) -> Option<usize> {
-        self.as_i64().map(|v| v as usize)
+        self.as_i64().and_then(|v| usize::try_from(v).ok())
     }
 
     pub fn as_f64(&self) -> Option<f64> {
         match self {
-            Json::Num(n) => Some(*n),
-            Json::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            Json::Num(n) if n.is_finite() => Some(*n),
             _ => None,
         }
     }
@@ -84,9 +84,13 @@ impl Json {
     }
 }
 
+/// Nesting limit for the recursive-descent parser. Without it, an 8 MiB HTTP
+/// body of `[[[[...` would overflow the stack and abort the whole process.
+const MAX_DEPTH: usize = 128;
+
 pub fn parse(input: &str) -> Result<Json, String> {
     let b = input.as_bytes();
-    let mut p = Parser { b, i: 0 };
+    let mut p = Parser { b, i: 0, depth: 0 };
     let v = p.value()?;
     p.skip_ws();
     if p.i != p.b.len() {
@@ -98,6 +102,7 @@ pub fn parse(input: &str) -> Result<Json, String> {
 struct Parser<'a> {
     b: &'a [u8],
     i: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -128,6 +133,16 @@ impl<'a> Parser<'a> {
     }
 
     fn value(&mut self) -> Result<Json, String> {
+        if self.depth >= MAX_DEPTH {
+            return Err(self.err("maximum nesting depth exceeded"));
+        }
+        self.depth += 1;
+        let result = self.value_impl();
+        self.depth -= 1;
+        result
+    }
+
+    fn value_impl(&mut self) -> Result<Json, String> {
         self.skip_ws();
         match self.peek() {
             Some(b'{') => self.object(),
@@ -257,6 +272,8 @@ impl<'a> Parser<'a> {
                         _ => return Err(self.err("invalid escape")),
                     }
                 }
+                // Raw control characters are forbidden inside JSON strings.
+                c if c < 0x20 => return Err(self.err("control character in string")),
                 _ => out.push(c),
             }
         }
@@ -300,7 +317,10 @@ impl fmt::Display for Json {
             Json::Null => write!(f, "null"),
             Json::Bool(b) => write!(f, "{}", b),
             Json::Num(n) => {
-                if n.is_finite() && n.fract() == 0.0 && n.abs() < 9.007199254740992e15 {
+                if !n.is_finite() {
+                    // NaN / Infinity are not valid JSON tokens.
+                    write!(f, "null")
+                } else if n.fract() == 0.0 && n.abs() < 9.007199254740992e15 {
                     write!(f, "{}", *n as i64)
                 } else {
                     write!(f, "{}", n)
@@ -359,4 +379,49 @@ pub fn obj(pairs: &[(&str, Json)]) -> Json {
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parser_rejects_excessive_nesting() {
+        let deep = format!("{}0{}", "[".repeat(200), "]".repeat(200));
+        assert!(
+            parse(&deep).is_err(),
+            "deeply nested input must be rejected"
+        );
+        let ok = format!("{}0{}", "[".repeat(100), "]".repeat(100));
+        assert!(parse(&ok).is_ok());
+        // Deeply nested objects are guarded by the same limit.
+        let deep_obj = format!("{{\"a\":{}}}", "{".repeat(200) + &"}".repeat(200));
+        assert!(parse(&deep_obj).is_err());
+    }
+
+    #[test]
+    fn parser_rejects_control_chars_in_strings() {
+        assert!(parse("\"a\nb\"").is_err());
+        assert!(parse("\"a\u{0001}b\"").is_err());
+        assert_eq!(parse("\"a\\nb\"").unwrap(), Json::Str("a\nb".into()));
+    }
+
+    #[test]
+    fn non_finite_numbers_serialize_as_null() {
+        assert_eq!(Json::Num(f64::NAN).to_string(), "null");
+        assert_eq!(Json::Num(f64::INFINITY).to_string(), "null");
+        assert_eq!(Json::Num(f64::NEG_INFINITY).to_string(), "null");
+        assert_eq!(Json::Num(1.5).to_string(), "1.5");
+    }
+
+    #[test]
+    fn booleans_are_not_numbers() {
+        assert!(Json::Bool(true).as_i64().is_none());
+        assert!(Json::Bool(true).as_f64().is_none());
+        assert!(Json::Bool(true).as_usize().is_none());
+        assert_eq!(
+            parse("{\"n\":-1}").unwrap().get("n").unwrap().as_usize(),
+            None
+        );
+    }
 }

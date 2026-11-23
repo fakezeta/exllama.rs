@@ -135,7 +135,7 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 - `Params` includes `enable_thinking`, penalties, `logit_bias`, stop token ids and `include_usage`. `parse_params()` validates all fields and returns 400 on bad input.
 - `OutputRouter` owns UTF-8 assembly, stream toggling and stop-string tail buffering; `on_token` returns false to abort generation when the client disconnects. RoPE tables and DeltaNet head scratch are precomputed/reused for throughput.
 
-### `src/exl3.rs` — EXL3 safetensors reader + dequantizer (782 lines, most research-heavy)
+### `src/exl3.rs` — EXL3 safetensors reader + dequantizer (1556 lines, most research-heavy)
 See §5 for the full format. Key items:
 - `half_to_f32`, `f32_to_half`, `half_add`, `half_fma` — hand-written fp16 emulation (round-to-nearest-even).
 - `decode_3inst`, `decode_mcg`, `decode_mul1` — the three codebooks (16-bit index → fp16).
@@ -143,7 +143,7 @@ See §5 for the full format. Key items:
 - `tile_perm()` — maps ring position → row-major 16×16 tile offset.
 - `unpack_tile()` — unpacks + decodes one tile into 256 f32 values (integer or half-integer K).
 - `hadamard128()`, `hadamard_rows()`, `hadamard_cols()` — normalized Sylvester H128 butterflies.
-- `read_safetensors()`, `load_all_shards()` — safetensors header parsing, sharding via index JSON or glob.
+- `read_safetensors()`, `load_all_shards()` — safetensors header parsing, sharding via index JSON or glob. Header arithmetic is checked and malformed metadata (dtype/shape/data_offsets) is rejected; `validate_tile_width()` bounds trellis widths before unpacking.
 - `dequant_linear()` — reference full dequant pipeline for one quantized linear: unpack tiles → H_k → ×suh → H_n → ×svh → transpose to `(n, k)` → `Matrix`. **Used only by tests** as ground truth.
 - `QuantLinear` — a quantized linear (trellis + suh/svh) with three storage modes set by `--weight-mode`:
   - `packed`: `matmul(x)` decodes one 16×16 tile at a time into a small scratch (1× on-disk RAM but ~10+ s/token — too slow for interactive use on CPU). O(1) `window()` (64-bit funnel shift), `DECODE_*` LUTs (65536 f32 entries per codebook, avoids log2/powi per codeword), `TILE_PERM` table, and stack buffers keep it from being worse.
@@ -155,7 +155,7 @@ See §5 for the full format. Key items:
 - `Exl3Model { config, weights: HashMap<String, Matrix>, linears: HashMap<String, QuantLinear>, vectors: HashMap<String, Vec<f32>> }`.
 - `read_signs()` — reads suh/svh (F16) with legacy packed su/sv fallback.
 
-### `src/model.rs` — Qwen3.5 decoder forward (598 lines)
+### `src/model.rs` — Qwen3.5 decoder forward (846 lines)
 See §6 for the full math. Key items:
 - `ModelConfig` — extracted from `config.json` (handles nested `text_config`).
 - `Model { config, prefix, weights, linears, vectors, threads, context_size, position, full_states, linear_states }`.
@@ -322,7 +322,7 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 
 ## 8. Known Limitations & Gotchas
 
-- **Memory vs speed:** `--weight-mode` trades RAM for tokens/s. `f32` (default): quantized linears decoded to f32 at load (~4× on-disk, fast). `f16`: ~2× on-disk, near-f32 speed. `packed`: ~1× on-disk but ~10+ s/token on CPU — unusable interactively. On CPU, SIMD on `dot()` would not help the packed path; its bottleneck is codebook decode, not the MACs. Tied-embedding models skip the lm_head decode (plain embedding matrix used directly). Peak RAM during load ≈ 2× on-disk before shards are dropped.
+- **Memory vs speed:** `--weight-mode` trades RAM for tokens/s. `f32` (default): quantized linears decoded to f32 at load (~4× on-disk, fast). `f16`: ~2× on-disk, near-f32 speed. `packed`: ~1× on-disk but ~10+ s/token on CPU — unusable interactively. On CPU, SIMD on `dot()` would not help the packed path; its bottleneck is codebook decode, not the MACs. Tied-embedding models skip the lm_head decode (plain embedding matrix used directly). Peak RAM during load includes raw shard bytes plus decoded caches (in `f32` mode, several times on-disk); the old "≈ 2× on-disk" claim was inaccurate. Plain 2-D tensors are now decoded once (previously stored in both `vectors` and `weights`).
 - **No GPU:** CPU only; large models are slow.
 - **Single-request generation:** `Engine.model` is a mutex; concurrent requests serialize.
 - **No full Jinja template engine:** chat template covers text-only common cases; tool-call arguments and advanced Jinja features (e.g. `tojson` of tool definitions) are not implemented.
@@ -349,14 +349,14 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 | `exl3::tests::half_roundtrip` | fp16 conversion correctness |
 | `exl3::tests::tile_perm_matches_reference` | Tile permutation vs reference |
 
-Run `cargo test` — all 15 pass on the committed state.
+Run `cargo test` — 52 pass, 4 ignored on the current state.
 
 ---
 
 ## 10. Git / CI State
 
-- Branch `main`, single squashed commit tagged `v0.2.0`, placeholder author identity.
+- Branch `main`, latest release tag `v0.3.0`, placeholder author identity.
 - `.github/workflows/ci.yml`: build + `cargo test` on push/PR for `ubuntu-latest` (linux x86_64), `ubuntu-24.04-arm` (linux arm64), `macos-latest` (arm64, with `gpu-metal`), `windows-latest` (x86_64). fmt check; clippy `-D warnings` (Linux); uploads artifacts. The macOS build compiles the GPU backend; GPU runtime correctness is not exercised on CI runners.
 - `.github/workflows/release.yml`: on `v*` tags, builds all 4 targets (macOS with `gpu-metal`), packages, publishes GitHub Release.
 - `.github/workflows/release-gpu.yml`: manually triggered (`workflow_dispatch`, optional tag input). Installs CUDA toolkit via `Jimver/cuda-toolkit@v0.2.21` (12.6.0) on Linux/Windows, builds with `--features gpu-cuda`, attaches to a release by tag. Separate from main CI because stock runners have no nvcc (candle-kernels/cudarc need it; `fallback-latest` only fixes cudarc version detection, not candle-kernels' nvcc requirement).
-- To push: `git remote add origin <URL> && git push -u origin master`.
+- `origin` is configured (`https://github.com/fakezeta/exllama.rs.git`); to push: `git push -u origin main`.

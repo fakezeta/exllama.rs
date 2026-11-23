@@ -262,8 +262,9 @@ fn unpack_tile(
     out: &mut [f32; 256],
 ) {
     let nw = packed.len() / 2; // number of u32 words
-                               // Stack buffer avoids a heap allocation per tile (up to K=8 -> 64 words;
-                               // half-integer KA=7 -> 68 words).
+                               // Stack buffer avoids a heap allocation per tile. Max supported width
+                               // is 144 u16 words = 72 u32 words (K=8 -> 64; half KA=7 -> 60).
+                               // `validate_tile_width` enforces this at load time.
     let mut words = [0u32; 72];
     for w in 0..nw {
         words[w] = ((packed[2 * w + 1] as u32) << 16) | (packed[2 * w] as u32);
@@ -357,18 +358,22 @@ struct SafeFile {
 }
 
 fn read_safetensors(path: &Path) -> Result<SafeFile, String> {
-    let bytes = fs::read(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let display = path.display();
+    let bytes = fs::read(path).map_err(|e| format!("read {}: {}", display, e))?;
     if bytes.len() < 8 {
-        return Err(format!("{}: too short", path.display()));
+        return Err(format!("{}: too short", display));
     }
-    let hlen = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
-    if hlen == 0 || 8 + hlen > bytes.len() {
-        return Err(format!("{}: bad header length {}", path.display(), hlen));
+    let hlen_u64 = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let hlen = usize::try_from(hlen_u64)
+        .map_err(|_| format!("{}: bad header length {}", display, hlen_u64))?;
+    // `bytes.len() >= 8` was checked above, so this subtraction cannot underflow.
+    if hlen == 0 || hlen > bytes.len() - 8 {
+        return Err(format!("{}: bad header length {}", display, hlen));
     }
     let header_str = std::str::from_utf8(&bytes[8..8 + hlen])
-        .map_err(|e| format!("{}: bad header utf8: {}", path.display(), e))?;
+        .map_err(|e| format!("{}: bad header utf8: {}", display, e))?;
     let header = crate::json::parse(header_str)
-        .map_err(|e| format!("{}: bad header json: {}", path.display(), e))?;
+        .map_err(|e| format!("{}: bad header json: {}", display, e))?;
 
     let data_start = 8 + hlen;
     let mut tensors = HashMap::new();
@@ -380,23 +385,55 @@ fn read_safetensors(path: &Path) -> Result<SafeFile, String> {
             let dtype = val
                 .get("dtype")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
+                .ok_or_else(|| format!("{}: tensor {} has no dtype", display, name))?
                 .to_string();
-            let shape: Vec<usize> = val
+            if dtype_size(&dtype).is_none() {
+                return Err(format!(
+                    "{}: tensor {} has unsupported dtype {}",
+                    display, name, dtype
+                ));
+            }
+            let shape_json = val
                 .get("shape")
                 .and_then(|v| v.as_arr())
-                .map(|a| a.iter().filter_map(|x| x.as_usize()).collect())
-                .unwrap_or_default();
-            let offsets = match val.get("data_offsets").and_then(|v| v.as_arr()) {
-                Some(a) if a.len() == 2 => {
-                    (a[0].as_usize().unwrap_or(0), a[1].as_usize().unwrap_or(0))
-                }
-                _ => continue,
-            };
-            let begin = data_start + offsets.0;
-            let end = data_start + offsets.1;
+                .ok_or_else(|| format!("{}: tensor {} has no shape", display, name))?;
+            let shape = shape_json
+                .iter()
+                .map(|x| {
+                    x.as_usize()
+                        .ok_or_else(|| format!("{}: tensor {} has invalid shape", display, name))
+                })
+                .collect::<Result<Vec<usize>, String>>()?;
+            let offsets = val
+                .get("data_offsets")
+                .and_then(|v| v.as_arr())
+                .ok_or_else(|| format!("{}: tensor {} has no data_offsets", display, name))?;
+            if offsets.len() != 2 {
+                return Err(format!(
+                    "{}: tensor {} has invalid data_offsets",
+                    display, name
+                ));
+            }
+            let off0 = offsets[0]
+                .as_usize()
+                .ok_or_else(|| format!("{}: tensor {} has invalid data_offsets", display, name))?;
+            let off1 = offsets[1]
+                .as_usize()
+                .ok_or_else(|| format!("{}: tensor {} has invalid data_offsets", display, name))?;
+            if off1 < off0 {
+                return Err(format!(
+                    "{}: tensor {} has inverted data_offsets",
+                    display, name
+                ));
+            }
+            let begin = data_start
+                .checked_add(off0)
+                .ok_or_else(|| format!("{}: tensor {} offset overflow", display, name))?;
+            let end = data_start
+                .checked_add(off1)
+                .ok_or_else(|| format!("{}: tensor {} offset overflow", display, name))?;
             if end > bytes.len() {
-                return Err(format!("{}: tensor {} out of bounds", path.display(), name));
+                return Err(format!("{}: tensor {} out of bounds", display, name));
             }
             tensors.insert(
                 name.clone(),
@@ -576,6 +613,21 @@ fn bitrate_from_tile_width(words_per_tile: usize) -> (usize, bool) {
     (words_per_tile / 16, !words_per_tile.is_multiple_of(16))
 }
 
+/// Validate a trellis tile width before any unpacking. `unpack_tile` uses a
+/// fixed 72-word stack buffer and divides by the word count, so malformed
+/// metadata must be rejected at load time rather than panicking later.
+fn validate_tile_width(words_per_tile: usize) -> Result<(usize, bool), String> {
+    let valid_width = words_per_tile.is_multiple_of(16)
+        || (words_per_tile >= 8 && (words_per_tile - 8).is_multiple_of(16));
+    if words_per_tile == 0 || !valid_width || words_per_tile / 2 > 72 {
+        return Err(format!(
+            "invalid trellis tile width {} words (expected 16*K or 16*K+8, <= 144)",
+            words_per_tile
+        ));
+    }
+    Ok(bitrate_from_tile_width(words_per_tile))
+}
+
 /// Dequantize one EXL3 linear layer into a weight matrix of shape
 /// `(out_features, in_features)` — ready for `matmul_t` (`y = x @ W^T`).
 fn dequant_linear(shards: &Shards, prefix: &str) -> Result<(Matrix, Option<Vec<f32>>), String> {
@@ -592,8 +644,8 @@ fn dequant_linear(shards: &Shards, prefix: &str) -> Result<(Matrix, Option<Vec<f
     let k = tiles_k * 16;
     let n = tiles_n * 16;
 
-    // Bitrate from tile width (integer math only).
-    let (k_bits_int, k_half) = bitrate_from_tile_width(words_per_tile);
+    // Bitrate from tile width (integer math only), with bounds validation.
+    let (k_bits_int, k_half) = validate_tile_width(words_per_tile)?;
 
     // Codebook from marker presence.
     let cb = if shards.has(&format!("{}.mcg", prefix)) {
@@ -671,9 +723,20 @@ fn dequant_linear(shards: &Shards, prefix: &str) -> Result<(Matrix, Option<Vec<f
     // 2. H_k on rows: W1 = H_k @ W_hat.
     hadamard_rows(&mut wh, k, n);
 
+    if suh.len() < k || svh.len() < n {
+        return Err(format!(
+            "{}: sign vectors too short (suh={} need {}, svh={} need {})",
+            prefix,
+            suh.len(),
+            k,
+            svh.len(),
+            n
+        ));
+    }
+
     // 3. Input sign vector: W2[i,j] = W1[i,j] * suh[i].
     for i in 0..k {
-        let s = *suh.get(i).unwrap_or(&1.0);
+        let s = suh[i];
         for j in 0..n {
             wh[i * n + j] *= s;
         }
@@ -685,7 +748,7 @@ fn dequant_linear(shards: &Shards, prefix: &str) -> Result<(Matrix, Option<Vec<f
     // 5. Output sign vector: W4[i,j] = W3[i,j] * svh[j].
     for i in 0..k {
         for j in 0..n {
-            wh[i * n + j] *= *svh.get(j).unwrap_or(&1.0);
+            wh[i * n + j] *= svh[j];
         }
     }
 
@@ -765,7 +828,7 @@ impl QuantLinear {
             return Err(format!("{}: expected 3D shape", trellis_name));
         }
         let (tiles_k, tiles_n, words_per_tile) = (shape[0], shape[1], shape[2]);
-        let (k_bits_int, k_half) = bitrate_from_tile_width(words_per_tile);
+        let (k_bits_int, k_half) = validate_tile_width(words_per_tile)?;
         let cb = if shards.has(&format!("{}.mcg", prefix)) {
             Codebook::Mcg
         } else if shards.has(&format!("{}.mul1", prefix)) {
@@ -776,26 +839,43 @@ impl QuantLinear {
         if k_half && cb != Codebook::Mul1 {
             return Err(format!("{}: half bitrate requires mul1 codebook", prefix));
         }
-        let trellis = shards
+        let mut trellis = shards
             .u16(&trellis_name)
             .ok_or_else(|| format!("{}: cannot read trellis", trellis_name))?;
-        let expected = tiles_k * tiles_n * words_per_tile;
+        let expected = tiles_k
+            .checked_mul(tiles_n)
+            .and_then(|v| v.checked_mul(words_per_tile))
+            .ok_or_else(|| format!("{}: trellis shape overflow", trellis_name))?;
         if trellis.len() < expected {
             return Err(format!("{}: trellis too short", trellis_name));
         }
         let suh = read_signs(shards, prefix, "suh", "su")?;
         let svh = read_signs(shards, prefix, "svh", "sv")?;
+        let k = tiles_k * 16;
+        let n = tiles_n * 16;
+        if suh.len() < k || svh.len() < n {
+            return Err(format!(
+                "{}: sign vectors too short (suh={} need {}, svh={} need {})",
+                prefix,
+                suh.len(),
+                k,
+                svh.len(),
+                n
+            ));
+        }
+        // `shards.u16` already returned an owned buffer; avoid a full copy.
+        trellis.truncate(expected);
         Ok(QuantLinear {
             name: prefix.to_string(),
-            k: tiles_k * 16,
-            n: tiles_n * 16,
+            k,
+            n,
             tiles_k,
             tiles_n,
             words_per_tile,
             k_bits_int,
             k_half,
             cb,
-            trellis: Some(trellis[..expected].to_vec()),
+            trellis: Some(trellis),
             suh,
             svh,
             what_f16: None,
@@ -891,8 +971,9 @@ impl QuantLinear {
 
         // 1. xr = H_k @ (x ⊙ suh), per 128-row block.
         let mut xr = vec![0.0f32; k];
+        debug_assert!(x.len() >= k, "matmul input shorter than in_features");
         for i in 0..k {
-            xr[i] = x[i] * self.suh.get(i).copied().unwrap_or(1.0);
+            xr[i] = x.get(i).copied().unwrap_or(0.0) * self.suh[i];
         }
         for blk in 0..(k / 128) {
             hadamard128(&mut xr, blk * 128, 1, scale);
@@ -987,7 +1068,7 @@ impl QuantLinear {
 
         // 4. y[j] = svh[j] * t[j].
         for (j, v) in t.iter_mut().enumerate() {
-            *v *= self.svh.get(j).copied().unwrap_or(1.0);
+            *v *= self.svh[j];
         }
         t
     }
@@ -1096,7 +1177,7 @@ impl Exl3Model {
                 "f32" => ql.build_decode_cache_f32()?,
                 "f16" => ql.build_decode_cache()?,
                 "packed" => {} // decode on every matmul
-                _ => {}
+                other => return Err(format!("unknown weight mode '{}'", other)),
             }
             // Keep any bias in vectors (forward currently ignores biases).
             if let Some(b) = shards.f32(&format!("{}.bias", base)) {
@@ -1142,20 +1223,28 @@ impl Exl3Model {
                 Some(s) => s,
                 None => continue,
             };
-            // Load every plain tensor as a flat vector (norms, biases,
-            // A_log, dt_bias, conv1d.weight, etc.).
-            if let Some(v) = shards.f32(name) {
-                vectors.insert(name.clone(), v);
-            }
-            if shape.len() == 2 && !name.ends_with(".bias") {
+            // Decode each plain tensor exactly once. Calling `shards.f32`
+            // twice here used to store every 2-D tensor (including the huge
+            // embedding matrix) once in `vectors` and once in `weights`.
+            let Some(v) = shards.f32(name) else {
+                continue;
+            };
+            let is_matrix = shape.len() == 2 && !name.ends_with(".bias");
+            let expected_len = if is_matrix {
+                shape[0].checked_mul(shape[1])
+            } else {
+                None
+            };
+            if expected_len == Some(v.len()) {
                 // Any plain 2-D tensor is a linear weight: embeddings,
                 // lm_head, in_proj_a / in_proj_b (16 x hidden), q/k/v
                 // projections that were left unquantized, etc.
-                if let Some(v) = shards.f32(name) {
-                    if v.len() == shape[0] * shape[1] {
-                        weights.insert(name.clone(), Matrix::from_vec(shape[0], shape[1], v));
-                    }
-                }
+                weights.insert(name.clone(), Matrix::from_vec(shape[0], shape[1], v));
+            } else {
+                // 1-D tensors (norms, biases, A_log, dt_bias, conv1d, ...).
+                // A shape/length mismatch falls back to a flat vector rather
+                // than silently dropping the tensor.
+                vectors.insert(name.clone(), v);
             }
         }
 
@@ -1245,6 +1334,67 @@ mod tests {
         // bitrate detection: K=6 from 96 words/tile
         assert_eq!(bitrate_from_tile_width(96), (6, false));
     }
+    /// Half-integer rates (KA + 0.5, MUL1 codebook) had no test that actually
+    /// called `unpack_tile`. Build a synthetic ring from the documented layout
+    /// (each 16-position group advances KA bits per position plus one extra bit
+    /// on odd positions, mask 0xAAAA) and extract every window bit-by-bit as an
+    /// independent reference.
+    #[test]
+    fn half_bitrate_unpack_matches_ring_reference() {
+        const KA: usize = 2; // K = 2.5
+        const BPB: usize = 16 * KA + 8; // bits per 16-position group = 40
+        const RING_BITS: usize = 16 * BPB; // 640
+        let nw = RING_BITS / 32; // 20 u32 words
+        let mut packed = vec![0u16; nw * 2];
+        for (i, w) in packed.iter_mut().enumerate() {
+            *w = ((i as u32).wrapping_mul(0x9E37_79B9) >> 13) as u16;
+        }
+        let words: Vec<u32> = (0..nw)
+            .map(|w| ((packed[2 * w + 1] as u32) << 16) | packed[2 * w] as u32)
+            .collect();
+
+        let mut expected = [0f32; 256];
+        let perm = tile_perm_table();
+        for i in 0..256usize {
+            let g = i >> 4;
+            let q = i & 15;
+            let mut end = g * BPB + q * KA;
+            for j in 0..=q {
+                end += ((0xAAAAu16 >> j) & 1) as usize;
+            }
+            // Independent bit-by-bit extraction (not using `window()`).
+            let mut idx = 0u16;
+            for b in 0..16 {
+                let pos = (end as isize + b as isize - 16).rem_euclid(RING_BITS as isize) as usize;
+                let bit = (words[pos / 32] >> (31 - (pos % 32))) & 1;
+                idx = (idx << 1) | bit as u16;
+            }
+            expected[perm[i]] = decode_f32(idx, Codebook::ThreeInst);
+        }
+
+        let mut out = [0f32; 256];
+        unpack_tile(&packed, KA, true, Codebook::ThreeInst, &mut out);
+        for i in 0..256 {
+            assert!(
+                (out[i] - expected[i]).abs() < 1e-6,
+                "tile[{}]: got {} expected {}",
+                i,
+                out[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn tile_width_validation_rejects_malformed_metadata() {
+        assert!(validate_tile_width(0).is_err());
+        assert!(validate_tile_width(17).is_err());
+        assert!(validate_tile_width(146).is_err()); // 73 u32 words > 72
+        assert_eq!(validate_tile_width(96).unwrap(), (6, false));
+        assert_eq!(validate_tile_width(128).unwrap(), (8, false));
+        assert_eq!(validate_tile_width(40).unwrap(), (2, true));
+    }
+
     #[test]
     fn bitrate_detection_integer_and_half() {
         // Integer bitrates: 16*K words, not half.
