@@ -43,9 +43,13 @@ fn extract_pre_tokenizer(json: &Json) -> Result<PreTokenizerSpec, String> {
         ));
     };
     if let Some(behavior) = split.get("behavior").and_then(|v| v.as_str()) {
-        if behavior != "isolated" {
+        // `tokenizers` serializes the SplitBehavior enum as "Isolated" in
+        // recent versions and as "isolated" in older ones. Both mean the
+        // same thing; our regex engine implements exactly that behavior.
+        if !behavior.eq_ignore_ascii_case("isolated") {
             return Err(format!(
-                "unsupported Split behavior '{}' (only isolated is implemented)",
+                "unsupported Split behavior '{}' (only isolated is implemented; \
+                 accepted spellings: 'isolated' or 'Isolated')",
                 behavior
             ));
         }
@@ -564,6 +568,43 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains("pre_tokenizer"), "{}", err);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepts_both_split_behavior_spellings() {
+        let dir = temp_dir("split-behavior");
+        let path = dir.join("tokenizer.json");
+        // Newer `tokenizers` writes the enum variant as "Isolated"; older
+        // versions wrote "isolated". Both must load (regression from v0.4.0).
+        for behavior in ["Isolated", "isolated"] {
+            let json = format!(
+                r#"{{"model":{{"vocab":{{"a":0}},"merges":[]}},"pre_tokenizer":{{"type":"Split","behavior":"{}","pattern":{{"Regex":"\\s+"}}}}}}"#,
+                behavior
+            );
+            std::fs::write(&path, json).unwrap();
+            Tokenizer::load(path.to_str().unwrap())
+                .unwrap_or_else(|e| panic!("behavior '{}' rejected: {}", behavior, e));
+        }
+        // Same for the Sequence shape used by the real Qwen3.5 tokenizer.
+        std::fs::write(
+            &path,
+            r#"{"model":{"vocab":{"a":0},"merges":[]},"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","behavior":"Isolated","pattern":{"Regex":"\\s+"}},{"type":"ByteLevel"}]}}"#,
+        )
+        .unwrap();
+        Tokenizer::load(path.to_str().unwrap()).unwrap();
+
+        // Other split behaviors genuinely change the tokenization semantics.
+        std::fs::write(
+            &path,
+            r#"{"model":{"vocab":{"a":0},"merges":[]},"pre_tokenizer":{"type":"Split","behavior":"Inverted","pattern":{"Regex":"\\s+"}}}"#,
+        )
+        .unwrap();
+        let err = match Tokenizer::load(path.to_str().unwrap()) {
+            Ok(_) => panic!("Inverted split behavior must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.contains("behavior"), "{}", err);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
