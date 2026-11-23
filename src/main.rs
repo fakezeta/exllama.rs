@@ -46,10 +46,10 @@ fn print_usage() {
         "exllama-server \u{2014} minimal OpenAI-compatible server for EXL3 models (Qwen3.5)\n\
          \n\
          USAGE:\n\
-           exllama-server --model <path.exl3> [options]\n\
+           exllama-server --model <model-dir> [options]\n\
          \n\
          OPTIONS:\n\
-           -m, --model <PATH>        Path to the .exl3 model file (required)\n\
+           -m, --model <PATH>        Path to the EXL3 model directory (required)\n\
            -c, --context-size <N>    Maximum context size in tokens (default 4096)\n\
            -p, --port <PORT>         Listen port (default 8080)\n\
                --host <HOST>         Bind address (default 0.0.0.0)\n\
@@ -124,6 +124,15 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         print_usage();
         return Err("--model is required".into());
     }
+    if cli.context_size == 0 {
+        return Err("--context-size must be > 0".into());
+    }
+    if cli.threads == 0 {
+        return Err("--threads must be > 0".into());
+    }
+    if cli.max_tokens == 0 {
+        return Err("--max-tokens must be > 0".into());
+    }
     Ok(cli)
 }
 
@@ -137,8 +146,9 @@ fn main() -> ExitCode {
         }
     };
 
-    // Select compute backend (best available for "auto").
-    compute::init(&cli.compute);
+    // Select compute backend (best available for "auto"). Pass the configured
+    // thread count so the auto probe benchmarks the actual inference setup.
+    compute::init(&cli.compute, cli.threads);
 
     // Load model.
     eprintln!("[init] loading model: {}", cli.model);
@@ -161,7 +171,7 @@ fn main() -> ExitCode {
 
     // Load tokenizer.
     let tok_path = cli.tokenizer.clone().unwrap_or_else(|| {
-        // Default: tokenizer.json next to the model file.
+        // Default: tokenizer.json next to the model/shard.
         let parent = std::path::Path::new(&cli.model)
             .parent()
             .unwrap_or(std::path::Path::new("."));
@@ -209,7 +219,11 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn route(mut stream: std::net::TcpStream, req: Request, engine: &std::sync::Arc<Engine>) {
+pub(crate) fn route(
+    mut stream: std::net::TcpStream,
+    req: Request,
+    engine: &std::sync::Arc<Engine>,
+) {
     let method = req.method.clone();
     let path = req.path.clone();
 
@@ -262,4 +276,30 @@ fn models_json(engine: &Engine) -> String {
         ),
     ])
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(rest: &[&str]) -> Vec<String> {
+        let mut a = vec!["prog".to_string(), "-m".to_string(), "model".to_string()];
+        a.extend(rest.iter().map(|s| s.to_string()));
+        a
+    }
+
+    #[test]
+    fn cli_rejects_zero_sizes() {
+        assert!(parse_cli(&args(&["-c", "0"])).is_err());
+        assert!(parse_cli(&args(&["--threads", "0"])).is_err());
+        assert!(parse_cli(&args(&["--max-tokens", "0"])).is_err());
+    }
+
+    #[test]
+    fn cli_accepts_valid_options() {
+        let cli = parse_cli(&args(&["-c", "1024", "--weight-mode", "f16"])).unwrap();
+        assert_eq!(cli.context_size, 1024);
+        assert_eq!(cli.weight_mode, "f16");
+        assert_eq!(cli.compute, "auto");
+    }
 }

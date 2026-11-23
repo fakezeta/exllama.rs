@@ -3,6 +3,8 @@
 //! used transparently by `tensor::matmul_t`.
 
 use std::sync::OnceLock;
+#[cfg(feature = "gpu")]
+use std::{collections::HashMap, sync::Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
@@ -30,9 +32,21 @@ struct Compute {
 
 static COMPUTE: OnceLock<Compute> = OnceLock::new();
 
+/// Device-resident weights. A decode matmul used to re-upload the entire
+/// weight matrix on every token, which made the GPU backend slower than the
+/// CPU paths. Weight buffers live for the process lifetime, so they can be
+/// uploaded once and reused, keyed by buffer address and shape.
+#[cfg(feature = "gpu")]
+struct GpuCache {
+    tensors: Mutex<HashMap<(usize, usize, usize), candle_core::Tensor>>,
+}
+
+#[cfg(feature = "gpu")]
+static GPU_CACHE: OnceLock<GpuCache> = OnceLock::new();
+
 /// Detect the best backend. Preferences: "auto" (default), "scalar", "blas",
 /// "gpu". Falls back to BLAS if GPU is requested but unavailable.
-pub fn init(preference: &str) -> Backend {
+pub fn init(preference: &str, nthreads: usize) -> Backend {
     COMPUTE
         .get_or_init(|| {
             let gpu = detect_gpu();
@@ -48,9 +62,8 @@ pub fn init(preference: &str) -> Backend {
                         // GPU is dramatically faster for large matmuls.
                         Backend::Gpu
                     } else {
-                        // Decode is memory-bound GEMV: benchmark scalar vs
-                        // sgemm once and pick the faster one for this machine.
-                        pick_fastest_cpu()
+                        // No GPU: benchmark both CPU paths once for this machine.
+                        pick_fastest_cpu(nthreads)
                     }
                 }
                 _ => Backend::Blas,
@@ -60,6 +73,11 @@ pub fn init(preference: &str) -> Backend {
                 backend.name(),
                 if gpu_present { ", gpu" } else { "" }
             );
+            if backend == Backend::Gpu {
+                eprintln!(
+                    "[compute] GPU weights are cached on device (first matmul per matrix uploads once)"
+                );
+            }
             Compute {
                 backend,
                 #[cfg(feature = "gpu")]
@@ -73,38 +91,68 @@ pub fn backend() -> Backend {
     COMPUTE.get().map(|c| c.backend).unwrap_or(Backend::Blas)
 }
 
-/// Micro-benchmark a representative GEMV to decide whether the hand-written
-/// threaded dot or the BLAS sgemm kernel is faster on this machine. The result
-/// is cached with the backend selection.
-fn pick_fastest_cpu() -> Backend {
+/// Micro-benchmark a decode GEMV and a prefill-shaped matrix-matrix multiply
+/// to pick the faster CPU path on this machine. `nthreads` comes from the CLI
+/// so the probe measures the same configuration used for inference.
+fn pick_fastest_cpu(nthreads: usize) -> Backend {
+    let n = nthreads.max(1);
+    let reps = 3u32;
+
+    // Decode shape: one input row, large weight matrix (memory-bound GEMV).
     let (m, k) = (4096usize, 1024usize);
     let w: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32) * 0.01 - 0.5).collect();
     let x: Vec<f32> = (0..k).map(|i| ((i % 13) as f32) * 0.1).collect();
     let mut y = vec![0.0f32; m];
-    // Warm up both paths.
-    crate::tensor::matmul_t_scalar(&x, 1, k, &w, m, &mut y, 4);
+    crate::tensor::matmul_t_scalar(&x, 1, k, &w, m, &mut y, n);
     blas_matmul(&x, 1, k, &w, m, &mut y);
 
-    let reps = 3;
     let t0 = std::time::Instant::now();
     for _ in 0..reps {
-        crate::tensor::matmul_t_scalar(&x, 1, k, &w, m, &mut y, 4);
+        crate::tensor::matmul_t_scalar(&x, 1, k, &w, m, &mut y, n);
     }
-    let scalar = t0.elapsed();
+    let gemv_scalar = t0.elapsed().as_secs_f64() / reps as f64;
     let t0 = std::time::Instant::now();
     for _ in 0..reps {
         blas_matmul(&x, 1, k, &w, m, &mut y);
     }
-    let blas = t0.elapsed();
-    let chosen = if blas < scalar {
+    let gemv_blas = t0.elapsed().as_secs_f64() / reps as f64;
+
+    // Prefill shape: a batch of input rows (compute-bound matrix-matrix).
+    let (rows, k2, out) = (32usize, 1024usize, 4096usize);
+    let wx: Vec<f32> = (0..out * k2)
+        .map(|i| ((i % 89) as f32) * 0.01 - 0.4)
+        .collect();
+    let xx: Vec<f32> = (0..rows * k2).map(|i| ((i % 19) as f32) * 0.05).collect();
+    let mut yy = vec![0.0f32; rows * out];
+    crate::tensor::matmul_t_scalar(&xx, rows, k2, &wx, out, &mut yy, n);
+    blas_matmul(&xx, rows, k2, &wx, out, &mut yy);
+
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        crate::tensor::matmul_t_scalar(&xx, rows, k2, &wx, out, &mut yy, n);
+    }
+    let prefill_scalar = t0.elapsed().as_secs_f64() / reps as f64;
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        blas_matmul(&xx, rows, k2, &wx, out, &mut yy);
+    }
+    let prefill_blas = t0.elapsed().as_secs_f64() / reps as f64;
+
+    // Decode dominates per-token latency, so weight its score higher.
+    let scalar_total = 2.0 * gemv_scalar + prefill_scalar;
+    let blas_total = 2.0 * gemv_blas + prefill_blas;
+    let chosen = if blas_total < scalar_total {
         Backend::Blas
     } else {
         Backend::Scalar
     };
     eprintln!(
-        "[compute] CPU probe: scalar={:?} blas={:?} -> using {}",
-        scalar,
-        blas,
+        "[compute] CPU probe ({} threads): GEMV scalar={:.2}ms blas={:.2}ms | prefill scalar={:.2}ms blas={:.2}ms -> using {}",
+        n,
+        gemv_scalar * 1e3,
+        gemv_blas * 1e3,
+        prefill_scalar * 1e3,
+        prefill_blas * 1e3,
         chosen.name()
     );
     chosen
@@ -219,11 +267,28 @@ fn gpu_matmul(
     if x_rows != 1 {
         return false; // decode is GEMV; fall back for multi-row
     }
-    let xs = match Tensor::from_slice(x, (x_cols,), device) {
-        Ok(t) => t,
-        Err(_) => return false,
+    let key = (w.as_ptr() as usize, w_rows, x_cols);
+    let cache = GPU_CACHE.get_or_init(|| GpuCache {
+        tensors: Mutex::new(HashMap::new()),
+    });
+    let ws = {
+        let mut tensors = cache.tensors.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = tensors.get(&key) {
+            t.clone()
+        } else {
+            let t = match Tensor::from_slice(w, (w_rows, x_cols), device) {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+            // Bound the cache in case a caller passes transient buffers.
+            if tensors.len() >= 512 {
+                tensors.clear();
+            }
+            tensors.insert(key, t.clone());
+            t
+        }
     };
-    let ws = match Tensor::from_slice(w, (w_rows, x_cols), device) {
+    let xs = match Tensor::from_slice(x, (x_cols,), device) {
         Ok(t) => t,
         Err(_) => return false,
     };

@@ -1,12 +1,12 @@
 # exllama.rs
 
-A minimal, **dependency-free** Rust inference server for [ExLlamaV3 (EXL3)](https://github.com/turboderp-org/exllamav3) quantized models, focused on the `Qwen3_5ForConditionalGeneration` text decoder (text-only). It serves an OpenAI-compatible HTTP API with streaming SSE support.
+A minimal Rust inference server for [ExLlamaV3 (EXL3)](https://github.com/turboderp-org/exllamav3) quantized models, focused on the `Qwen3_5ForConditionalGeneration` text decoder (text-only). It serves an OpenAI-compatible HTTP API with streaming SSE support.
 
-Everything is implemented with the Rust standard library only — no crates, no CUDA, no Python at runtime.
+The JSON parser, HTTP server, tokenizer, regex engine, PRNG and EXL3 dequantizer are hand-written with the standard library only. Linear algebra uses the pure-Rust `matrixmultiply` crate (optionally `candle` for GPU); there is no CUDA toolchain or Python dependency at runtime.
 
 ## Features
 
-- **Minimal dependencies** — hand-written JSON parser/serializer, HTTP server, BPE tokenizer, regex engine, PRNG, and EXL3 dequantizer. Linear algebra uses `matrixmultiply` (SIMD BLAS kernel) and optionally `candle` for GPU; see [Compute backends](#compute-backends).
+- **Hand-written core** — JSON parser/serializer, HTTP server, BPE tokenizer, regex engine, PRNG, and EXL3 dequantizer need no crates. Linear algebra uses `matrixmultiply` (SIMD BLAS kernel) and optionally `candle` for GPU; see [Compute backends](#compute-backends).
 - **OpenAI-compatible API** — `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/health`, with streaming SSE (`stream: true`).
 - **Qwen3.5 text decoder** — full attention (GQA + partial RoPE) and linear attention (Gated DeltaNet), SwiGLU MLP, zero-centered RMSNorm.
 - **Configurable context size** and thread count from the CLI.
@@ -15,7 +15,7 @@ Everything is implemented with the Rust standard library only — no crates, no 
 
 ## Requirements
 
-- Rust 1.70+ (edition 2021). No external toolchain or Python runtime needed. Default build uses only pure-Rust crates (no system BLAS/GPU SDK).
+- Rust 1.70+ (edition 2021). No external toolchain or Python runtime needed. Default build uses only pure-Rust crates (no system BLAS/GPU SDK). CI builds and tests on Linux (x86_64 + ARM64), macOS ARM64 and Windows x86_64 on every push/PR.
 - An EXL3-quantized Qwen3.5 model directory containing:
   - `config.json`
   - `model.safetensors` or sharded `model-*.safetensors` (+ `model.safetensors.index.json`)
@@ -155,7 +155,7 @@ GET /v1/models
 GET /health   (or /)
 ```
 
-Supported sampling parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `max_completion_tokens`, `seed`, `stop`, `repetition_penalty`, `enable_thinking`.
+Supported request parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `max_completion_tokens`, `seed`, `stop`, `stop_token_ids`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `stream`, `stream_options.include_usage`, `enable_thinking`. The `model` field is validated against the server's `--name`.
 
 ## How it works
 
@@ -170,7 +170,7 @@ Supported sampling parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `
 cargo test
 ```
 
-Tests cover JSON parsing, regex/pre-tokenizer behavior, chat-template rendering, tokenizer encoding against the real Qwen3.5 tokenizer, and EXL3 codebook/tile-layout correctness against the reference implementation.
+Tests cover JSON parsing, regex/pre-tokenizer behavior, chat-template rendering, tokenizer encoding against the real Qwen3.5 tokenizer, EXL3 codebook/tile-layout correctness against the reference implementation, sampling, and end-to-end HTTP/SSE behavior against a tiny synthetic model (no model download required). For throughput benchmarking with a real model, see `bench_generation_throughput` in `src/server.rs`.
 
 For manual end-to-end checks against a **running server**, see [`tests/README.md`](tests/README.md). It contains smoke-test and diagnostic shell scripts (`test_api.sh`, `test_diag.sh`, `test_sample.sh`, `test_prompts.sh`) that exercise the OpenAI-compatible endpoints with curl.
 

@@ -387,6 +387,52 @@ impl Tokenizer {
 }
 
 #[cfg(test)]
+impl Tokenizer {
+    /// Minimal in-memory tokenizer for HTTP/engine tests (no tokenizer.json).
+    pub(crate) fn tiny() -> Tokenizer {
+        let (byte_encoder, byte_decoder) = build_byte_level_map();
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        let mut id_to_token: HashMap<u32, String> = HashMap::new();
+        for b in 0u16..=255 {
+            let ch = byte_encoder[&(b as u8)];
+            let s = ch.to_string();
+            vocab.insert(s.clone(), b as u32);
+            id_to_token.insert(b as u32, s);
+        }
+        let specials = [
+            ("<|im_start|>", 256u32),
+            ("<|im_end|>", 257),
+            ("<think>", 258),
+            ("</think>", 259),
+            ("<|endoftext|>", 260),
+        ];
+        let mut special_ids = HashSet::new();
+        let mut added_tokens: Vec<(String, u32)> = Vec::new();
+        for (text, id) in specials {
+            vocab.insert(text.into(), id);
+            id_to_token.insert(id, text.into());
+            special_ids.insert(id);
+            added_tokens.push((text.into(), id));
+        }
+        added_tokens.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+        Tokenizer {
+            vocab,
+            id_to_token,
+            merge_rank: HashMap::new(),
+            byte_encoder,
+            byte_decoder,
+            special_ids,
+            added_tokens,
+            unk_id: None,
+            eos_id: Some(257),
+            pre_tokenizer: Regex::compile(r"\s+|[^\s]+").unwrap(),
+            vocab_size: 261,
+            chat_template: None,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

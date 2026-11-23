@@ -3,7 +3,16 @@
 
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Request size limits. Without these, a client can OOM the server with a
+/// huge Content-Length or an unterminated header block.
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Generations are serialized; more waiting connections only waste threads.
+const MAX_CONNECTIONS: usize = 64;
 
 pub struct Request {
     pub method: String,
@@ -42,11 +51,16 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
     };
 
     let mut headers: Vec<(String, String)> = Vec::new();
-    let mut content_length: usize = 0;
+    let mut content_length: Option<usize> = None;
+    let mut header_bytes = request_line.len();
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
             break;
+        }
+        header_bytes += line.len();
+        if header_bytes > MAX_HEADER_BYTES {
+            return Err("request headers too large".into());
         }
         let line = line.trim_end();
         if line.is_empty() {
@@ -56,11 +70,19 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
             let k = k.trim().to_string();
             let v = v.trim().to_string();
             if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.parse().unwrap_or(0);
+                if content_length.is_some() {
+                    return Err("duplicate Content-Length".into());
+                }
+                let n: usize = v.parse().map_err(|_| "invalid Content-Length")?;
+                if n > MAX_BODY_BYTES {
+                    return Err("request body too large".into());
+                }
+                content_length = Some(n);
             }
             headers.push((k, v));
         }
     }
+    let content_length = content_length.unwrap_or(0);
 
     let mut body = vec![0u8; content_length];
     let mut got = 0;
@@ -108,7 +130,8 @@ pub fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &s
 /// Streaming (chunked) response writer used for SSE.
 pub struct Streamer {
     writer: BufWriter<TcpStream>,
-    started: bool,
+    /// Set once a write fails; callers should stop generating immediately.
+    failed: bool,
 }
 
 impl Streamer {
@@ -119,33 +142,57 @@ impl Streamer {
             "Internal Server Error"
         };
         let head = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
             status, reason, content_type
         );
         let mut writer = BufWriter::new(stream);
-        let _ = writer.write_all(head.as_bytes());
-        let _ = writer.flush();
-        Streamer {
-            writer,
-            started: true,
+        let failed = writer.write_all(head.as_bytes()).is_err() || writer.flush().is_err();
+        Streamer { writer, failed }
+    }
+
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
+    fn put(&mut self, bytes: &[u8]) -> bool {
+        if self.writer.write_all(bytes).is_err() {
+            self.failed = true;
+            return false;
         }
+        true
     }
 
     /// Write one raw chunk (SSE frame already formatted by caller).
-    pub fn write_chunk(&mut self, data: &str) {
+    /// Returns false if the connection is gone.
+    pub fn write_chunk(&mut self, data: &str) -> bool {
         if data.is_empty() {
-            return;
+            return !self.failed;
+        }
+        if self.failed {
+            return false;
         }
         let head = format!("{:X}\r\n", data.len());
-        let _ = self.writer.write_all(head.as_bytes());
-        let _ = self.writer.write_all(data.as_bytes());
-        let _ = self.writer.write_all(b"\r\n");
-        let _ = self.writer.flush();
+        if !self.put(head.as_bytes()) {
+            return false;
+        }
+        if !self.put(data.as_bytes()) {
+            return false;
+        }
+        if !self.put(b"\r\n") {
+            return false;
+        }
+        if self.writer.flush().is_err() {
+            self.failed = true;
+            return false;
+        }
+        true
     }
 
     pub fn end(mut self) {
-        let _ = self.writer.write_all(b"0\r\n\r\n");
-        let _ = self.writer.flush();
+        if !self.failed {
+            self.put(b"0\r\n\r\n");
+            let _ = self.writer.flush();
+        }
     }
 }
 
@@ -158,13 +205,26 @@ pub fn serve(
     listener: TcpListener,
     handler: impl Fn(TcpStream, Request) + Clone + Send + Sync + 'static,
 ) {
+    let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => {
+            Ok(mut stream) => {
+                if active.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    let body = "{\"error\":{\"message\":\"too many connections\",\"type\":\"server_error\"}}";
+                    let head = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    continue;
+                }
                 let handler = handler.clone();
+                let active = active.clone();
                 std::thread::spawn(move || {
-                    let mut stream = stream;
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(600)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(600)));
                     let _ = stream.set_nodelay(true);
                     match read_request(&mut stream) {
                         Ok(req) => handler(stream, req),
@@ -173,6 +233,7 @@ pub fn serve(
                             let _ = stream.shutdown(std::net::Shutdown::Both);
                         }
                     }
+                    active.fetch_sub(1, Ordering::AcqRel);
                 });
             }
             Err(e) => eprintln!("[http] accept error: {}", e),

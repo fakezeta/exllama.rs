@@ -52,6 +52,10 @@ pub struct Model {
     threads: usize,
     context_size: usize,
     position: usize,
+    /// Precomputed RoPE phases: `rope_cos[position * rope_half + d]`.
+    rope_cos: Vec<f32>,
+    rope_sin: Vec<f32>,
+    rope_half: usize,
     full_states: Vec<FullAttnState>,
     linear_states: Vec<LinearAttnState>,
 }
@@ -73,6 +77,9 @@ impl Model {
         threads: usize,
         weight_mode: &str,
     ) -> Result<Model, String> {
+        if context_size == 0 {
+            return Err("context_size must be > 0".into());
+        }
         let ex = Exl3Model::load(path, weight_mode)?;
         let cfg = &ex.config;
 
@@ -134,6 +141,30 @@ impl Model {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
         };
+        if config.linear_conv_kernel_dim < 2 {
+            return Err(format!(
+                "invalid linear_conv_kernel_dim={} (must be >= 2)",
+                config.linear_conv_kernel_dim
+            ));
+        }
+        if config.num_key_value_heads == 0 || config.num_attention_heads == 0 {
+            return Err("attention head counts must be > 0".into());
+        }
+
+        // RoPE phases depend only on (position, rotary dimension), so compute
+        // them once instead of doing powf/sin_cos per head per token.
+        let rotary = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+        let rope_half = rotary / 2;
+        let mut rope_cos = vec![0.0f32; context_size * rope_half];
+        let mut rope_sin = vec![0.0f32; context_size * rope_half];
+        for pos in 0..context_size {
+            for d in 0..rope_half {
+                let freq = 1.0 / config.rope_theta.powf(2.0 * d as f32 / rotary as f32);
+                let (s, c) = (pos as f32 * freq).sin_cos();
+                rope_cos[pos * rope_half + d] = c;
+                rope_sin[pos * rope_half + d] = s;
+            }
+        }
 
         // Allocate per-sequence state.
         let mut full_states = Vec::new();
@@ -177,6 +208,9 @@ impl Model {
             threads,
             context_size,
             position: 0,
+            rope_cos,
+            rope_sin,
+            rope_half,
             full_states,
             linear_states,
         })
@@ -251,6 +285,14 @@ impl Model {
             .or_else(|| self.vectors.get(name))
     }
 
+    /// Resolve a 1-D tensor, failing loudly with its name when absent. Silent
+    /// zero fallbacks here previously produced confident-looking garbage.
+    fn vec(&self, name: &str) -> Result<&[f32], String> {
+        self.v(name)
+            .map(|v| v.as_slice())
+            .ok_or_else(|| format!("missing vector tensor `{}`", name))
+    }
+
     // -----------------------------------------------------------------------
     // Forward pass helpers
     // -----------------------------------------------------------------------
@@ -288,32 +330,31 @@ impl Model {
     /// packed quantized weight. For tied-embedding models `lm_head` shares the
     /// embedding matrix, so preferring the plain matrix avoids decoding the
     /// single largest weight (vocab x hidden) on every token.
-    fn linear(&self, x: &[f32], name: &str) -> Vec<f32> {
+    fn linear(&self, x: &[f32], name: &str) -> Result<Vec<f32>, String> {
         if let Some(w) = self.w(name) {
             let mut y = vec![0.0f32; w.rows];
             matmul_t(x, 1, x.len(), w, &mut y, self.threads);
-            return y;
+            return Ok(y);
         }
         if let Some(ql) = self.ql(name) {
-            return ql.matmul(x, self.threads);
+            return Ok(ql.matmul(x, self.threads));
         }
-        vec![0.0; 0]
+        Err(format!("missing linear weight `{}`", name))
     }
 
     /// Apply RoPE to the first `dim` elements of each head in `x`
     /// (head-major layout: head h starts at h*head_len).
-    fn apply_rope(x: &mut [f32], head_len: usize, num_heads: usize, pos: usize, cfg: &ModelConfig) {
-        let rotary = (head_len as f32 * cfg.partial_rotary_factor) as usize;
-        let half = rotary / 2;
-        if half == 0 {
+    fn apply_rope(&self, x: &mut [f32], head_len: usize, num_heads: usize, pos: usize) {
+        let half = self.rope_half;
+        if half == 0 || pos >= self.context_size {
             return;
         }
+        let table_base = pos * half;
         for h in 0..num_heads {
             let base = h * head_len;
             for d in 0..half {
-                let freq = 1.0 / cfg.rope_theta.powf(2.0 * d as f32 / rotary as f32);
-                let angle = pos as f32 * freq;
-                let (s, c) = angle.sin_cos();
+                let c = self.rope_cos[table_base + d];
+                let s = self.rope_sin[table_base + d];
                 let a = x[base + d];
                 let b = x[base + d + half];
                 x[base + d] = a * c - b * s;
@@ -329,23 +370,23 @@ impl Model {
         x: &[f32],
         state_idx: usize,
         pos: usize,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, String> {
         let cfg = &self.config;
-        let norm_w = self
-            .v(&format!("layers.{}.input_layernorm.weight", layer))
-            .cloned()
-            .unwrap_or_default();
-        let xn = Self::rms_norm(x, &norm_w, cfg.rms_norm_eps);
+        let norm_w = self.vec(&format!("layers.{}.input_layernorm.weight", layer))?;
+        let xn = Self::rms_norm(x, norm_w, cfg.rms_norm_eps);
 
-        let qp = self.linear(&xn, &format!("layers.{}.self_attn.q_proj", layer));
-        let mut kp = self.linear(&xn, &format!("layers.{}.self_attn.k_proj", layer));
-        let vp = self.linear(&xn, &format!("layers.{}.self_attn.v_proj", layer));
+        let qp = self.linear(&xn, &format!("layers.{}.self_attn.q_proj", layer))?;
+        let mut kp = self.linear(&xn, &format!("layers.{}.self_attn.k_proj", layer))?;
+        let vp = self.linear(&xn, &format!("layers.{}.self_attn.v_proj", layer))?;
         let hd = cfg.head_dim;
         let nh = cfg.num_attention_heads;
         let nkv = cfg.num_key_value_heads;
 
-        if qp.len() < 2 * nh * hd || kp.len() < nkv * hd {
-            return vec![0.0; cfg.hidden_size];
+        if qp.len() < 2 * nh * hd || kp.len() < nkv * hd || vp.len() < nkv * hd {
+            return Err(format!(
+                "layer {}: unexpected q/k/v projection shapes",
+                layer
+            ));
         }
 
         // q_proj output is interleaved per head: head h has [query(hd), gate(hd)].
@@ -358,14 +399,8 @@ impl Model {
         }
 
         // Per-head RMSNorm (zero-centered) on q and k.
-        let qn_w = self
-            .v(&format!("layers.{}.self_attn.q_norm.weight", layer))
-            .cloned()
-            .unwrap_or_default();
-        let kn_w = self
-            .v(&format!("layers.{}.self_attn.k_norm.weight", layer))
-            .cloned()
-            .unwrap_or_default();
+        let qn_w = self.vec(&format!("layers.{}.self_attn.q_norm.weight", layer))?;
+        let kn_w = self.vec(&format!("layers.{}.self_attn.k_norm.weight", layer))?;
         for h in 0..nh {
             let s = &mut q[h * hd..(h + 1) * hd];
             let ss: f32 = s.iter().map(|v| v * v).sum();
@@ -384,9 +419,9 @@ impl Model {
         }
 
         // RoPE (text-only: all position IDs equal, mrope is a no-op).
-        Self::apply_rope(&mut q, hd, nh, pos, cfg);
+        self.apply_rope(&mut q, hd, nh, pos);
         let mut k = kp[..nkv * hd].to_vec();
-        Self::apply_rope(&mut k, hd, nkv, pos, cfg);
+        self.apply_rope(&mut k, hd, nkv, pos);
 
         // Write to KV cache.
         let kv = nkv * hd;
@@ -436,26 +471,28 @@ impl Model {
         }
 
         // Output projection.
-        let y = self.linear(&attn, &format!("layers.{}.self_attn.o_proj", layer));
+        let y = self.linear(&attn, &format!("layers.{}.self_attn.o_proj", layer))?;
         if y.len() != cfg.hidden_size {
-            return vec![0.0; cfg.hidden_size];
+            return Err(format!("layer {}: unexpected o_proj shape", layer));
         }
-        y
+        Ok(y)
     }
 
     /// One linear-attention (Gated DeltaNet) layer.
-    fn forward_linear_attn(&mut self, layer: usize, x: &[f32], state_idx: usize) -> Vec<f32> {
+    fn forward_linear_attn(
+        &mut self,
+        layer: usize,
+        x: &[f32],
+        state_idx: usize,
+    ) -> Result<Vec<f32>, String> {
         let cfg = &self.config;
-        let norm_w = self
-            .v(&format!("layers.{}.input_layernorm.weight", layer))
-            .cloned()
-            .unwrap_or_default();
-        let xn = Self::rms_norm(x, &norm_w, cfg.rms_norm_eps);
+        let norm_w = self.vec(&format!("layers.{}.input_layernorm.weight", layer))?;
+        let xn = Self::rms_norm(x, norm_w, cfg.rms_norm_eps);
 
-        let qkv = self.linear(&xn, &format!("layers.{}.linear_attn.in_proj_qkv", layer));
-        let z = self.linear(&xn, &format!("layers.{}.linear_attn.in_proj_z", layer));
-        let b = self.linear(&xn, &format!("layers.{}.linear_attn.in_proj_b", layer));
-        let a = self.linear(&xn, &format!("layers.{}.linear_attn.in_proj_a", layer));
+        let qkv = self.linear(&xn, &format!("layers.{}.linear_attn.in_proj_qkv", layer))?;
+        let z = self.linear(&xn, &format!("layers.{}.linear_attn.in_proj_z", layer))?;
+        let b = self.linear(&xn, &format!("layers.{}.linear_attn.in_proj_b", layer))?;
+        let a = self.linear(&xn, &format!("layers.{}.linear_attn.in_proj_a", layer))?;
 
         let kd = cfg.linear_key_head_dim;
         let vd = cfg.linear_value_head_dim;
@@ -464,16 +501,25 @@ impl Model {
         let key_dim = kd * nkh;
         let val_dim = vd * nvh;
         let conv_dim = key_dim * 2 + val_dim;
-        if qkv.len() < conv_dim {
-            return vec![0.0; cfg.hidden_size];
+        if qkv.len() < conv_dim || z.len() < val_dim {
+            return Err(format!(
+                "layer {}: unexpected linear-attn projection shapes",
+                layer
+            ));
         }
 
         // Depthwise causal conv1d (kernel = conv kernel dim) + SiLU.
-        let cw = self
-            .v(&format!("layers.{}.linear_attn.conv1d.weight", layer))
-            .cloned()
-            .unwrap_or_default();
+        let cw = self.vec(&format!("layers.{}.linear_attn.conv1d.weight", layer))?;
         let kernel = cfg.linear_conv_kernel_dim;
+        if cw.len() < kernel * conv_dim {
+            return Err(format!(
+                "layer {}: conv1d.weight has {} values, expected {}",
+                layer,
+                cw.len(),
+                kernel * conv_dim
+            ));
+        }
+        let cw = cw.to_vec(); // release the immutable borrow of `self`
         let hist = kernel - 1; // number of stored previous qkv vectors
         let st = &mut self.linear_states[state_idx];
         // Build the window [oldest ... newest] from the circular buffer of
@@ -491,15 +537,13 @@ impl Model {
         st.conv_pos = (st.conv_pos + 1) % hist;
 
         let mut conv_out = vec![0.0f32; conv_dim];
-        if cw.len() >= kernel * conv_dim {
-            for c in 0..conv_dim {
-                let mut v = 0.0f32;
-                for j in 0..kernel {
-                    // conv1d.weight is (conv_dim, 1, kernel): channel-major.
-                    v += cw[c * kernel + j] * window[j * conv_dim + c];
-                }
-                conv_out[c] = v / (1.0 + (-v).exp()); // silu
+        for c in 0..conv_dim {
+            let mut v = 0.0f32;
+            for j in 0..kernel {
+                // conv1d.weight is (conv_dim, 1, kernel): channel-major.
+                v += cw[c * kernel + j] * window[j * conv_dim + c];
             }
+            conv_out[c] = v / (1.0 + (-v).exp()); // silu
         }
 
         // Split into query, key, value.
@@ -511,26 +555,31 @@ impl Model {
         let rep = nvh / nkh;
 
         // g = -exp(A_log) * softplus(a + dt_bias); beta = sigmoid(b).
-        let alog = self
-            .v(&format!("layers.{}.linear_attn.A_log", layer))
-            .cloned()
-            .unwrap_or_default();
-        let dtbias = self
-            .v(&format!("layers.{}.linear_attn.dt_bias", layer))
-            .cloned()
-            .unwrap_or_default();
+        let alog = self.vec(&format!("layers.{}.linear_attn.A_log", layer))?;
+        let dtbias = self.vec(&format!("layers.{}.linear_attn.dt_bias", layer))?;
+        if a.len() < nvh || b.len() < nvh || alog.len() < nvh || dtbias.len() < nvh {
+            return Err(format!(
+                "layer {}: gated deltanet parameter vectors are too short",
+                layer
+            ));
+        }
         let mut g = vec![0.0f32; nvh];
         let mut beta = vec![0.0f32; nvh];
         for h in 0..nvh {
-            let ab = a.get(h).copied().unwrap_or(0.0) + dtbias.get(h).copied().unwrap_or(0.0);
+            let ab = a[h] + dtbias[h];
             let sp = if ab > 20.0 { ab } else { (1.0 + ab.exp()).ln() };
-            g[h] = -alog.get(h).copied().unwrap_or(0.0).exp() * sp;
-            let bb = b.get(h).copied().unwrap_or(0.0);
+            g[h] = -alog[h].exp() * sp;
+            let bb = b[h];
             beta[h] = 1.0 / (1.0 + (-bb).exp());
         }
 
-        // Recurrent state update (fp32), per value head.
+        // Recurrent state update (fp32), per value head. Scratch vectors are
+        // allocated once per layer and overwritten for each head.
         let st = &mut self.linear_states[state_idx];
+        let mut qh = vec![0.0f32; kd];
+        let mut kh_vec = vec![0.0f32; kd];
+        let mut mem = vec![0.0f32; vd];
+        let mut delta = vec![0.0f32; vd];
         let mut o = vec![0.0f32; val_dim];
         for vh in 0..nvh {
             let kh = vh / rep;
@@ -540,8 +589,6 @@ impl Model {
             let sbase = vh * kd * vd;
 
             // L2-normalize q and k; scale q by 1/sqrt(kd).
-            let mut qh = vec![0.0f32; kd];
-            let mut kh_vec = vec![0.0f32; kd];
             let qn = (q[qbase..qbase + kd].iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt();
             let kn = (k[kbase..kbase + kd].iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt();
             for d in 0..kd {
@@ -556,7 +603,7 @@ impl Model {
             }
 
             // kv_mem[j] = sum_i S[i,j] * k[i].
-            let mut mem = vec![0.0f32; vd];
+            mem.fill(0.0);
             for (i, &kv) in kh_vec.iter().enumerate() {
                 if kv == 0.0 {
                     continue;
@@ -569,7 +616,6 @@ impl Model {
 
             // delta[j] = (v[j] - mem[j]) * beta.
             let bta = beta[vh];
-            let mut delta = vec![0.0f32; vd];
             for j in 0..vd {
                 delta[j] = (v[vbase + j] - mem[j]) * bta;
             }
@@ -598,21 +644,18 @@ impl Model {
         }
 
         // Gated RMSNorm: norm(o) * norm.weight * silu(z).
-        let norm_w = self
-            .v(&format!("layers.{}.linear_attn.norm.weight", layer))
-            .cloned()
-            .unwrap_or_default();
-        let o_norm = Self::rms_norm_gated(&o, &z, &norm_w, cfg.rms_norm_eps, vd);
+        let norm_w = self.vec(&format!("layers.{}.linear_attn.norm.weight", layer))?;
+        let o_norm = Self::rms_norm_gated(&o, &z, norm_w, cfg.rms_norm_eps, vd);
 
         // Output projection.
-        let y = self.linear(&o_norm, &format!("layers.{}.linear_attn.out_proj", layer));
+        let y = self.linear(&o_norm, &format!("layers.{}.linear_attn.out_proj", layer))?;
         if y.len() != cfg.hidden_size {
-            return vec![0.0; cfg.hidden_size];
+            return Err(format!("layer {}: unexpected out_proj shape", layer));
         }
-        y
+        Ok(y)
     }
 
-    fn forward_token(&mut self, token: u32) -> Vec<f32> {
+    fn forward_token(&mut self, token: u32) -> Result<Vec<f32>, String> {
         let num_layers = self.config.num_layers;
         let hs = self.config.hidden_size;
         let vocab = self.config.vocab_size;
@@ -621,14 +664,18 @@ impl Model {
         let intv = self.config.full_attention_interval;
 
         // Embedding lookup.
-        let embed = match self.w("embed_tokens.weight") {
-            Some(w) => w,
-            None => return vec![0.0; vocab],
-        };
+        let embed = self
+            .w("embed_tokens.weight")
+            .ok_or_else(|| "missing embedding tensor `embed_tokens.weight`".to_string())?;
         let mut x = vec![0.0f32; hs];
-        if (token as usize) < embed.rows {
-            x.copy_from_slice(embed.row(token as usize));
+        let id = token as usize;
+        if id >= embed.rows {
+            return Err(format!(
+                "token id {} is outside embedding range ({} rows)",
+                token, embed.rows
+            ));
         }
+        x.copy_from_slice(embed.row(id));
 
         let pos = self.position;
         let mut full_idx = 0usize;
@@ -640,11 +687,11 @@ impl Model {
                 (i + 1) % intv == 0
             };
             let attn = if is_full {
-                let y = self.forward_full_attn(i, &x, full_idx, pos);
+                let y = self.forward_full_attn(i, &x, full_idx, pos)?;
                 full_idx += 1;
                 y
             } else {
-                let y = self.forward_linear_attn(i, &x, linear_idx);
+                let y = self.forward_linear_attn(i, &x, linear_idx)?;
                 linear_idx += 1;
                 y
             };
@@ -653,19 +700,22 @@ impl Model {
             }
 
             // MLP.
-            let norm_w = self
-                .v(&format!("layers.{}.post_attention_layernorm.weight", i))
-                .cloned()
-                .unwrap_or_default();
-            let xn = Self::rms_norm(&x, &norm_w, eps);
-            let gate = self.linear(&xn, &format!("layers.{}.mlp.gate_proj", i));
-            let up = self.linear(&xn, &format!("layers.{}.mlp.up_proj", i));
+            let norm_w = self.vec(&format!("layers.{}.post_attention_layernorm.weight", i))?;
+            let xn = Self::rms_norm(&x, norm_w, eps);
+            let gate = self.linear(&xn, &format!("layers.{}.mlp.gate_proj", i))?;
+            let up = self.linear(&xn, &format!("layers.{}.mlp.up_proj", i))?;
+            if gate.len() != up.len() || gate.is_empty() {
+                return Err(format!("layer {}: mismatched MLP gate/up shapes", i));
+            }
             let mut act = vec![0.0f32; gate.len()];
-            for j in 0..gate.len().min(up.len()) {
+            for j in 0..gate.len() {
                 let g = gate[j];
                 act[j] = (g / (1.0 + (-g).exp())) * up[j];
             }
-            let mlp_out = self.linear(&act, &format!("layers.{}.mlp.down_proj", i));
+            let mlp_out = self.linear(&act, &format!("layers.{}.mlp.down_proj", i))?;
+            if mlp_out.len() != hs {
+                return Err(format!("layer {}: unexpected down_proj shape", i));
+            }
             for (j, v) in mlp_out.iter().enumerate() {
                 x[j] += v;
             }
@@ -674,20 +724,123 @@ impl Model {
         self.position += 1;
 
         // Final norm + lm_head.
-        let final_w = self.v("norm.weight").cloned().unwrap_or_default();
-        let xf = Self::rms_norm(&x, &final_w, eps);
-        let logits = self.linear(&xf, "lm_head.weight");
+        let final_w = self.vec("norm.weight")?;
+        let xf = Self::rms_norm(&x, final_w, eps);
+        let logits = self.linear(&xf, "lm_head.weight")?;
         if logits.len() != vocab {
-            return vec![0.0; vocab];
+            return Err(format!(
+                "lm_head produced {} logits, expected {}",
+                logits.len(),
+                vocab
+            ));
         }
-        logits
+        Ok(logits)
     }
 
-    pub fn forward(&mut self, input_ids: &[u32]) -> Vec<f32> {
+    pub fn forward(&mut self, input_ids: &[u32]) -> Result<Vec<f32>, String> {
+        if input_ids.len() > self.context_size.saturating_sub(self.position) {
+            return Err(format!(
+                "context size exceeded: position {} + {} input tokens > context {}",
+                self.position,
+                input_ids.len(),
+                self.context_size
+            ));
+        }
         let mut logits = vec![0.0f32; self.config.vocab_size];
         for &t in input_ids {
-            logits = self.forward_token(t);
+            logits = self.forward_token(t)?;
         }
-        logits
+        Ok(logits)
+    }
+}
+
+#[cfg(test)]
+impl Model {
+    /// Deterministic tiny full-attention model used by HTTP/engine tests.
+    /// It needs no EXL3 files: all weights are small synthetic matrices.
+    pub(crate) fn tiny() -> Model {
+        fn mat(rows: usize, cols: usize, seed: usize) -> Matrix {
+            let data = (0..rows * cols)
+                .map(|i| (((i + seed * 17) as f32) * 0.031).sin() * 0.2)
+                .collect();
+            Matrix::from_vec(rows, cols, data)
+        }
+
+        let context_size = 64usize;
+        let config = ModelConfig {
+            architecture: "Qwen3_5ForCausalLM".into(),
+            num_layers: 1,
+            hidden_size: 4,
+            vocab_size: 261,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            intermediate_size: 4,
+            layer_types: vec!["full_attention".into()],
+            full_attention_interval: 4,
+            linear_conv_kernel_dim: 4,
+            linear_key_head_dim: 4,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_value_head_dim: 4,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1e4,
+            partial_rotary_factor: 0.5,
+            tie_word_embeddings: false,
+        };
+
+        let mut weights = HashMap::new();
+        weights.insert("model.embed_tokens.weight".into(), mat(261, 4, 1));
+        weights.insert("model.layers.0.self_attn.q_proj".into(), mat(8, 4, 2));
+        weights.insert("model.layers.0.self_attn.k_proj".into(), mat(4, 4, 3));
+        weights.insert("model.layers.0.self_attn.v_proj".into(), mat(4, 4, 4));
+        weights.insert("model.layers.0.self_attn.o_proj".into(), mat(4, 4, 5));
+        weights.insert("model.layers.0.mlp.gate_proj".into(), mat(4, 4, 6));
+        weights.insert("model.layers.0.mlp.up_proj".into(), mat(4, 4, 7));
+        weights.insert("model.layers.0.mlp.down_proj".into(), mat(4, 4, 8));
+        weights.insert("lm_head.weight".into(), mat(261, 4, 9));
+
+        let mut vectors = HashMap::new();
+        for name in [
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.self_attn.q_norm.weight",
+            "model.layers.0.self_attn.k_norm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.norm.weight",
+        ] {
+            vectors.insert(name.into(), vec![0.0f32; 4]);
+        }
+
+        let rotary = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+        let rope_half = rotary / 2;
+        let mut rope_cos = vec![0.0f32; context_size * rope_half];
+        let mut rope_sin = vec![0.0f32; context_size * rope_half];
+        for pos in 0..context_size {
+            for d in 0..rope_half {
+                let freq = 1.0 / config.rope_theta.powf(2.0 * d as f32 / rotary as f32);
+                let (s, c) = (pos as f32 * freq).sin_cos();
+                rope_cos[pos * rope_half + d] = c;
+                rope_sin[pos * rope_half + d] = s;
+            }
+        }
+
+        Model {
+            config,
+            prefix: "model.".into(),
+            weights,
+            linears: HashMap::new(),
+            vectors,
+            threads: 1,
+            context_size,
+            position: 0,
+            rope_cos,
+            rope_sin,
+            rope_half,
+            full_states: vec![FullAttnState {
+                k: vec![0.0; context_size * 4],
+                v: vec![0.0; context_size * 4],
+            }],
+            linear_states: Vec::new(),
+        }
     }
 }

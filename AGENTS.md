@@ -6,9 +6,9 @@ This document is a complete orienteering guide for AI agents (or humans) continu
 
 ## 1. Project Overview
 
-**Goal:** A minimal, **zero-dependency** (std-only) Rust inference server for ExLlamaV3 (EXL3) quantized models, focused on the **Qwen3.5 text decoder** (`Qwen3_5ForConditionalGeneration` / `Qwen3_5ForCausalLM`). It exposes an OpenAI-compatible HTTP API.
+**Goal:** A minimal Rust inference server for ExLlamaV3 (EXL3) quantized models, focused on the **Qwen3.5 text decoder** (`Qwen3_5ForConditionalGeneration` / `Qwen3_5ForCausalLM`). It exposes an OpenAI-compatible HTTP API.
 
-**Hard constraint:** No external crates. Everything (JSON, HTTP, tokenizer, regex, PRNG, matmul, dequantizer) is hand-written in `src/`. `Cargo.toml` must stay dependency-free.
+**Dependency policy:** JSON, HTTP, tokenizer, regex, PRNG and dequantizer are hand-written in `src/` with the standard library only. The only (non-optional) crate is `matrixmultiply` for the SIMD sgemm kernel; `candle-core` is opt-in for GPU. Do not add general-purpose crates (serde, tokio, serde_json, etc.) without explicit approval.
 
 **Model scope:** Qwen3.5 only. The vision tower of multimodal checkpoints is ignored; text-only inference works. Other architectures are out of scope.
 
@@ -23,7 +23,7 @@ This document is a complete orienteering guide for AI agents (or humans) continu
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build                      # debug
 cargo build --release            # optimized binary at target/release/exllama-server
-cargo test                       # 15 unit tests
+cargo test                       # 45 unit tests (4 ignored)
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings   # must pass (CI enforces)
 ```
@@ -48,7 +48,7 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 | OPTIONS | any | 204 (CORS preflight) |
 
 ### API parameters (chat & completions)
-`temperature` (default 0.7), `top_p` (1.0), `top_k` (0 = off), `max_tokens` / `max_completion_tokens`, `stop` (string or array), `seed`, `repetition_penalty`, `stream` (bool), and for chat: `enable_thinking` (bool, default **true** for 9B/4B).
+`temperature` (default 0.7), `top_p` (1.0), `top_k` (0 = off), `max_tokens` / `max_completion_tokens`, `stop` (string or array), `stop_token_ids`, `seed`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `logit_bias` (token-id → bias), `stream` (bool), `stream_options.include_usage`, and for chat: `enable_thinking` (bool, default **true** for 9B/4B). `model` is validated against the server name. Invalid parameters are rejected with a 400.
 
 ---
 
@@ -62,10 +62,10 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 - Has `#![allow(dead_code)]` at crate root (intentional unused helpers).
 
 ### `src/http.rs` — Minimal HTTP/1.1 server
-- `Request { method, path, headers, body }` — parsed by `read_request()` (reads headers until `\r\n\r\n`, then `Content-Length` bytes).
-- `respond()` — writes a complete HTTP response with Content-Length.
-- `Streamer` — manages chunked-transfer-encoding SSE. `write_chunk(data)` writes one chunk; `end()` writes the terminating `0\r\n\r\n`.
-- `serve(listener, handler)` — accept loop; **one OS thread per connection**. Handler signature: `Fn(TcpStream, Request)` (takes ownership of the stream).
+- `Request { method, path, headers, body }` — parsed by `read_request()` (64 KiB header cap, 8 MiB body cap, rejects duplicate/invalid Content-Length).
+- `respond()` — writes a complete response with Content-Length and CORS headers.
+- `Streamer` — chunked SSE writer with `Cache-Control: no-cache`; `write_chunk()` returns false on a broken connection so generation aborts; `end()` writes `0\r\n\r\n`.
+- `serve(listener, handler)` — accept loop; one OS thread per connection (capped at 64), 600 s read/write timeouts. Handler signature: `Fn(TcpStream, Request)` (takes ownership of the stream).
 
 ### `src/json.rs` — JSON parser/serializer
 - `Json` enum: `Null, Bool(bool), Num(f64), Str(String), Arr(Vec<Json>), Obj(Vec<(String, Json)>)` (no separate Float variant).
@@ -127,12 +127,13 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
   2. Each step: `sample()` → check stop token → decode incrementally → `on_token(chunk, is_reasoning)` → `logits = model.forward(&[tok])`.
   3. Stops on EOS or matching `stop` strings; strips the matched stop string from output.
   4. `flush_utf8()` buffers incomplete multibyte chars across token boundaries (avoids char-boundary panics).
-  5. When `split_reasoning=true`, tokens 248068/248069 (`<think>`/`</think>`) toggle `in_reasoning` and are never emitted; reasoning text accumulates in `GenResult.reasoning_content`, answer text in `GenResult.text`.
+  5. When `split_reasoning=true`, tokens 248068/248069 (`<think>`/`</think>`) toggle `in_reasoning` and are never emitted; they **are still fed through the model** so state stays aligned. `OutputRouter` handles toggling and buffered text; reasoning text accumulates in `GenResult.reasoning_content`, answer text in `GenResult.text`.
 - `run_chat()` / `run_completion()` — render prompt, tokenize, call `generate()`. **Chat uses `add_generation_prompt=true`** (critical: model needs `<think>\n` to start) and `split_reasoning=true`; completions use `split_reasoning=false`.
-- `sample()` — repetition penalty (divides logits of already-generated tokens by `repetition_penalty` > 1, HashSet dedup), then temperature (≤0 = argmax), top-k, top-p nucleus sampling with softmax. `generate()` passes the completion history into `sample()`.
+- `sample()` — repetition penalty (divides logits of already-generated tokens by `repetition_penalty` > 1, HashSet dedup), presence/frequency penalties, `logit_bias`, then temperature (≤0 = argmax), top-k, top-p nucleus sampling. The default path (no top-k, top_p=1) uses an allocation-free two-pass categorical draw; other paths use one candidate vector with partial selection. `generate()` passes completion history into `sample()`.
 - Progress logging to stderr: `[load]` per 16 linears + totals in `exl3.rs::load`; `[prompt] processed/total (tok/s)` per 32-token prefill batch; `[decode] N tokens generated (tok/s)` every 16 tokens; `[done]` final summary. Constants `PROMPT_BATCH=32`, `DECODE_BATCH=16` in `server.rs`.
 - `handle_chat()` / `handle_completions()` — parse JSON body, build SSE chunks or JSON responses. SSE uses `chat_chunk()` / completion chunk builders; terminates with `data: [DONE]`.
-- `Params` includes `enable_thinking` (parsed from body).
+- `Params` includes `enable_thinking`, penalties, `logit_bias`, stop token ids and `include_usage`. `parse_params()` validates all fields and returns 400 on bad input.
+- `OutputRouter` owns UTF-8 assembly, stream toggling and stop-string tail buffering; `on_token` returns false to abort generation when the client disconnects. RoPE tables and DeltaNet head scratch are precomputed/reused for throughput.
 
 ### `src/exl3.rs` — EXL3 safetensors reader + dequantizer (782 lines, most research-heavy)
 See §5 for the full format. Key items:
@@ -355,7 +356,7 @@ Run `cargo test` — all 15 pass on the committed state.
 ## 10. Git / CI State
 
 - Branch `main`, single squashed commit tagged `v0.2.0`, placeholder author identity.
-- `.github/workflows/ci.yml`: build+test on push/PR for `ubuntu-latest` (linux x86_64), `ubuntu-24.04-arm` (linux arm64, native runner), `macos-latest` (arm64), `windows-latest` (x86_64). macOS Intel target removed. fmt check; clippy `-D warnings`; uploads artifacts.
+- `.github/workflows/ci.yml`: build + `cargo test` on push/PR for `ubuntu-latest` (linux x86_64), `ubuntu-24.04-arm` (linux arm64), `macos-latest` (arm64, with `gpu-metal`), `windows-latest` (x86_64). fmt check; clippy `-D warnings` (Linux); uploads artifacts. The macOS build compiles the GPU backend; GPU runtime correctness is not exercised on CI runners.
 - `.github/workflows/release.yml`: on `v*` tags, builds all 4 targets (macOS with `gpu-metal`), packages, publishes GitHub Release.
 - `.github/workflows/release-gpu.yml`: manually triggered (`workflow_dispatch`, optional tag input). Installs CUDA toolkit via `Jimver/cuda-toolkit@v0.2.21` (12.6.0) on Linux/Windows, builds with `--features gpu-cuda`, attaches to a release by tag. Separate from main CI because stock runners have no nvcc (candle-kernels/cudarc need it; `fallback-latest` only fixes cudarc version detection, not candle-kernels' nvcc requirement).
 - To push: `git remote add origin <URL> && git push -u origin master`.

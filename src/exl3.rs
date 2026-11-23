@@ -18,6 +18,22 @@ use std::path::{Path, PathBuf};
 use crate::json::Json;
 use crate::tensor::Matrix;
 
+/// Best-effort resident-set size in MiB. `std` has no portable RSS API, so
+/// this is Linux-only and simply omitted elsewhere.
+fn rss_mib() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let s = fs::read_to_string("/proc/self/status").ok()?;
+        for line in s.lines() {
+            if let Some(v) = line.strip_prefix("VmRSS:") {
+                let kb: f64 = v.split_whitespace().next()?.parse().ok()?;
+                return Some(kb / 1024.0);
+            }
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // FP16 helpers
 // ---------------------------------------------------------------------------
@@ -176,6 +192,18 @@ static HALF_F32: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
 #[inline]
 fn half_f32(bits: u16) -> f32 {
     HALF_F32.get_or_init(|| (0..=u16::MAX).map(half_to_f32).collect())[bits as usize]
+}
+
+/// Dot product against one fp16 weight row, converting weights on the fly via
+/// the lookup table. Avoids materialising a full-size f32 scratch per matmul.
+#[inline]
+fn dot_f16(x: &[f32], w: &[u16]) -> f32 {
+    let n = x.len().min(w.len());
+    let mut acc = 0.0f32;
+    for k in 0..n {
+        acc += x[k] * half_f32(w[k]);
+    }
+    acc
 }
 
 // ---------------------------------------------------------------------------
@@ -711,9 +739,11 @@ pub struct QuantLinear {
     k_bits_int: usize,
     k_half: bool,
     cb: Codebook,
-    trellis: Vec<u16>, // tiles_k * tiles_n * words_per_tile
-    suh: Vec<f32>,     // (k,)
-    svh: Vec<f32>,     // (n,)
+    /// Packed trellis (tiles_k * tiles_n * words_per_tile). Set to `None`
+    /// after a decode cache is built so the on-disk copy can be freed.
+    trellis: Option<Vec<u16>>,
+    suh: Vec<f32>, // (k,)
+    svh: Vec<f32>, // (n,)
     /// Optional fp16 decode cache of W_hat in (k, n) row-major layout.
     /// Codebook outputs are natively fp16, so this is lossless and costs
     /// 2 bytes/weight (vs 4 for f32, 1 for packed). When present, matmul uses
@@ -765,7 +795,7 @@ impl QuantLinear {
             k_bits_int,
             k_half,
             cb,
-            trellis: trellis[..expected].to_vec(),
+            trellis: Some(trellis[..expected].to_vec()),
             suh,
             svh,
             what_f16: None,
@@ -775,10 +805,15 @@ impl QuantLinear {
 
     /// Decode all tiles once into an fp16 W_hat cache in (k, n) row-major
     /// layout. Lossless (codebook outputs are fp16) and 2 bytes/weight.
-    pub fn build_decode_cache(&mut self) {
+    /// The packed trellis is dropped afterwards to keep peak RAM low.
+    pub fn build_decode_cache(&mut self) -> Result<(), String> {
         if self.what_f16.is_some() {
-            return;
+            return Ok(());
         }
+        let trellis = self
+            .trellis
+            .take()
+            .ok_or_else(|| format!("{}: trellis already consumed", self.name))?;
         let mut what = vec![0u16; self.k * self.n];
         let mut tile_f32 = [0.0f32; 256];
         let mut tile_f16 = [0u16; 256];
@@ -786,7 +821,7 @@ impl QuantLinear {
             for tn in 0..self.tiles_n {
                 let off = (tk * self.tiles_n + tn) * self.words_per_tile;
                 unpack_tile(
-                    &self.trellis[off..off + self.words_per_tile],
+                    &trellis[off..off + self.words_per_tile],
                     self.k_bits_int,
                     self.k_half,
                     self.cb,
@@ -804,20 +839,26 @@ impl QuantLinear {
             }
         }
         self.what_f16 = Some(what);
+        Ok(())
     }
 
     /// Decode all tiles into an f32 W_hat cache (k, n) for the fastest matmul.
-    pub fn build_decode_cache_f32(&mut self) {
+    /// As above, the packed trellis is released once decoding is complete.
+    pub fn build_decode_cache_f32(&mut self) -> Result<(), String> {
         if self.what_f32.is_some() {
-            return;
+            return Ok(());
         }
+        let trellis = self
+            .trellis
+            .take()
+            .ok_or_else(|| format!("{}: trellis already consumed", self.name))?;
         let mut what = vec![0.0f32; self.k * self.n];
         let mut tile = [0.0f32; 256];
         for tk in 0..self.tiles_k {
             for tn in 0..self.tiles_n {
                 let off = (tk * self.tiles_n + tn) * self.words_per_tile;
                 unpack_tile(
-                    &self.trellis[off..off + self.words_per_tile],
+                    &trellis[off..off + self.words_per_tile],
                     self.k_bits_int,
                     self.k_half,
                     self.cb,
@@ -833,6 +874,7 @@ impl QuantLinear {
             }
         }
         self.what_f32 = Some(what);
+        Ok(())
     }
 
     /// Compute `y = W @ x` where W is the dequantized (n, k) weight, directly
@@ -863,13 +905,34 @@ impl QuantLinear {
             // selected compute backend (BLAS/GPU). what is (n, k) row-major.
             crate::compute::matmul_t(&xr, 1, k, what, n, &mut t, threads);
         } else if let Some(what) = &self.what_f16 {
-            // fp16 cache: convert to an f32 scratch then use the compute
-            // backend. The scratch is transient (one layer at a time).
-            let scratch: Vec<f32> = what.iter().map(|&b| half_f32(b)).collect();
-            crate::compute::matmul_t(&xr, 1, k, &scratch, n, &mut t, threads);
+            // fp16 cache: decode each weight on the fly (2 bytes/weight) and
+            // split output rows across threads. No full f32 scratch is built.
+            let base = SharedPtr(t.as_mut_ptr());
+            let n_threads = if n < 256 { 1 } else { threads.max(1).min(n) };
+            let chunk = n.div_ceil(n_threads);
+            let xr_ref = &xr;
+            let what_ref = what;
+            std::thread::scope(|s| {
+                for t_idx in 0..n_threads {
+                    let j0 = t_idx * chunk;
+                    if j0 >= n {
+                        break;
+                    }
+                    let j1 = (j0 + chunk).min(n);
+                    s.spawn(move || {
+                        for j in j0..j1 {
+                            base.write_at(j, dot_f16(xr_ref, &what_ref[j * k..(j + 1) * k]));
+                        }
+                    });
+                }
+            });
         } else {
             // Packed path: decode tiles on demand (low memory, slow). Split over
             // tn so each worker writes a disjoint slice of `t`.
+            let trellis = self
+                .trellis
+                .as_ref()
+                .expect("packed matmul requires a trellis cache");
             let base = SharedPtr(t.as_mut_ptr());
             // Avoid spawning many short-lived threads for small matrices: require
             // enough total tiles to amortize thread creation (~1024 tiles).
@@ -895,7 +958,7 @@ impl QuantLinear {
                             for tk in 0..slf.tiles_k {
                                 let off = (tk * slf.tiles_n + tn) * slf.words_per_tile;
                                 unpack_tile(
-                                    &slf.trellis[off..off + slf.words_per_tile],
+                                    &trellis[off..off + slf.words_per_tile],
                                     slf.k_bits_int,
                                     slf.k_half,
                                     slf.cb,
@@ -1030,8 +1093,8 @@ impl Exl3Model {
             }
             let mut ql = QuantLinear::from_shards(&shards, base)?;
             match weight_mode {
-                "f32" => ql.build_decode_cache_f32(),
-                "f16" => ql.build_decode_cache(),
+                "f32" => ql.build_decode_cache_f32()?,
+                "f16" => ql.build_decode_cache()?,
                 "packed" => {} // decode on every matmul
                 _ => {}
             }
@@ -1103,11 +1166,14 @@ impl Exl3Model {
         }
 
         eprintln!(
-            "[load] Model loaded in {:.1}s ({} linears, {} matrices, {} vectors)",
+            "[load] Model loaded in {:.1}s ({} linears, {} matrices, {} vectors{})",
             load_start.elapsed().as_secs_f64(),
             linears.len(),
             weights.len(),
-            vectors.len()
+            vectors.len(),
+            rss_mib()
+                .map(|m| format!(", rss={:.0} MiB", m))
+                .unwrap_or_default()
         );
         Ok(Exl3Model {
             config,
@@ -1338,7 +1404,7 @@ mod real_model_tests {
 
         // Cached f32 path must also match the reference.
         let mut qc = QuantLinear::from_shards(&shards, pre).unwrap();
-        qc.build_decode_cache_f32();
+        qc.build_decode_cache_f32().unwrap();
         let got_cached = qc.matmul(&x, 1);
         let mut cmax = 0.0f32;
         for (j, &g) in got_cached.iter().enumerate() {
@@ -1349,7 +1415,7 @@ mod real_model_tests {
 
         // Cached f16 path must also match (within fp16 rounding).
         let mut qh = QuantLinear::from_shards(&shards, pre).unwrap();
-        qh.build_decode_cache();
+        qh.build_decode_cache().unwrap();
         let got_h = qh.matmul(&x, 1);
         let mut hmax = 0.0f32;
         for (j, &g) in got_h.iter().enumerate() {
@@ -1366,7 +1432,7 @@ mod real_model_tests {
             None => return,
         };
         let mut ql = QuantLinear::from_shards(&shards, pre).unwrap();
-        ql.build_decode_cache_f32();
+        ql.build_decode_cache_f32().unwrap();
         let x = vec![0.5f32; ql.k];
         // warmup
         let _ = ql.matmul(&x, 1);
@@ -1417,7 +1483,7 @@ mod packed_profile {
             k_bits_int: 8,
             k_half: false,
             cb: Codebook::Mcg,
-            trellis,
+            trellis: Some(trellis),
             suh: vec![1.0; tk * 16],
             svh: vec![1.0; tn * 16],
             what_f16: None,
@@ -1434,7 +1500,7 @@ mod packed_profile {
             for t in 0..ql.tiles_k * ql.tiles_n {
                 let off = t * wpt;
                 unpack_tile(
-                    &ql.trellis[off..off + wpt],
+                    &ql.trellis.as_ref().unwrap()[off..off + wpt],
                     8,
                     false,
                     Codebook::Mcg,
@@ -1460,7 +1526,7 @@ mod packed_profile {
             let tk2 = t / ql.tiles_n;
             let tn2 = t % ql.tiles_n;
             unpack_tile(
-                &ql.trellis[off..off + wpt],
+                &ql.trellis.as_ref().unwrap()[off..off + wpt],
                 8,
                 false,
                 Codebook::Mcg,
