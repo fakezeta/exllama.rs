@@ -73,7 +73,7 @@ jobs:
         with:
           cuda: '12.6.0'
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "nvrtc"]'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "nvrtc", "nvrtc_dev"]'
 
       # nvcc invokes the host compiler (cl.exe on MSVC). Headless runners have
       # Visual Studio installed but not on PATH unless the dev cmd is sourced.
