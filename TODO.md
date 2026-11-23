@@ -48,16 +48,21 @@ checked off with a short note; open items are unchecked.
   Hadamard rows, shard-byte compaction after the linear pass, and a persistent
   worker pool replacing per-matmul thread spawning. Equivalence tests added;
   real-model throughput benchmark still optional.
-- [ ] **(P0) Make the core equivalence tests fresh-clone-safe.** See plan
-  Phase 0 #1: `quantized_matmul_matches_f32_dequant` silently skips when
-  `/tmp/unstable_*.bin` is absent, so the main correctness guarantee is a no-op
-  on CI. Build a committed synthetic EXL3 fixture and mark real-model tests
-  `#[ignore]`. Cover 3INST / MCG / MUL1.
-- [ ] **(P0) Numeric unit tests for decoder primitives.** See plan Phase 0 #2:
-  `model.rs` has one unit test; add golden tests for RMSNorm, partial RoPE,
-  q_proj interleaving, GQA, gate sigmoid, the DeltaNet step, and per-head
-  RMSNormGated. The forward math is verified correct against HF source — this
-  locks it in without a model download.
+- [x] **(P0) Make the core equivalence tests fresh-clone-safe.** Done — see
+  plan Phase 0 #1: `exl3::synthetic_tests` builds a deterministic 128x128 EXL3
+  linear in memory and checks all three `--weight-mode` paths against full
+  dequant for 3INST, MCG, MUL1 (integer + half-bitrate). The `/tmp`-dependent
+  real-model tests (and the real-tokenizer tests) are now explicitly `#[ignore]`d
+  with reasons; `cargo test` proves the guarantee on a fresh clone.
+- [x] **(P0) Numeric unit tests for decoder primitives.** Done — see plan
+  Phase 0 #2: extracted `split_q_gate`, `gqa_attention` and `deltanet_step`
+  helpers without changing the math, and added hand-computed golden tests for
+  RMSNorm, per-head RMSNormGated, partial RoPE, q_proj interleaving, GQA
+  grouping/scale/gate and the DeltaNet recurrence (with decay). `model.rs`
+  now has 7 unit tests.
+- [x] **(P1) Fix doc drift.** Done — `AGENTS.md` counts/line numbers, `TODO.md`
+  stale "next steps", and this plan's baseline are updated to 88 passed /
+  10 ignored.
 - [ ] **(P1) Bounded request-line reading.** See plan Phase 1 #4: `read_request`
   (`http.rs`) reads the request line with no cap; OOM vector with a long
   newline-free line. Use `Read::take` on both request line and headers.
@@ -203,20 +208,18 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 ## Suggested Next Steps (ordered)
 
 The authoritative phased plan (with acceptance criteria) is
-[`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md). Execute in this order:
+[`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md). **Phase 0 is complete**; execute
+the remaining phases in this order:
 
-1. **Phase 0 — test/docs foundation.** Make the dequantization/matmul
-   equivalence tests fresh-clone-safe with a committed synthetic EXL3 fixture,
-   add golden tests for the decoder math primitives, and fix stale doc counts.
-2. **Phase 1 — robustness & streaming fidelity.** Bound the HTTP request line,
+1. **Phase 1 — robustness & streaming fidelity (start here).** Bound the HTTP request line,
    guard the global threadpool against concurrent `run()`, align SSE chunk
    ordering / completion `usage` / tool-call deltas, add a generation deadline,
    and bound regex quantifier allocations.
-3. **Phase 2 — performance (measure first).** Reuse post-prefill state for
+2. **Phase 2 — performance (measure first).** Reuse post-prefill state for
    `n > 1`, then batching, f16 KV cache / tied embeddings, GPU cache key fix.
-4. **Phase 3 — exploration.** Vision, other architectures, NFC / `chat_template`
+3. **Phase 3 — exploration.** Vision, other architectures, NFC / `chat_template`
    loading, structured logging, Anthropic endpoint.
-5. **Manual validation still worth doing:** the end-to-end benchmark
+4. **Manual validation still worth doing:** the end-to-end benchmark
    (`EXLLAMA_BENCH_MODEL=/path cargo test --release bench_generation_throughput -- --ignored --nocapture`),
    a real-client SSE smoke test (`curl -N`), and real-model runs on 2B/4B/9B
    and MUL1 codebooks (only the 0.8B 8-bpw MCG model has been exercised).

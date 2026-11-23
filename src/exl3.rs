@@ -1722,6 +1722,7 @@ mod real_model_tests {
     }
 
     #[test]
+    #[ignore = "requires /tmp/unstable_prefix.bin + layer0.bin (partial real model); see tests/README.md"]
     fn dequant_matches_python_reference() {
         let (shards, pre) = match layer0_in_proj_qkv() {
             Some(v) => v,
@@ -1756,6 +1757,7 @@ mod real_model_tests {
     }
 
     #[test]
+    #[ignore = "requires /tmp/unstable_prefix.bin + layer0.bin; self-contained equivalent in synthetic_tests"]
     fn quantized_matmul_matches_f32_dequant() {
         // The core guarantee of computing with quantized weights: inline
         // dequantize-on-matmul must match reconstruct-then-matmul.
@@ -1845,6 +1847,193 @@ mod real_model_tests {
                 dt
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod synthetic_tests {
+    use super::*;
+    use crate::tensor::dot;
+
+    /// A deterministic 128x128 EXL3 linear built entirely in memory: no files,
+    /// no `/tmp` fixtures. This is the fresh-clone-safe counterpart of the
+    /// `/tmp`-dependent `real_model_tests::quantized_matmul_matches_f32_dequant`.
+    fn synthetic_shards(cb: Codebook, half: bool) -> Shards {
+        const PREFIX: &str = "synthetic";
+        let (tiles_k, tiles_n) = (8usize, 8usize);
+        let k = tiles_k * 16;
+        let n = tiles_n * 16;
+        // K = 8 (integer) or K = 3.5 (half-integer MUL1 rate).
+        let words_per_tile = if half { 16 * 3 + 8 } else { 16 * 8 };
+
+        fn add(
+            bytes: &mut Vec<u8>,
+            tensors: &mut HashMap<String, RawTensor>,
+            name: &str,
+            dtype: &str,
+            shape: Vec<usize>,
+            data: &[u8],
+        ) {
+            let offset = bytes.len();
+            bytes.extend_from_slice(data);
+            tensors.insert(
+                name.to_string(),
+                RawTensor {
+                    dtype: dtype.to_string(),
+                    shape,
+                    offset,
+                    len: data.len(),
+                },
+            );
+        }
+
+        let mut bytes = Vec::new();
+        let mut tensors = HashMap::new();
+
+        // xorshift64 trellis bits: identical on every machine and run.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut trellis = Vec::with_capacity(tiles_k * tiles_n * words_per_tile * 2);
+        for _ in 0..tiles_k * tiles_n * words_per_tile {
+            trellis.extend_from_slice(&(next() as u16).to_le_bytes());
+        }
+        add(
+            &mut bytes,
+            &mut tensors,
+            &format!("{}.trellis", PREFIX),
+            "I16",
+            vec![tiles_k, tiles_n, words_per_tile],
+            &trellis,
+        );
+
+        // Repeating fp16 scales [1, -1, 0.5, -0.5]. The output vector uses an
+        // offset pattern so a row/column transposition cannot cancel out.
+        const PATTERN: [u16; 4] = [0x3c00, 0xbc00, 0x3800, 0xb800];
+        let mut suh = Vec::with_capacity(k * 2);
+        for i in 0..k {
+            suh.extend_from_slice(&PATTERN[i % 4].to_le_bytes());
+        }
+        add(
+            &mut bytes,
+            &mut tensors,
+            &format!("{}.suh", PREFIX),
+            "F16",
+            vec![k],
+            &suh,
+        );
+        let mut svh = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            svh.extend_from_slice(&PATTERN[(i + 1) % 4].to_le_bytes());
+        }
+        add(
+            &mut bytes,
+            &mut tensors,
+            &format!("{}.svh", PREFIX),
+            "F16",
+            vec![n],
+            &svh,
+        );
+
+        // Codebook marker: presence alone selects the codebook at load time.
+        match cb {
+            Codebook::Mcg => add(
+                &mut bytes,
+                &mut tensors,
+                &format!("{}.mcg", PREFIX),
+                "I32",
+                vec![1],
+                &1i32.to_le_bytes(),
+            ),
+            Codebook::Mul1 => add(
+                &mut bytes,
+                &mut tensors,
+                &format!("{}.mul1", PREFIX),
+                "I32",
+                vec![1],
+                &1i32.to_le_bytes(),
+            ),
+            Codebook::ThreeInst => {} // no marker selects 3INST
+        }
+
+        let map = tensors.keys().map(|name| (name.clone(), 0usize)).collect();
+        Shards {
+            files: vec![SafeFile { bytes, tensors }],
+            map,
+        }
+    }
+
+    fn assert_close(label: &str, got: &[f32], expect: &[f32]) {
+        assert_eq!(got.len(), expect.len(), "{}: output length", label);
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (&g, &e) in got.iter().zip(expect) {
+            let err = (g - e).abs();
+            max_abs = max_abs.max(err);
+            max_rel = max_rel.max(err / (e.abs() + 1e-3));
+        }
+        assert!(
+            max_abs < 5e-3 && max_rel < 5e-3,
+            "{}: max_abs={} max_rel={}",
+            label,
+            max_abs,
+            max_rel
+        );
+    }
+
+    /// All three storage modes must reproduce the reconstruct-then-matmul
+    /// reference, for every EXL3 codebook (and the half-integer MUL1 rate).
+    fn check(cb: Codebook, half: bool) {
+        let shards = synthetic_shards(cb, half);
+        let (w, _) = dequant_linear(&shards, "synthetic").unwrap();
+        assert_eq!((w.rows, w.cols), (128, 128));
+
+        let mut x = vec![0.0f32; w.cols];
+        let mut seed = 42u64;
+        for v in &mut x {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *v = ((seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0;
+        }
+        let expect: Vec<f32> = (0..w.rows).map(|j| dot(w.row(j), &x)).collect();
+
+        let ql = QuantLinear::from_shards(&shards, "synthetic").unwrap();
+        assert_eq!((ql.n, ql.k), (w.rows, w.cols));
+        assert_close("packed", &ql.matmul(&x, 1), &expect);
+
+        let mut qf = QuantLinear::from_shards(&shards, "synthetic").unwrap();
+        qf.build_decode_cache_f32().unwrap();
+        assert_close("f32 cache", &qf.matmul(&x, 1), &expect);
+
+        let mut qh = QuantLinear::from_shards(&shards, "synthetic").unwrap();
+        qh.build_decode_cache().unwrap();
+        assert_close("f16 cache", &qh.matmul(&x, 1), &expect);
+    }
+
+    #[test]
+    fn matmul_matches_dequant_3inst() {
+        check(Codebook::ThreeInst, false);
+    }
+
+    #[test]
+    fn matmul_matches_dequant_mcg() {
+        check(Codebook::Mcg, false);
+    }
+
+    #[test]
+    fn matmul_matches_dequant_mul1() {
+        check(Codebook::Mul1, false);
+    }
+
+    #[test]
+    fn matmul_matches_dequant_mul1_half_bitrate() {
+        // Half-integer K = 3.5 exercises the 0xAAAA mask ring layout.
+        check(Codebook::Mul1, true);
     }
 }
 

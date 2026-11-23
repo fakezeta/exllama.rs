@@ -7,14 +7,16 @@ module. It complements `TODO.md`: that file tracks individual checked-off tasks,
 while this file groups the *open* work into executable phases with acceptance
 criteria.
 
-> **Status:** plan only — no code changes have been made and nothing has been
-> committed. Commit only on explicit approval.
+> **Status:** Phase 0 is **implemented and verified** (see the completion notes
+> below); Phases 1–3 remain plans. Commit only on explicit approval.
 
 ## Baseline (at time of review)
 
-- Branch `main`, tag `v0.4.2`, working tree clean.
-- `cargo test`: **84 passed, 4 ignored**. `cargo fmt --all -- --check` and
-  `cargo clippy --all-targets -- -D warnings`: clean.
+- Branch `main`, tag `v0.4.2`, working tree clean at review time.
+- At review: `cargo test` **84 passed, 4 ignored**. After Phase 0:
+  **88 passed, 10 ignored** (6 real-model / `/tmp` fixtures now explicitly
+  ignored with reasons, 4 benchmarks). `cargo fmt --all -- --check` and
+  `cargo clippy --all-targets -- -D warnings` remain clean.
 - The **forward math is correct**. `src/model.rs` matches both `AGENTS.md` §6
   and the upstream HuggingFace `modeling_qwen3_5.py` / `modeling_qwen3_next.py`
   reference on every subtlety checked: q_proj `[query|gate]` per-head
@@ -50,6 +52,10 @@ tests silently return early when `/tmp` files are absent.
    message so their intent is explicit.
    *Acceptance:* a clean clone with no `/tmp` fixtures proves dequant and
    quantized-matmul equivalence for 3INST / MCG / MUL1 codebooks.
+   **Done:** `exl3::synthetic_tests` builds a deterministic 128x128 EXL3 linear
+   entirely in memory and compares all three storage modes (packed / f32 cache
+   / f16 cache) against `dequant_linear` for 3INST, MCG, MUL1 integer and
+   MUL1 half-bitrate. Real-model `/tmp` tests are `#[ignore]`d with reasons.
 
 2. **Add numeric unit tests for the decoder primitives.** `src/model.rs` has
    only one unit test today. Add hand-computed golden tests for: zero-centered
@@ -58,12 +64,20 @@ tests silently return early when `/tmp` files are absent.
    update with the *updated* state), and per-value-head RMSNormGated.
    *Acceptance:* each primitive in `AGENTS.md` §6 has at least one assertion
    that does not require a model download.
+   **Done:** extracted `split_q_gate`, `gqa_attention` and `deltanet_step`
+   (plus `AttnShape` / `DeltaNetScratch`) without changing the math and added
+   seven `model::tests` golden tests covering RMSNorm, per-head RMSNormGated,
+   partial RoPE, q_proj interleaving, GQA grouping/scale/gate, the DeltaNet
+   state update with decay, and fp16 embedding resolution.
 
-3. **Fix doc drift.** `AGENTS.md` §9 says "82 tests / 4 ignored" and §3 says
-   `exl3.rs` is 1556 lines — actual counts are 84 / 4 and ~1949. `TODO.md`
-   "Suggested Next Steps" #1 (reduce embedding memory) is already done. Update
-   these to match reality and point `TODO.md` at this plan.
+3. **Fix doc drift.** At review `AGENTS.md` §9 said "82 tests / 4 ignored"
+   and §3 said `exl3.rs` was 1556 lines (actual then: 84 / 4 and 1949 lines);
+   `TODO.md` "Suggested Next Steps" #1 (reduce embedding memory) was already
+   done. Update these to match reality and point `TODO.md` at this plan.
    *Acceptance:* no stale counts or completed items presented as open.
+   **Done:** `AGENTS.md`, `TODO.md`, `README.md` and `tests/README.md` now
+   reflect 88 passed / 10 ignored, the synthetic fixtures, the new golden
+   tests and the explicit `#[ignore]` tagging of `/tmp`-dependent tests.
 
 ---
 
@@ -180,6 +194,8 @@ tests silently return early when `/tmp` files are absent.
 
 ## Suggested execution order
 
-**Phase 0 → Phase 1 → Phase 2 → Phase 3.** Start with Phase 0 items 1-3: they
-are low-risk, fix the most dangerous gap (untested core guarantees), and make
-every later change safer. Do not commit until the user explicitly approves.
+**Phase 0 is complete** → **Phase 1 → Phase 2 → Phase 3**. Phase 0 was
+low-risk, closed the most dangerous gap (untested core guarantees) and makes
+every later change safer. Start the remaining work with Phase 1 item 4 (the
+bounded HTTP request line), then item 5 (threadpool deadlock). Do not commit
+until the user explicitly approves.

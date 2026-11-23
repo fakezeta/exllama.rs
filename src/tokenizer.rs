@@ -525,6 +525,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires /tmp/qwen35/tokenizer.json (real Qwen3.5 tokenizer); see tests/README.md"]
     fn added_token_protection() {
         let t = match load() {
             Some(t) => t,
@@ -648,6 +649,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires /tmp/unstable_tok.json (real UnstableLlama tokenizer); see tests/README.md"]
     fn load_tokenizer_without_byte_encoder() {
         // The UnstableLlama EXL3 repo's tokenizer.json omits byte_encoder.
         let t = match Tokenizer::load("/tmp/unstable_tok.json") {
@@ -660,6 +662,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires /tmp/qwen35/tokenizer.json (real Qwen3.5 tokenizer); see tests/README.md"]
     fn encode_reference() {
         let t = match load() {
             Some(t) => t,

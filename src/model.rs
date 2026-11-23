@@ -55,6 +55,27 @@ struct LinearAttnState {
     state: Vec<f32>, // (num_value_heads, value_dim, key_dim)
 }
 
+/// Shape of one GQA attention call, grouped to keep the helper signature small.
+#[derive(Clone, Copy)]
+struct AttnShape {
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    tlen: usize,
+}
+
+/// Scratch buffers reused across heads and tokens by the DeltaNet step, so
+/// the recurrent path stays allocation-free per head.
+struct DeltaNetScratch {
+    kd: usize,
+    vd: usize,
+    qh: Vec<f32>,
+    kh: Vec<f32>,
+    mem: Vec<f32>,
+    delta: Vec<f32>,
+    o: Vec<f32>,
+}
+
 pub struct Model {
     pub config: ModelConfig,
     prefix: String,
@@ -357,6 +378,130 @@ impl Model {
         out
     }
 
+    /// Split an interleaved q_proj output into per-head query and gate vectors.
+    /// Head `h` occupies `[h*2*hd .. h*2*hd + 2*hd)`: query in the first half,
+    /// gate in the second half (HF `chunk(q.view(..., hd*2), 2, -1)`).
+    fn split_q_gate(qp: &[f32], nh: usize, hd: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut q = vec![0.0f32; nh * hd];
+        let mut gate = vec![0.0f32; nh * hd];
+        for h in 0..nh {
+            let base = h * 2 * hd;
+            q[h * hd..(h + 1) * hd].copy_from_slice(&qp[base..base + hd]);
+            gate[h * hd..(h + 1) * hd].copy_from_slice(&qp[base + hd..base + 2 * hd]);
+        }
+        (q, gate)
+    }
+
+    /// GQA attention for all query heads, including the per-element sigmoid
+    /// gate. `k`/`v` hold `shape.tlen` cached positions laid out as
+    /// `(tlen, nkv, hd)`; query head `h` reads KV head `h / (nh / nkv)`.
+    fn gqa_attention(q: &[f32], gate: &[f32], k: &[f32], v: &[f32], shape: AttnShape) -> Vec<f32> {
+        let AttnShape { nh, nkv, hd, tlen } = shape;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let groups = nh / nkv;
+        let kv = nkv * hd;
+        let mut out = vec![0.0f32; nh * hd];
+        let mut scores = vec![0.0f32; tlen];
+        for h in 0..nh {
+            let kv_head = h / groups;
+            let qoff = h * hd;
+            for (t, score) in scores.iter_mut().enumerate() {
+                let koff = t * kv + kv_head * hd;
+                *score = dot(&q[qoff..qoff + hd], &k[koff..koff + hd]) * scale;
+            }
+            let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for s in &mut scores {
+                *s = (*s - max).exp();
+                sum += *s;
+            }
+            for s in &mut scores {
+                *s /= sum;
+            }
+            for (t, &a) in scores.iter().enumerate() {
+                let voff = t * kv + kv_head * hd;
+                for d in 0..hd {
+                    out[qoff + d] += a * v[voff + d];
+                }
+            }
+            for d in 0..hd {
+                out[qoff + d] *= 1.0 / (1.0 + (-gate[qoff + d]).exp());
+            }
+        }
+        out
+    }
+
+    /// One Gated DeltaNet recurrence step for a single value head. `state` is
+    /// a `(kd, vd)` row-major slice, updated in place; the head's output is
+    /// written to `scratch.o[..vd]`. The output uses the *updated* state, as
+    /// in HF's `chunk_gated_delta_rule` / `recurrent_update`.
+    fn deltanet_step(
+        state: &mut [f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        g: f32,
+        beta: f32,
+        scratch: &mut DeltaNetScratch,
+    ) {
+        let (kd, vd) = (scratch.kd, scratch.vd);
+        let DeltaNetScratch {
+            qh,
+            kh,
+            mem,
+            delta,
+            o,
+            ..
+        } = scratch;
+        // L2-normalize q and k (HF's +1e-6 epsilon); scale q by 1/sqrt(kd).
+        let qn = (q.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt();
+        let kn = (k.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt();
+        for d in 0..kd {
+            qh[d] = q[d] / qn / (kd as f32).sqrt();
+            kh[d] = k[d] / kn;
+        }
+        // Decay the state by exp(g).
+        let decay = g.exp();
+        for s in state.iter_mut() {
+            *s *= decay;
+        }
+        // mem[j] = sum_i S[i,j] * k[i].
+        mem.fill(0.0);
+        for (i, &kv) in kh.iter().enumerate() {
+            if kv == 0.0 {
+                continue;
+            }
+            let soff = i * vd;
+            for j in 0..vd {
+                mem[j] += state[soff + j] * kv;
+            }
+        }
+        // delta[j] = (v[j] - mem[j]) * beta, then S += k (x) delta.
+        for j in 0..vd {
+            delta[j] = (v[j] - mem[j]) * beta;
+        }
+        for (i, &kv) in kh.iter().enumerate() {
+            if kv == 0.0 {
+                continue;
+            }
+            let soff = i * vd;
+            for j in 0..vd {
+                state[soff + j] += kv * delta[j];
+            }
+        }
+        // o[j] = sum_i S[i,j] * q[i] (updated state).
+        o.fill(0.0);
+        for (i, &qv) in qh.iter().enumerate() {
+            if qv == 0.0 {
+                continue;
+            }
+            let soff = i * vd;
+            for j in 0..vd {
+                o[j] += state[soff + j] * qv;
+            }
+        }
+    }
+
     /// Linear layer: prefer a plain f32 matrix (fast) when available, then the
     /// packed quantized weight. For tied-embedding models `lm_head` shares the
     /// embedding matrix, so preferring the plain matrix avoids decoding the
@@ -421,13 +566,7 @@ impl Model {
         }
 
         // q_proj output is interleaved per head: head h has [query(hd), gate(hd)].
-        let mut q = vec![0.0f32; nh * hd];
-        let mut gate = vec![0.0f32; nh * hd];
-        for h in 0..nh {
-            let base = h * 2 * hd;
-            q[h * hd..(h + 1) * hd].copy_from_slice(&qp[base..base + hd]);
-            gate[h * hd..(h + 1) * hd].copy_from_slice(&qp[base + hd..base + 2 * hd]);
-        }
+        let (mut q, gate) = Self::split_q_gate(&qp, nh, hd);
 
         // Per-head RMSNorm (zero-centered) on q and k.
         let qn_w = self.vec(&format!("layers.{}.self_attn.q_norm.weight", layer))?;
@@ -462,44 +601,16 @@ impl Model {
             st.v[pos * kv..(pos + 1) * kv].copy_from_slice(&vp[..kv]);
         }
 
-        // Attention over cached keys/values.
-        let scale = 1.0 / (hd as f32).sqrt();
-        let mut attn = vec![0.0f32; nh * hd];
-        let groups = nh / nkv;
+        // Causal attention over cached keys/values, then sigmoid(gate).
         let tlen = pos.min(self.context_size - 1) + 1;
-        let mut scores = vec![0.0f32; tlen];
-        for h in 0..nh {
-            let kv_head = h / groups;
-            let qoff = h * hd;
-            for (t, score) in scores.iter_mut().enumerate() {
-                let koff = t * kv + kv_head * hd;
-                let st = &self.full_states[state_idx];
-                *score = dot(&q[qoff..qoff + hd], &st.k[koff..koff + hd]) * scale;
-            }
-            let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for s in &mut scores {
-                *s = (*s - max).exp();
-                sum += *s;
-            }
-            for s in &mut scores {
-                *s /= sum;
-            }
-            attn[qoff..qoff + hd].fill(0.0);
-            for (t, &a) in scores.iter().enumerate() {
-                let voff = t * kv + kv_head * hd;
-                let st = &self.full_states[state_idx];
-                for d in 0..hd {
-                    attn[qoff + d] += a * st.v[voff + d];
-                }
-            }
-        }
-
-        // Gating with sigmoid(gate).
-        for i in 0..nh * hd {
-            let g = gate[i];
-            attn[i] *= 1.0 / (1.0 + (-g).exp());
-        }
+        let st = &self.full_states[state_idx];
+        let attn = Self::gqa_attention(
+            &q,
+            &gate,
+            &st.k[..tlen * kv],
+            &st.v[..tlen * kv],
+            AttnShape { nh, nkv, hd, tlen },
+        );
 
         // Output projection.
         let y = self.linear(&attn, &format!("layers.{}.self_attn.o_proj", layer))?;
@@ -604,74 +715,35 @@ impl Model {
             beta[h] = 1.0 / (1.0 + (-bb).exp());
         }
 
-        // Recurrent state update (fp32), per value head. Scratch vectors are
-        // allocated once per layer and overwritten for each head.
+        // Recurrent state update (fp32), per value head. Scratch buffers are
+        // allocated once per layer and reused for every head/token.
         let st = &mut self.linear_states[state_idx];
-        let mut qh = vec![0.0f32; kd];
-        let mut kh_vec = vec![0.0f32; kd];
-        let mut mem = vec![0.0f32; vd];
-        let mut delta = vec![0.0f32; vd];
+        let mut scratch = DeltaNetScratch {
+            kd,
+            vd,
+            qh: vec![0.0f32; kd],
+            kh: vec![0.0f32; kd],
+            mem: vec![0.0f32; vd],
+            delta: vec![0.0f32; vd],
+            o: vec![0.0f32; vd],
+        };
         let mut o = vec![0.0f32; val_dim];
         for vh in 0..nvh {
-            let kh = vh / rep;
+            let kh = vh / rep; // key heads are repeated to match value heads
             let qbase = kh * kd;
             let kbase = kh * kd;
             let vbase = vh * vd;
             let sbase = vh * kd * vd;
-
-            // L2-normalize q and k; scale q by 1/sqrt(kd).
-            let qn = (q[qbase..qbase + kd].iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt();
-            let kn = (k[kbase..kbase + kd].iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt();
-            for d in 0..kd {
-                qh[d] = q[qbase + d] / qn / (kd as f32).sqrt();
-                kh_vec[d] = k[kbase + d] / kn;
-            }
-
-            // Decay state.
-            let decay = g[vh].exp();
-            for i in 0..kd * vd {
-                st.state[sbase + i] *= decay;
-            }
-
-            // kv_mem[j] = sum_i S[i,j] * k[i].
-            mem.fill(0.0);
-            for (i, &kv) in kh_vec.iter().enumerate() {
-                if kv == 0.0 {
-                    continue;
-                }
-                let soff = sbase + i * vd;
-                for j in 0..vd {
-                    mem[j] += st.state[soff + j] * kv;
-                }
-            }
-
-            // delta[j] = (v[j] - mem[j]) * beta.
-            let bta = beta[vh];
-            for j in 0..vd {
-                delta[j] = (v[vbase + j] - mem[j]) * bta;
-            }
-
-            // S += k (x) delta.
-            for (i, &kv) in kh_vec.iter().enumerate() {
-                if kv == 0.0 {
-                    continue;
-                }
-                let soff = sbase + i * vd;
-                for j in 0..vd {
-                    st.state[soff + j] += kv * delta[j];
-                }
-            }
-
-            // o[j] = sum_i S[i,j] * q[i].
-            for (i, &qv) in qh.iter().enumerate() {
-                if qv == 0.0 {
-                    continue;
-                }
-                let soff = sbase + i * vd;
-                for j in 0..vd {
-                    o[vbase + j] += st.state[soff + j] * qv;
-                }
-            }
+            Self::deltanet_step(
+                &mut st.state[sbase..sbase + kd * vd],
+                &q[qbase..qbase + kd],
+                &k[kbase..kbase + kd],
+                &v[vbase..vbase + vd],
+                g[vh],
+                beta[vh],
+                &mut scratch,
+            );
+            o[vbase..vbase + vd].copy_from_slice(&scratch.o[..vd]);
         }
 
         // Gated RMSNorm: norm(o) * norm.weight * silu(z).
@@ -923,5 +995,164 @@ mod tests {
         // A wrong prefix must fail loudly rather than mis-tokenize.
         m.prefix = "model.".into();
         assert!(m.embedding_row(0).is_err());
+    }
+
+    #[test]
+    fn rms_norm_matches_hand_computation() {
+        // x = [3, 4] -> mean(x^2) = 12.5, scale = 1/sqrt(12.5).
+        let scale = 1.0 / 12.5f32.sqrt();
+        let out = Model::rms_norm(&[3.0, 4.0], &[1.0, 0.0], 0.0);
+        assert!((out[0] - 3.0 * scale * 2.0).abs() < 1e-6); // (1 + w[0]) = 2
+        assert!((out[1] - 4.0 * scale).abs() < 1e-6); // (1 + w[1]) = 1
+
+        // Missing weight entries default to 0, i.e. multiplier 1.
+        let bare = Model::rms_norm(&[3.0, 4.0], &[], 0.0);
+        assert!((bare[0] - 3.0 * scale).abs() < 1e-6);
+        assert!((bare[1] - 4.0 * scale).abs() < 1e-6);
+
+        // eps keeps all-zero input finite.
+        assert_eq!(
+            Model::rms_norm(&[0.0, 0.0], &[0.0, 0.0], 1e-6),
+            vec![0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn rms_norm_gated_normalizes_per_head() {
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        let x = [3.0f32, 4.0, 0.0, 8.0];
+        let gate = [0.0f32, 1.0, 2.0, -1.0];
+        let w = [1.0f32, 0.5]; // weight is group-sized, reused per head
+        let out = Model::rms_norm_gated(&x, &gate, &w, 0.0, 2);
+
+        // Head 0: x=[3,4], mean(x^2)=12.5; head 1: x=[0,8], mean=32.
+        let s0 = 1.0 / 12.5f32.sqrt();
+        let s1 = 1.0 / 32.0f32.sqrt();
+        assert!((out[0] - 3.0 * s0 * 1.0 * silu(0.0)).abs() < 1e-6);
+        assert!((out[1] - 4.0 * s0 * 0.5 * silu(1.0)).abs() < 1e-6);
+        assert!(out[2].abs() < 1e-6);
+        assert!((out[3] - 8.0 * s1 * 0.5 * silu(-1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rope_is_partial_and_position_indexed() {
+        let m = Model::tiny(); // head_dim=4, partial_rotary_factor=0.5 -> 2 rotary dims
+        assert_eq!(m.rope_half, 1);
+        assert!((m.rope_cos[0] - 1.0).abs() < 1e-6);
+        assert!(m.rope_sin[0].abs() < 1e-6);
+        assert!((m.rope_cos[1] - 1.0f32.cos()).abs() < 1e-6);
+        assert!((m.rope_sin[1] - 1.0f32.sin()).abs() < 1e-6);
+
+        // Position 0 is the identity rotation.
+        let mut x = [1.0f32, 2.0, 3.0, 4.0];
+        m.apply_rope(&mut x, 4, 1, 0);
+        assert_eq!(x, [1.0, 2.0, 3.0, 4.0]);
+
+        // Position 1 rotates only the first 2 dims (rotate-half layout).
+        m.apply_rope(&mut x, 4, 1, 1);
+        let (c, s) = (m.rope_cos[1], m.rope_sin[1]);
+        assert!((x[0] - (1.0 * c - 2.0 * s)).abs() < 1e-6);
+        assert!((x[1] - (2.0 * c + 1.0 * s)).abs() < 1e-6);
+        assert_eq!(x[2], 3.0); // dims past the rotary width are untouched
+        assert_eq!(x[3], 4.0);
+    }
+
+    #[test]
+    fn q_proj_interleaving_matches_per_head_query_gate() {
+        let qp: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+        let (q, gate) = Model::split_q_gate(&qp, 2, 2);
+        assert_eq!(q, vec![1.0, 2.0, 5.0, 6.0]);
+        assert_eq!(gate, vec![3.0, 4.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn gqa_attention_groups_heads_and_applies_gate() {
+        let (nh, nkv, hd, tlen) = (4usize, 2usize, 2usize, 2usize);
+        let mut q = vec![0.0f32; nh * hd];
+        let mut gate = vec![0.0f32; nh * hd];
+        for h in 0..nh {
+            for d in 0..hd {
+                q[h * hd + d] = 0.5 * h as f32 + d as f32;
+                gate[h * hd + d] = if h % 2 == 0 { 1.0 } else { -1.0 };
+            }
+        }
+        let mut k = vec![0.0f32; tlen * nkv * hd];
+        let mut v = vec![0.0f32; tlen * nkv * hd];
+        for t in 0..tlen {
+            for h in 0..nkv {
+                for d in 0..hd {
+                    let i = (t * nkv + h) * hd + d;
+                    k[i] = 1.0 + 10.0 * t as f32 + 4.0 * h as f32 + d as f32;
+                    v[i] = 2.0 + 100.0 * t as f32 + 20.0 * h as f32 + d as f32;
+                }
+            }
+        }
+
+        let got = Model::gqa_attention(&q, &gate, &k, &v, AttnShape { nh, nkv, hd, tlen });
+        for h in 0..nh {
+            let kv_head = h / (nh / nkv); // heads 0,1 -> kv 0; heads 2,3 -> kv 1
+            let mut scores = [0.0f32; 2];
+            for (t, score) in scores.iter_mut().enumerate() {
+                let koff = (t * nkv + kv_head) * hd;
+                *score = (q[h * hd] * k[koff] + q[h * hd + 1] * k[koff + 1]) / (hd as f32).sqrt();
+            }
+            let max = scores[0].max(scores[1]);
+            let e = [(scores[0] - max).exp(), (scores[1] - max).exp()];
+            let a = [e[0] / (e[0] + e[1]), e[1] / (e[0] + e[1])];
+            for d in 0..hd {
+                let v0 = v[kv_head * hd + d];
+                let v1 = v[(nkv + kv_head) * hd + d];
+                let mut expect = a[0] * v0 + a[1] * v1;
+                let g = gate[h * hd + d];
+                expect *= 1.0 / (1.0 + (-g).exp());
+                assert!(
+                    (got[h * hd + d] - expect).abs() < 1e-5,
+                    "head {} dim {}: got {} expected {}",
+                    h,
+                    d,
+                    got[h * hd + d],
+                    expect
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deltanet_step_uses_updated_state_and_decay() {
+        let (kd, vd) = (2usize, 2usize);
+        let mut state = vec![0.0f32; kd * vd];
+        let mut scratch = DeltaNetScratch {
+            kd,
+            vd,
+            qh: vec![0.0; kd],
+            kh: vec![0.0; kd],
+            mem: vec![0.0; vd],
+            delta: vec![0.0; vd],
+            o: vec![0.0; vd],
+        };
+        let q = [1.0f32, 0.0];
+        let k = [1.0f32, 0.0];
+        let v = [2.0f32, 3.0];
+        let qscale = 1.0 / 2.0f32.sqrt(); // 1/sqrt(kd) with q = [1, 0]
+
+        // Step 1 from a zero state: S += k (x) ((v - 0) * 0.5), then o = S @ q.
+        Model::deltanet_step(&mut state, &q, &k, &v, 0.0, 0.5, &mut scratch);
+        assert!((state[0] - 1.0).abs() < 1e-4);
+        assert!((state[1] - 1.5).abs() < 1e-4);
+        assert!(state[2].abs() < 1e-6 && state[3].abs() < 1e-6);
+        assert!((scratch.o[0] - qscale).abs() < 1e-4);
+        assert!((scratch.o[1] - 1.5 * qscale).abs() < 1e-4);
+
+        // Step 2: mem = [1, 1.5], delta = [(2-1)*0.5, (3-1.5)*0.5].
+        Model::deltanet_step(&mut state, &q, &k, &v, 0.0, 0.5, &mut scratch);
+        assert!((state[0] - 1.5).abs() < 1e-4);
+        assert!((state[1] - 2.25).abs() < 1e-4);
+        assert!((scratch.o[0] - 1.5 * qscale).abs() < 1e-4);
+        assert!((scratch.o[1] - 2.25 * qscale).abs() < 1e-4);
+
+        // Decay: exp(g) = 0.5 halves the state before the (beta = 0) update.
+        Model::deltanet_step(&mut state, &q, &k, &v, 0.5f32.ln(), 0.0, &mut scratch);
+        assert!((state[0] - 0.75).abs() < 1e-4);
+        assert!((state[1] - 1.125).abs() < 1e-4);
     }
 }

@@ -23,7 +23,7 @@ This document is a complete orienteering guide for AI agents (or humans) continu
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build                      # debug
 cargo build --release            # optimized binary at target/release/exllama-server
-cargo test                       # 82 unit tests (4 ignored)
+cargo test                       # 88 unit tests (10 ignored: real-model / /tmp fixtures + benchmarks)
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings   # must pass (CI enforces)
 ```
@@ -145,7 +145,7 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 - `Params` includes `enable_thinking`, penalties, `logit_bias`, stop token ids and `include_usage`. `parse_params()` validates all fields and returns 400 on bad input.
 - `OutputRouter` owns UTF-8 assembly, stream toggling and stop-string tail buffering; `on_token` returns false to abort generation when the client disconnects. RoPE tables and DeltaNet head scratch are precomputed/reused for throughput.
 
-### `src/exl3.rs` — EXL3 safetensors reader + dequantizer (1556 lines, most research-heavy)
+### `src/exl3.rs` — EXL3 safetensors reader + dequantizer (2138 lines, most research-heavy)
 See §5 for the full format. Key items:
 - `half_to_f32`, `f32_to_half`, `half_add`, `half_fma` — hand-written fp16 emulation (round-to-nearest-even).
 - `decode_3inst`, `decode_mcg`, `decode_mul1` — the three codebooks (16-bit index → fp16).
@@ -159,13 +159,13 @@ See §5 for the full format. Key items:
   - `packed`: `matmul(x)` decodes one 16×16 tile at a time into a small scratch (1× on-disk RAM but ~10+ s/token — too slow for interactive use on CPU). O(1) `window()` (64-bit funnel shift), `DECODE_*` LUTs (65536 f32 entries per codebook, avoids log2/powi per codeword), `TILE_PERM` table, and stack buffers keep it from being worse.
   - `f16`: `build_decode_cache()` decodes W_hat once into fp16 (2 bytes/weight, lossless) stored as `(n,k)`; `matmul` uses `half_f32` LUT for a fast dot.
   - `f32` (default): `build_decode_cache_f32()` decodes W_hat once into f32 `(n,k)`; `matmul` is a direct f32 dot. ~0.02 s for a 1024×6144 layer.
-  - All modes use the derivation `y[j] = svh[j] * (H_n @ (W_hat^T @ (H_k @ (x ⊙ suh))))[j]` and split output rows across the persistent worker pool (`SharedPtr` newtype / `SendSlice`, ≥65536-element threshold). Verified equivalent by `quantized_matmul_matches_f32_dequant`.
+  - All modes use the derivation `y[j] = svh[j] * (H_n @ (W_hat^T @ (H_k @ (x ⊙ suh))))[j]` and split output rows across the persistent worker pool (`SharedPtr` newtype / `SendSlice`, ≥65536-element threshold). Verified equivalent to full dequant by the fresh-clone-safe `synthetic_tests::matmul_matches_dequant_*` tests (3INST, MCG, MUL1 integer + half-bitrate). The real-model `quantized_matmul_matches_f32_dequant` is `#[ignore]`d because it needs `/tmp/unstable_*.bin`.
   - `linear()` in model.rs prefers a plain `Matrix` over `QuantLinear` — for tied-embedding models the lm_head uses the plain embedding matrix, skipping the largest decode.
 - `Exl3Model::load(path, weight_mode)` — loads config.json + all shards, detects prefix, keeps quantized linears in `linears` (skipping vision) with optional f32/f16 decode cache per `weight_mode`, loads plain tensors as flat vectors, builds plain 2-D matrices (embeddings etc.) in `weights`.
 - `Exl3Model { config, prefix: String, weights: HashMap<String, Matrix>, embeddings_f16: HashMap<String, F16Matrix>, linears: HashMap<String, QuantLinear>, vectors: HashMap<String, Vec<f32>> }`. `prefix` is detected from shard tensor names (`model.` or `model.language_model.`) and reused by `Model::load`. Untied embeddings are read straight from the F16 shard into `embeddings_f16`; tied ones stay in `weights` for `lm_head`.
 - `read_signs()` — reads suh/svh (F16) with legacy packed su/sv fallback.
 
-### `src/model.rs` — Qwen3.5 decoder forward (846 lines)
+### `src/model.rs` — Qwen3.5 decoder forward (1158 lines)
 See §6 for the full math. Key items:
 - `ModelConfig` — extracted from `config.json` (handles nested `text_config`).
 - `Model { config, prefix, weights, linears, vectors, threads, context_size, position, full_states, linear_states }`.
@@ -173,6 +173,7 @@ See §6 for the full math. Key items:
 - `linear(x, name)` — the universal linear: prefers a packed `QuantLinear` (dequantize-on-matmul), falls back to a plain `Matrix` via `matmul_t`. All projections (q/k/v/o, in_proj_*, out_proj, MLP gate/up/down, lm_head) go through it; only the embedding stays a direct row lookup on a `Matrix`.
 - `FullAttnState { k, v }` — KV cache `(max_ctx, num_kv_heads, head_dim)`.
 - `LinearAttnState { conv, conv_pos, state }` — conv circular buffer + recurrent state.
+- Testable math helpers (extracted from the forward paths without changing the math): `split_q_gate()` (per-head `[query|gate]` interleaving), `gqa_attention()` (`AttnShape` carries nh/nkv/hd/tlen; GQA gather + scale + softmax + sigmoid gate), and `deltanet_step()` (one value-head recurrence; `DeltaNetScratch` carries kd/vd and reusable buffers). Each has a hand-computed golden test in `model::tests`.
 - `rms_norm()` — zero-centered: `x * rsqrt(mean(x²)+eps) * (1+w)`.
 - `rms_norm_gated()` — `norm(x) * w * silu(gate)`, applied **per value head** (groups of `linear_value_head_dim`); normalizing over the whole concatenated vector was a bug that broke linear attention.
 - `forward_full_attn()`, `forward_linear_attn()`, `forward_token()`, `forward(&[u32])`.
@@ -348,7 +349,7 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 - **Prefix must come from the shards (fixed in v0.4.2):** `Exl3Model::load` detects `model.` vs `model.language_model.` from the shard tensor names and now stores it as `Exl3Model.prefix`; `Model::load` uses it verbatim. Re-detecting it from `weights` broke untied multimodal checkpoints because their embedding lives in `embeddings_f16`, causing "missing embedding tensor `embed_tokens.weight`" on the first request. Never re-derive the prefix from loaded tensors.
 - **EXL3 tensor naming / dtypes (fixed):** quantized linears in the UnstableLlama repos use base names **without** `.weight` (e.g. `lm_head.trellis` → matrix key `lm_head`, `...mlp.gate_proj.trellis` → key `...gate_proj`). `Model::w()` now resolves both with and without `.weight`, with an `lm_head` alias and tied-embedding fallback to `embed_tokens.weight`. Many tensors (norms, conv1d, dt_bias) are **BF16**, which `read_f32()` now converts (top 16 bits of f32). Non-quantized 2-D linears (`in_proj_a`/`in_proj_b`, shape `[16, hidden]`) are now loaded as `Matrix` entries — previously only embed/lm_head were, leaving `a`/`b` empty (g=beta=0) and breaking the Gated DeltaNet recurrence. The conv circular buffer holds `kernel-1` history slots (not `kernel`). Without these fixes generation degenerated into token loops.
 - **README claims CI covers fmt/clippy** — keep those checks passing (`cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`).
-- **Reference files:** `/tmp/qwen35/tokenizer.json` is used by tokenizer tests; `/tmp/exl3src/` has exllamav3 source; `/tmp/trellis_ref.py` is the trellis reference. These are test-time-only and may not exist in a fresh clone (tests skip gracefully if tokenizer file absent).
+- **Reference files:** `/tmp/qwen35/tokenizer.json` and `/tmp/unstable_tok.json` are used by real-tokenizer tests; `/tmp/unstable_prefix.bin` + `/tmp/unstable_layer0.bin` by real-dequant tests; `/tmp/exl3src/` has exllamav3 source; `/tmp/trellis_ref.py` is the trellis reference. These are test-time-only and may not exist in a fresh clone. All `/tmp`-dependent tests are explicitly `#[ignore]`d with a reason; run them with `cargo test -- --ignored` when the fixtures exist. The committed synthetic EXL3 fixtures and decoder golden tests always run.
 
 ---
 
@@ -363,10 +364,16 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 | `exl3::tests::codebook_decode_matches_reference` | All 3 codebooks vs numpy reference |
 | `exl3::tests::half_roundtrip` | fp16 conversion correctness |
 | `exl3::tests::tile_perm_matches_reference` | Tile permutation vs reference |
+| `exl3::synthetic_tests::matmul_matches_dequant_*` | Fresh-clone-safe equivalence of all three `--weight-mode` paths vs full dequant, for 3INST / MCG / MUL1 (integer + half-bitrate); no `/tmp` fixtures |
+| `exl3::real_model_tests` | Real layer-0 dequant + matmul checks; `#[ignore]`d (require `/tmp/unstable_*.bin`) |
+| `model::tests` | Golden tests for RMSNorm, per-head RMSNormGated, partial RoPE, q_proj interleaving, GQA grouping/gate, DeltaNet recurrence, plus fp16 embedding resolution |
 | `server::tests` | Sampling equivalence, logprobs vs log-softmax, parameter validation, `n` choices, SSE framing/usage/logprob deltas, HTTP responses |
 | `fuzz::tests` | Seeded random inputs against JSON/HTTP/regex/chat/tokenizer/API parsers (no panics) |
 
-Run `cargo test` — 82 pass, 4 ignored on the current state.
+Run `cargo test` — 88 pass, 10 ignored on the current state. The ignored set
+is 6 real-model / `/tmp`-fixture tests (now explicitly marked with reasons) plus
+4 benchmarks. On a fresh clone the dequantization/matmul guarantee is still
+verified by the committed synthetic fixtures.
 
 ---
 

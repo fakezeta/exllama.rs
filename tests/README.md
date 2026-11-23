@@ -6,6 +6,14 @@ directory. They are not part of `cargo test` (which runs the Rust unit tests).
 The `golden/` directory holds committed chat-prompt fixtures asserted by
 `chat::tests::prompts_match_committed_golden_files` (no downloaded files needed).
 
+`cargo test` itself is fully self-contained: the dequantization/matmul
+equivalence guarantee is covered by `exl3::synthetic_tests` (in-memory EXL3
+fixture, all codebooks and weight modes) and the decoder math by hand-computed
+tests in `model::tests`. Tests that require real-model `/tmp` files (e.g.
+`/tmp/qwen35/tokenizer.json`, `/tmp/unstable_layer0.bin`) are marked `#[ignore]`
+with a reason; run them explicitly with `cargo test -- --ignored` when the
+fixtures are present.
+
 ## Prerequisites
 
 - `exllama-server` is built and running (see the root [README.md](../README.md)).

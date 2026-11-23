@@ -372,6 +372,7 @@ mod tests {
 mod prompt_debug {
     use super::*;
     #[test]
+    #[ignore = "requires /tmp/unstable_tok.json (manual prompt dump); see tests/README.md"]
     fn print_chat_prompt_tokens() {
         let t = match crate::tokenizer::Tokenizer::load("/tmp/unstable_tok.json") {
             Ok(t) => t,
