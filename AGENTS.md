@@ -23,7 +23,7 @@ This document is a complete orienteering guide for AI agents (or humans) continu
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build                      # debug
 cargo build --release            # optimized binary at target/release/exllama-server
-cargo test                       # 102 unit tests (11 ignored: real-model / /tmp fixtures + benchmarks)
+cargo test                       # 107 unit tests (11 ignored: real-model / /tmp fixtures + benchmarks)
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings   # must pass (CI enforces)
 ```
@@ -55,7 +55,7 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 ## 3. Module Map
 
 ### `src/main.rs` — CLI + routing
-- `Cli` struct + `parse_cli()` — hand-rolled arg parser (`-m/--model`, `-c/--context-size`, `-p/--port`, `--host`, `--tokenizer`, `--max-tokens`, `--threads`, `--name`, `--weight-mode`, `--compute`). A single iterator owns argument advancement (no manual index increments); `--context-size` is clamped to `1..=1_000_000` and `--threads` to `1..=1024`.
+- `Cli` struct + `parse_cli()` — hand-rolled arg parser (`-m/--model`, `-c/--context-size`, `-p/--port`, `--host`, `--tokenizer`, `--max-tokens`, `--threads`, `--name`, `--weight-mode`, `--compute`, `--instances`). A single iterator owns argument advancement (no manual index increments); `--context-size` is clamped to `1..=1_000_000`, `--threads` to `1..=1024`, and `--instances` to `1..=64`.
 - `main()` — loads `Model`, `Tokenizer`, builds `Engine`, wraps in `Arc`, binds `TcpListener`, calls `http::serve`.
 - `route()` — dispatches HTTP requests (see table above).
 - `models_json()` — builds `/v1/models` response.
@@ -77,7 +77,7 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 
 ### `src/tensor.rs` — Matrices + matmul
 - `Matrix { rows, cols, data: Vec<f32> }` — row-major. **Weights are stored `(out_features, in_features)`**; a linear computes `y = x @ W^T` via `matmul_t`.
-- `F16Matrix { rows, cols, data: Vec<u16> }` — fp16 embedding storage; `row_f32(row)` decodes one row on lookup (used for untied models).
+- `F16Matrix { rows, cols, data: Vec<u16> }` — fp16 embedding storage for **all** plain embeddings (tied and untied); `row_f32(row)` decodes one row on lookup, and `exl3::matmul_f16` decodes rows in parallel for a tied `lm_head`.
 - `matmul_t(x, x_rows, x_cols, w, y, nthreads)` — splits work over the persistent pool (over rows if many input rows, over output neurons otherwise).
 - `dot(a, b)` asserts equal lengths in every build (previously `min(a.len(), b.len())` silently hid shape bugs); `exl3::dot_f16` does the same.
 - **Rust 1.100 quirk:** `NonNull<f32>` and `*mut f32` are NOT `Send`. Workaround: `SharedPtr(*mut f32)` newtype with `unsafe impl Send`, `#[derive(Clone, Copy)]`, and a safe `write_at(offset, value)` method. Closures capture `SharedPtr` **by value** (Copy). Do not revert to raw pointers. Immutable inputs cross threads via `threadpool::SendSlice<T>`.
@@ -133,10 +133,10 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 - `enable_thinking` default is model-size-aware: `hidden_size >= 2560` → true (9B/4B), otherwise false (0.8B/2B); an explicit config value wins. `Params` seeds its default from `Engine.default_enable_thinking`.
 
 ### `src/server.rs` — Inference engine + API handlers
-- `Engine { model: Mutex<Model>, tokenizer, model_name, default_max_tokens, threads, default_enable_thinking }`.
+- `Engine { models: Vec<Mutex<Model>>, available, ready, tokenizer, model_name, default_max_tokens, threads, default_enable_thinking }`.
 - `GenResult { text, reasoning_content, prompt_tokens, completion_tokens, finish_reason, logprobs }`.
 - `PrefillState` + `prepare_prefill()` / `prepare_chat_prefill()` / `prepare_completion_prefill()` — one prompt forward pass captured as a `Model::snapshot()` plus final logits; `generate_inner` takes `Option<&PrefillState>` and restores it for each choice. Both endpoints prepare once when `n > 1`.
-- Bounded admission: `Engine::try_admit()` reserves one of `MAX_QUEUED_REQUESTS = 16` slots (RAII `AdmissionGuard`); excess requests get a 429 instead of piling up behind the model mutex. Full multi-request batching remains deferred (see §8).
+- Bounded admission: `Engine::try_admit()` reserves one of `MAX_QUEUED_REQUESTS = 16` slots (RAII `AdmissionGuard`); excess requests get a 429 instead of piling up. `Engine` owns `models: Vec<Mutex<Model>>` with an available-slot `Vec` + `Condvar`; `ModelLease` hands out one instance for the whole request. `--instances N` (default 1) creates N instances sharing the Arc model core; extra instances cost state, not weights.
 - `Params` (Clone) adds `n`, `user`, `response_format`, `logprobs`, `top_logprobs` and an internal `deadline: Option<Instant>` override (never set by the API; used by tests). `parse_params_inner(body, engine, chat)` handles the different chat/completions shapes (`logprobs` bool vs integer). `ResponseFormat::JsonObject` adds a best-effort prompt hint (`apply_response_format_chat/text`); no constrained decoding.
 - `generate_inner()` is the core loop; `generate()` wraps it with a no-op logprob callback. `run_chat_inner()` / `run_completion_inner()` likewise wrap `run_chat()` / `run_completion()` and thread an `on_logprob` callback through for SSE deltas. `prepare_logits()` (penalties/bias) is shared by `sample()` and `logprob_info()` so reported probabilities match the sampled distribution; `choice_seeds()` derives one RNG stream per choice for `n > 1`.
 - `generate()` — core loop:
@@ -152,13 +152,13 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 - `Params` includes `enable_thinking`, penalties, `logit_bias`, stop token ids and `include_usage`. `parse_params()` validates all fields and returns 400 on bad input.
 - `OutputRouter` owns UTF-8 assembly, stream toggling and stop-string tail buffering; `on_token` returns false to abort generation when the client disconnects. RoPE tables and DeltaNet head scratch are precomputed/reused for throughput.
 
-### `src/exl3.rs` — EXL3 safetensors reader + dequantizer (2138 lines, most research-heavy)
+### `src/exl3.rs` — EXL3 safetensors reader + dequantizer (2214 lines, most research-heavy)
 See §5 for the full format. Key items:
 - `half_to_f32`, `f32_to_half`, `half_add`, `half_fma` — hand-written fp16 emulation (round-to-nearest-even).
 - `decode_3inst`, `decode_mcg`, `decode_mul1` — the three codebooks (16-bit index → fp16).
 - `window()` — extracts a 16-bit codeword from the packed MSB-first bitstream with wraparound.
 - `tile_perm()` — maps ring position → row-major 16×16 tile offset.
-- `unpack_tile_bits()` — unpacks one tile into 256 raw fp16 codebook bits; `unpack_tile()` converts those to f32 via the `half_f32` LUT. The f16 cache stores the bits directly (no f32→f16 round-trip).
+- `unpack_tile_bits()` — unpacks one tile into 256 raw fp16 codebook bits; `unpack_tile()` converts those to f32 via the `half_f32` LUT; `unpack_tile_f32()` is the fast hot-path variant that looks up the codebook's precomputed f32 table directly (bit-identical result, no per-codeword arithmetic). The f16 cache stores bits directly. `matmul_f16()` is the threaded lm_head matmul over an fp16 embedding table.
 - `hadamard128()`, `hadamard_rows()`, `hadamard_cols()` — normalized Sylvester H128 butterflies. `hadamard_rows` uses a stack buffer per 128-column slice (cache-friendly) instead of strided butterflies.
 - `read_safetensors()`, `load_all_shards()` — safetensors header parsing, sharding via index JSON or glob. Header arithmetic is checked and malformed metadata (dtype/shape/data_offsets) is rejected; `validate_tile_width()` bounds trellis widths before unpacking. `Shards::compact_to()` drops trellis byte ranges after the linear pass.
 - `dequant_linear()` — reference full dequant pipeline for one quantized linear: unpack tiles → H_k → ×suh → H_n → ×svh → transpose to `(n, k)` → `Matrix`. **Used only by tests** as ground truth.
@@ -167,17 +167,17 @@ See §5 for the full format. Key items:
   - `f16`: `build_decode_cache()` decodes W_hat once into fp16 (2 bytes/weight, lossless) stored as `(n,k)`; `matmul` uses `half_f32` LUT for a fast dot.
   - `f32` (default): `build_decode_cache_f32()` decodes W_hat once into f32 `(n,k)`; `matmul` is a direct f32 dot. ~0.02 s for a 1024×6144 layer.
   - All modes use the derivation `y[j] = svh[j] * (H_n @ (W_hat^T @ (H_k @ (x ⊙ suh))))[j]` and split output rows across the persistent worker pool (`SharedPtr` newtype / `SendSlice`, ≥65536-element threshold). Verified equivalent to full dequant by the fresh-clone-safe `synthetic_tests::matmul_matches_dequant_*` tests (3INST, MCG, MUL1 integer + half-bitrate). The real-model `quantized_matmul_matches_f32_dequant` is `#[ignore]`d because it needs `/tmp/unstable_*.bin`.
-  - `linear()` in model.rs prefers a plain `Matrix` over `QuantLinear` — for tied-embedding models the lm_head uses the plain embedding matrix, skipping the largest decode.
+  - `linear()` in model.rs prefers a plain `Matrix`, then `QuantLinear`, then (for tied `lm_head`) the fp16 embedding table via `matmul_f16`, skipping the largest decode and avoiding an f32 copy.
 - `Exl3Model::load(path, weight_mode)` — loads config.json + all shards, detects prefix, keeps quantized linears in `linears` (skipping vision) with optional f32/f16 decode cache per `weight_mode`, loads plain tensors as flat vectors, builds plain 2-D matrices (embeddings etc.) in `weights`.
-- `Exl3Model { config, prefix: String, weights: HashMap<String, Matrix>, embeddings_f16: HashMap<String, F16Matrix>, linears: HashMap<String, QuantLinear>, vectors: HashMap<String, Vec<f32>> }`. `prefix` is detected from shard tensor names (`model.` or `model.language_model.`) and reused by `Model::load`. Untied embeddings are read straight from the F16 shard into `embeddings_f16`; tied ones stay in `weights` for `lm_head`.
+- `Exl3Model { config, prefix: String, weights: HashMap<String, Matrix>, embeddings_f16: HashMap<String, F16Matrix>, linears: HashMap<String, QuantLinear>, vectors: HashMap<String, Vec<f32>> }`. `prefix` is detected from shard tensor names (`model.` or `model.language_model.`) and reused by `Model::load`. All plain embeddings are read straight from the F16 shard into `embeddings_f16`; tied checkpoints use the same table for `lm_head` via `matmul_f16` (no f32 vocab x hidden matrix).
 - `read_signs()` — reads suh/svh (F16) with legacy packed su/sv fallback.
 
-### `src/model.rs` — Qwen3.5 decoder forward (1224 lines)
+### `src/model.rs` — Qwen3.5 decoder forward (1356 lines)
 See §6 for the full math. Key items:
 - `ModelConfig` — extracted from `config.json` (handles nested `text_config`).
-- `Model { config, prefix, weights, linears, vectors, threads, context_size, position, full_states, linear_states }`.
+- `ModelCore` (Arc-shared: config, prefix, weights, linears, vectors, threads, context_size, rope tables, zeroed state templates) + `Model` (one instance: `core`, `position`, `full_states`, `linear_states`). `Model::spawn()` creates another instance sharing weights but with fresh state; this is what `--instances N` uses.
 - `w(name)` / `ql(name)` / `v(name)` — resolve unprefixed names by trying `{prefix}{name}`, `{prefix}{name}.weight`, bare `name`, `name.weight`; `ql` also aliases `lm_head` → the quantized head. `embedding_row(token)` looks up the fp16 table under `{prefix}embed_tokens.weight` first (or the f32 fallback), so untied multimodal checkpoints resolve correctly.
-- `linear(x, name)` — the universal linear: prefers a packed `QuantLinear` (dequantize-on-matmul), falls back to a plain `Matrix` via `matmul_t`. All projections (q/k/v/o, in_proj_*, out_proj, MLP gate/up/down, lm_head) go through it; only the embedding stays a direct row lookup on a `Matrix`.
+- `linear(x, name)` — universal linear: plain `Matrix` → `QuantLinear` → fp16 embedding (`matmul_f16`, tied `lm_head`). All projections (q/k/v/o, in_proj_*, out_proj, MLP gate/up/down, lm_head) go through it; only the embedding lookup bypasses it.
 - `FullAttnState { k, v }` — **fp16** KV cache `(max_ctx, num_kv_heads, head_dim)` stored as `Vec<u16>` bits (halves context RAM). Writes use `f32_to_half`; the used prefix is decoded through the `half_f32` LUT into f32 scratch before attention.
 - `ModelState` / `snapshot()` / `restore()` — a compact post-prefill snapshot (only the used KV prefix plus DeltaNet state) so `n > 1` choices share one prompt forward pass.
 - `LinearAttnState { conv, conv_pos, state }` — conv circular buffer + recurrent state.
@@ -344,9 +344,9 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 
 ## 8. Known Limitations & Gotchas
 
-- **Memory vs speed:** `--weight-mode` trades RAM for tokens/s. `f32` (default): quantized linears decoded to f32 at load (~4× on-disk, fast). `f16`: ~2× on-disk, near-f32 speed. `packed`: ~1× on-disk but ~10+ s/token on CPU — unusable interactively. On CPU, SIMD on `dot()` would not help the packed path; its bottleneck is codebook decode, not the MACs. Tied-embedding models skip the lm_head decode (plain embedding matrix used directly). Peak RAM during load includes raw shard bytes plus decoded caches (in `f32` mode, several times on-disk); the old "≈ 2× on-disk" claim was inaccurate. Plain 2-D tensors are decoded once (previously stored in both `vectors` and `weights`), trellis byte ranges are compacted away after the linear pass, and untied embedding tables are stored as fp16 with per-row decode. Tied models (0.8B) still keep the ~1 GB f32 embedding for `lm_head` (converting just the embedding to f16 needs a new threaded f16 lm_head matmul — deferred). The full-attention KV cache is now fp16 (2 bytes/value, LUT-decoded per step), halving context RAM; a SIMD-gather rewrite of the `packed` decode path is also deferred (bottleneck is codebook decode, not MACs).
+- **Memory vs speed:** `--weight-mode` trades RAM for tokens/s. `f32` (default): quantized linears decoded to f32 at load (~4× on-disk, fast). `f16`: ~2× on-disk, near-f32 speed. `packed`: ~1× on-disk but ~10+ s/token on CPU — unusable interactively. On CPU, SIMD on `dot()` would not help the packed path; its bottleneck is codebook decode, not the MACs. Tied-embedding models skip the lm_head decode (plain embedding matrix used directly). Peak RAM during load includes raw shard bytes plus decoded caches (in `f32` mode, several times on-disk); the old "≈ 2× on-disk" claim was inaccurate. Plain 2-D tensors are decoded once (previously stored in both `vectors` and `weights`), trellis byte ranges are compacted away after the linear pass, and untied embedding tables are stored as fp16 with per-row decode. Tied models no longer keep a ~1 GB f32 embedding: all plain embeddings are fp16 and tied `lm_head` uses the threaded `matmul_f16`. The full-attention KV cache is fp16 (2 bytes/value, LUT-decoded per step), halving context RAM. The packed decode hot path now uses `unpack_tile_f32()` (direct codebook f32 LUT) instead of per-codeword arithmetic + fp16 conversion; true SIMD gather remains unavailable on stable std-only Rust (no portable `simd` API), but the arithmetic bottleneck is gone.
 - **No GPU:** CPU only; large models are slow.
-- **Single-request generation:** `Engine.model` is a mutex; concurrent requests serialize. `n > 1` still decodes choices sequentially, but they now **share one prefill** via `PrefillState` (see §3), so cost grows sublinearly in the prompt pass. Bounded admission returns 429 when more than 16 requests queue. Full multi-request batching is deferred: it requires splitting shared weights from per-request state (or N full model copies), a large refactor with RAM scaling linearly in concurrent requests.
+- **Concurrency:** `n > 1` choices share one prefill via `PrefillState` (see §3). Independent requests can run in parallel with `--instances N` (default 1): N model instances share one Arc model core (weights/config) and only duplicate KV/recurrent state, so memory scales with instances' state rather than full weights. Bounded admission returns 429 past 16 queued requests. Matmuls are **not** batched across requests (that needs batch-aware attention/DeltaNet), and `threadpool::RUN_LOCK` still serializes matmul dispatch globally — instances overlap non-matmul work (tokenize, sampling, I/O, state handling) rather than two GEMVs at once.
 - **API fidelity limits:** `response_format: json_object` only adds a prompt hint — there is no grammar/constrained decoding or JSON validation. Streaming tool calls now produce indexed `tool_calls` deltas (name + argument fragments) with the XML withheld from content, but tool-call arguments are still assembled with the simple `<parameter=...>` parser, not full JSON streaming. Chat `top_logprobs` is capped at 20 (completions accept up to 20 as an extension; OpenAI allows 5). Logprobs exclude reasoning delimiters and stop tokens, so their count matches `completion_tokens`, not every token sampled internally; `<think>`/`</think>` also consume a forward step but are not counted in `completion_tokens`.
 - **No full Jinja template engine:** chat template covers text-only common cases; tool-call arguments and advanced Jinja features (e.g. `tojson` of tool definitions) are not implemented.
 - **No Unicode NFC normalization:** tokenizer assumes input is already NFC (chat content typically is).
@@ -384,9 +384,14 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 | `server::tests::admission_bounds_queued_requests` | Bounded request admission slots |
 | `model::tests::kv_cache_stores_fp16_bits` | fp16 KV cache layout and LUT decode |
 | `compute::tests::gpu_cache_fingerprint_detects_recycled_buffer` | GPU cache key disambiguates recycled buffers (feature `gpu`) |
+| `model::tests::spawned_instance_shares_weights_but_not_state` | Arc core sharing + independent per-instance state |
+| `model::tests::f16_embedding_matmul_matches_f32` / `tied_f16_embedding_supports_forward` | Threaded f16 lm_head matmul and tied embedding forward |
+| `server::tests::multiple_instances_serve_concurrent_requests` | Two model instances serving parallel requests |
+| `exl3::tests` unpack-tile equivalence | `unpack_tile_f32` is bit-identical to unpack + fp16 convert |
+| `tests::cli_parses_instance_count` | `--instances` parsing and bounds |
 | `fuzz::tests` | Seeded random inputs against JSON/HTTP/regex/chat/tokenizer/API parsers (no panics) |
 
-Run `cargo test` — 102 pass, 11 ignored on the current state. The ignored set
+Run `cargo test` — 107 pass, 11 ignored on the current state. The ignored set
 is 6 real-model / `/tmp`-fixture tests (now explicitly marked with reasons) plus
 5 benchmarks (including `bench_n_choices_prefill_reuse`). On a fresh clone the dequantization/matmul guarantee is still
 verified by the committed synthetic fixtures.

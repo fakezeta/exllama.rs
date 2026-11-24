@@ -42,6 +42,8 @@ struct Cli {
     weight_mode: String,
     /// Compute backend: "auto" (best available), "blas", "gpu", "scalar".
     compute: String,
+    /// Number of independent decoding instances sharing the loaded weights.
+    instances: usize,
 }
 
 fn print_usage() {
@@ -62,6 +64,7 @@ fn print_usage() {
                --name <NAME>         Model name exposed by the API\n\
                --weight-mode <MODE>  f32 (fast, default) | f16 | packed (lowest RAM, slow)\n\
                --compute <BACKEND>   auto (best, default) | blas | gpu | scalar\n\
+               --instances <N>       Concurrent decoding instances (default 1)\n\
            -h, --help                Show this help"
     );
 }
@@ -80,12 +83,14 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         name: None,
         weight_mode: "f32".into(),
         compute: "auto".into(),
+        instances: 1,
     };
     // A single iterator owns argument advancement. The old code incremented
     // `i` both inside a value closure and after each match arm — easy to
     // break when adding a flag.
     const MAX_CONTEXT_SIZE: usize = 1_000_000;
     const MAX_THREADS: usize = 1024;
+    const MAX_INSTANCES: usize = 64;
     let mut iter = args.iter().skip(1);
     while let Some(a) = iter.next() {
         let mut value = || {
@@ -122,6 +127,9 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                     return Err("--compute must be auto, blas, gpu, or scalar".into());
                 }
             }
+            "--instances" => {
+                cli.instances = value()?.parse().map_err(|_| "invalid --instances")?;
+            }
             _ => return Err(format!("unknown argument: {}", a)),
         }
     }
@@ -140,6 +148,9 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     }
     if cli.max_tokens == 0 {
         return Err("--max-tokens must be > 0".into());
+    }
+    if cli.instances == 0 || cli.instances > MAX_INSTANCES {
+        return Err(format!("--instances must be in 1..={}", MAX_INSTANCES));
     }
     Ok(cli)
 }
@@ -209,13 +220,15 @@ fn main() -> ExitCode {
     });
 
     let default_enable_thinking = model.config().default_enable_thinking();
-    let engine = Engine::new(
+    eprintln!("[init] decoding instances: {}", cli.instances);
+    let engine = Engine::new_with_instances(
         model,
         tokenizer,
         name.clone(),
         cli.max_tokens,
         cli.threads,
         default_enable_thinking,
+        cli.instances,
     );
 
     let addr = format!("{}:{}", cli.host, cli.port);
@@ -316,6 +329,14 @@ mod tests {
         assert!(parse_cli(&args(&["-c", "0"])).is_err());
         assert!(parse_cli(&args(&["--threads", "0"])).is_err());
         assert!(parse_cli(&args(&["--max-tokens", "0"])).is_err());
+    }
+
+    #[test]
+    fn cli_parses_instance_count() {
+        let cli = parse_cli(&args(&["--instances", "4"])).unwrap();
+        assert_eq!(cli.instances, 4);
+        assert!(parse_cli(&args(&["--instances", "0"])).is_err());
+        assert!(parse_cli(&args(&["--instances", "999"])).is_err());
     }
 
     #[test]

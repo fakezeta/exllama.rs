@@ -308,6 +308,41 @@ fn unpack_tile(
     }
 }
 
+/// Fast f32 unpack for the decode hot path: look the codebook value up
+/// directly as f32 instead of running `decode` arithmetic and then a second
+/// fp16->f32 LUT lookup per weight. Numerically identical to `unpack_tile`
+/// (`decode_f32(idx) == half_f32(decode(idx))` by construction).
+fn unpack_tile_f32(
+    packed: &[u16],
+    k_bits_int: usize,
+    k_half: bool,
+    cb: Codebook,
+    out: &mut [f32; 256],
+) {
+    let nw = packed.len() / 2;
+    let mut words = [0u32; 72];
+    for w in 0..nw {
+        words[w] = ((packed[2 * w + 1] as u32) << 16) | (packed[2 * w] as u32);
+    }
+    let perm = tile_perm_table();
+    if !k_half {
+        let k = k_bits_int;
+        for i in 0..256 {
+            let end = ((i + 1) * k) as i64;
+            out[perm[i]] = decode_f32(window(&words, nw, end - 16), cb);
+        }
+    } else {
+        let ka = k_bits_int;
+        let bpb = 16 * ka + 8;
+        for i in 0..256 {
+            let g = i >> 4;
+            let q = i & 15;
+            let end = (g * bpb) as i64 + (q * ka) as i64 + q.div_ceil(2) as i64;
+            out[perm[i]] = decode_f32(window(&words, nw, end - 16), cb);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Hadamard transform (Sylvester H128 / sqrt(128), in-place butterfly)
 // ---------------------------------------------------------------------------
@@ -770,7 +805,7 @@ fn dequant_linear(shards: &Shards, prefix: &str) -> Result<(Matrix, Option<Vec<f
     for tk in 0..tiles_k {
         for tn in 0..tiles_n {
             let base = (tk * tiles_n + tn) * words_per_tile;
-            unpack_tile(
+            unpack_tile_f32(
                 &packed[base..base + words_per_tile],
                 k_bits_int,
                 k_half,
@@ -852,6 +887,42 @@ impl SharedPtr {
     fn write_at(&self, off: usize, v: f32) {
         unsafe { *self.0.add(off) = v }
     }
+}
+
+/// Threaded `y = W @ x` for an fp16 weight matrix (e.g. a tied embedding used
+/// as `lm_head`). Weights stay as fp16 bits in RAM and are decoded through the
+/// LUT inside `dot_f16`; only one output slice is written by each worker.
+pub(crate) fn matmul_f16(x: &[f32], w: &F16Matrix, y: &mut [f32], threads: usize) {
+    assert_eq!(x.len(), w.cols, "matmul_f16: input length mismatch");
+    assert_eq!(y.len(), w.rows, "matmul_f16: output length mismatch");
+    let rows = w.rows;
+    let cols = w.cols;
+    let base = SharedPtr(y.as_mut_ptr());
+    let n_threads = if rows < 256 {
+        1
+    } else {
+        threads.max(1).min(rows)
+    };
+    let chunk = rows.div_ceil(n_threads);
+    let x_p = SendSlice::new(x);
+    let w_p = SendSlice::new(&w.data);
+    let mut jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::new();
+    for t in 0..n_threads {
+        let r0 = t * chunk;
+        if r0 >= rows {
+            break;
+        }
+        let r1 = (r0 + chunk).min(rows);
+        let (base, x_p, w_p) = (base, x_p, w_p);
+        jobs.push(Box::new(move || unsafe {
+            let x = x_p.get(cols);
+            let data = w_p.get(rows * cols);
+            for j in r0..r1 {
+                base.write_at(j, dot_f16(x, &data[j * cols..(j + 1) * cols]));
+            }
+        }));
+    }
+    crate::threadpool::run(jobs);
 }
 
 /// An EXL3 linear layer kept in packed form. Inference multiplies directly
@@ -1000,7 +1071,7 @@ impl QuantLinear {
         for tk in 0..self.tiles_k {
             for tn in 0..self.tiles_n {
                 let off = (tk * self.tiles_n + tn) * self.words_per_tile;
-                unpack_tile(
+                unpack_tile_f32(
                     &trellis[off..off + self.words_per_tile],
                     self.k_bits_int,
                     self.k_half,
@@ -1109,7 +1180,7 @@ impl QuantLinear {
                     for tn in tn0..tn1 {
                         for tk in 0..tiles_k {
                             let off = (tk * tiles_n + tn) * wpb;
-                            unpack_tile(&trellis[off..off + wpb], kbi, kh, cb, &mut tile);
+                            unpack_tile_f32(&trellis[off..off + wpb], kbi, kh, cb, &mut tile);
                             let xbase = tk * 16;
                             let ybase = tn * 16;
                             for c in 0..16 {
@@ -1318,8 +1389,9 @@ impl Exl3Model {
             .collect();
         shards.compact_to(&keep);
 
-        // Untied models can store the embedding table as fp16 and decode one
-        // row per token. Tied models need the full f32 matrix for lm_head.
+        // Every plain embedding table is stored as fp16 and decoded per row
+        // (or by the threaded f16 lm_head matmul for tied models), so even
+        // tied checkpoints avoid the full f32 vocab x hidden allocation.
         let embed_name = {
             let preferred = format!("{}embed_tokens.weight", prefix);
             if shards.has(&preferred) {
@@ -1339,7 +1411,9 @@ impl Exl3Model {
             })
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let embed_as_f16 = !tie_embeddings;
+        // Kept for config diagnostics; embeddings are always fp16 now, and
+        // tied models use `matmul_f16` for lm_head instead of an f32 matrix.
+        let _tie_embeddings = tie_embeddings;
 
         // Plain (unquantized) tensors: embeddings, lm_head, 1-D vectors.
         for name in &all_names {
@@ -1356,7 +1430,7 @@ impl Exl3Model {
                 continue;
             }
             // Loaded directly as fp16 below (no f32 staging buffer).
-            if embed_as_f16 && embed_name.as_deref() == Some(name.as_str()) {
+            if embed_name.as_deref() == Some(name.as_str()) {
                 continue;
             }
             // Already dequantized.
@@ -1392,11 +1466,9 @@ impl Exl3Model {
             }
         }
 
-        if embed_as_f16 {
-            if let Some(name) = &embed_name {
-                if let Some(emb) = read_f16_matrix(&shards, name) {
-                    embeddings_f16.insert(name.clone(), emb);
-                }
+        if let Some(name) = &embed_name {
+            if let Some(emb) = read_f16_matrix(&shards, name) {
+                embeddings_f16.insert(name.clone(), emb);
             }
         }
 
@@ -1573,6 +1645,10 @@ mod tests {
             for i in 0..256 {
                 assert_eq!(half_to_f32(bits[i]), vals[i], "tile bit {}", i);
             }
+            // Fast f32 LUT path must be bit-identical to unpack + convert.
+            let mut fast = [0f32; 256];
+            unpack_tile_f32(&packed, ka, half, cb, &mut fast);
+            assert_eq!(fast, vals);
         }
     }
 
@@ -2081,7 +2157,7 @@ mod packed_profile {
             let mut acc = 0.0f32;
             for t in 0..ql.tiles_k * ql.tiles_n {
                 let off = t * wpt;
-                unpack_tile(
+                unpack_tile_f32(
                     &ql.trellis.as_ref().unwrap()[off..off + wpt],
                     8,
                     false,
@@ -2107,7 +2183,7 @@ mod packed_profile {
             let off = t * wpt;
             let tk2 = t / ql.tiles_n;
             let tn2 = t % ql.tiles_n;
-            unpack_tile(
+            unpack_tile_f32(
                 &ql.trellis.as_ref().unwrap()[off..off + wpt],
                 8,
                 false,

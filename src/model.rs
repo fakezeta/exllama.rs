@@ -1,8 +1,9 @@
 //! Qwen3.5 text decoder: config, weights, KV cache, and forward pass.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::exl3::{f32_to_half, half_f32, Exl3Model, QuantLinear};
+use crate::exl3::{f32_to_half, half_f32, matmul_f16, Exl3Model, QuantLinear};
 use crate::json::Json;
 use crate::tensor::{dot, matmul_t, F16Matrix, Matrix};
 
@@ -43,12 +44,14 @@ impl ModelConfig {
 /// State for one full-attention layer: fp16 KV cache. Storing the code bits
 /// directly halves context RAM; each step decodes the used prefix into f32
 /// through a lookup table before computing attention.
+#[derive(Clone)]
 struct FullAttnState {
     k: Vec<u16>, // (max_ctx, num_kv_heads, head_dim), fp16 bits
     v: Vec<u16>,
 }
 
 /// State for one linear-attention layer: convolution buffer + recurrent state.
+#[derive(Clone)]
 struct LinearAttnState {
     /// Circular buffer of the last `kernel` qkv vectors (oldest at index 0).
     conv: Vec<f32>, // (kernel, conv_dim)
@@ -87,21 +90,34 @@ struct DeltaNetScratch {
     o: Vec<f32>,
 }
 
-pub struct Model {
-    pub config: ModelConfig,
+/// Immutable model data shared by every inference instance. Weights, config
+/// and precomputed tables are loaded once; only the runtime state below is
+/// per-request, so extra instances cost KV/recurrent state, not another copy
+/// of a multi-GB model.
+struct ModelCore {
+    config: ModelConfig,
     prefix: String,
     weights: HashMap<String, Matrix>,
-    /// fp16 embedding tables (untied models); one row decoded per token.
+    /// fp16 embedding tables; one row decoded per token (also used by lm_head
+    /// for tied checkpoints).
     embeddings_f16: HashMap<String, F16Matrix>,
     linears: HashMap<String, QuantLinear>,
     vectors: HashMap<String, Vec<f32>>,
     threads: usize,
     context_size: usize,
-    position: usize,
     /// Precomputed RoPE phases: `rope_cos[position * rope_half + d]`.
     rope_cos: Vec<f32>,
     rope_sin: Vec<f32>,
     rope_half: usize,
+    /// Zeroed templates used to allocate fresh instance state.
+    full_template: Vec<FullAttnState>,
+    linear_template: Vec<LinearAttnState>,
+}
+
+/// One inference instance: shared immutable core + mutable per-sequence state.
+pub struct Model {
+    core: Arc<ModelCore>,
+    position: usize,
     full_states: Vec<FullAttnState>,
     linear_states: Vec<LinearAttnState>,
 }
@@ -257,7 +273,7 @@ impl Model {
             }
         }
 
-        Ok(Model {
+        let core = Arc::new(ModelCore {
             config,
             prefix,
             weights: ex.weights,
@@ -266,21 +282,42 @@ impl Model {
             vectors: ex.vectors,
             threads,
             context_size,
-            position: 0,
             rope_cos,
             rope_sin,
             rope_half,
+            full_template: full_states.clone(),
+            linear_template: linear_states.clone(),
+        });
+        Ok(Model {
+            core,
+            position: 0,
             full_states,
             linear_states,
         })
     }
 
+    /// Create another inference instance sharing the loaded weights/config but
+    /// with fresh, zeroed KV and recurrent state.
+    pub fn spawn(&self) -> Model {
+        Model {
+            core: Arc::clone(&self.core),
+            position: 0,
+            full_states: self.core.full_template.clone(),
+            linear_states: self.core.linear_template.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    fn core_mut(&mut self) -> &mut ModelCore {
+        Arc::get_mut(&mut self.core).expect("test model core must be uniquely owned")
+    }
+
     pub fn config(&self) -> &ModelConfig {
-        &self.config
+        &self.core.config
     }
 
     pub fn context_size(&self) -> usize {
-        self.context_size
+        self.core.context_size
     }
 
     pub fn reset(&mut self) {
@@ -299,7 +336,7 @@ impl Model {
     /// Copy the state produced by a prefill. Only KV rows up to `position`
     /// are retained; the unused tail of the cache is irrelevant to decoding.
     pub(crate) fn snapshot(&self) -> ModelState {
-        let kv = self.config.num_key_value_heads * self.config.head_dim;
+        let kv = self.core.config.num_key_value_heads * self.core.config.head_dim;
         let used = self.position * kv;
         ModelState {
             position: self.position,
@@ -322,7 +359,7 @@ impl Model {
         debug_assert_eq!(self.full_states.len(), state.full.len());
         debug_assert_eq!(self.linear_states.len(), state.linear.len());
         self.position = state.position;
-        let kv = self.config.num_key_value_heads * self.config.head_dim;
+        let kv = self.core.config.num_key_value_heads * self.core.config.head_dim;
         let used = state.position * kv;
         for (dst, (k, v)) in self.full_states.iter_mut().zip(&state.full) {
             dst.k[..used].copy_from_slice(k);
@@ -339,23 +376,25 @@ impl Model {
     /// prefix first and then the bare name (e.g. top-level `lm_head.weight` in
     /// multimodal checkpoints).
     fn w(&self, name: &str) -> Option<&Matrix> {
-        let prefixed = format!("{}{}", self.prefix, name);
+        let prefixed = format!("{}{}", self.core.prefix, name);
         let with_weight = format!("{}.weight", name);
-        let prefixed_weight = format!("{}{}", self.prefix, with_weight);
-        self.weights
+        let prefixed_weight = format!("{}{}", self.core.prefix, with_weight);
+        self.core
+            .weights
             .get(&prefixed)
-            .or_else(|| self.weights.get(&prefixed_weight))
-            .or_else(|| self.weights.get(name))
-            .or_else(|| self.weights.get(&with_weight))
+            .or_else(|| self.core.weights.get(&prefixed_weight))
+            .or_else(|| self.core.weights.get(name))
+            .or_else(|| self.core.weights.get(&with_weight))
             .or_else(|| {
                 // EXL3 checkpoints store the quantized lm_head under the bare
                 // base name `lm_head` (no `.weight` suffix). Some models tie
                 // embeddings and have no separate lm_head at all — fall back
                 // to the embedding matrix in that case.
                 if name == "lm_head.weight" {
-                    self.weights.get("lm_head").or_else(|| {
-                        self.weights
-                            .get(&format!("{}embed_tokens.weight", self.prefix))
+                    self.core.weights.get("lm_head").or_else(|| {
+                        self.core
+                            .weights
+                            .get(&format!("{}embed_tokens.weight", self.core.prefix))
                     })
                 } else {
                     None
@@ -364,27 +403,29 @@ impl Model {
     }
     /// Resolve a quantized linear with the same prefix/alias logic as `w`.
     fn ql(&self, name: &str) -> Option<&QuantLinear> {
-        let prefixed = format!("{}{}", self.prefix, name);
+        let prefixed = format!("{}{}", self.core.prefix, name);
         let with_weight = format!("{}.weight", name);
-        let prefixed_weight = format!("{}{}", self.prefix, with_weight);
-        self.linears
+        let prefixed_weight = format!("{}{}", self.core.prefix, with_weight);
+        self.core
+            .linears
             .get(&prefixed)
-            .or_else(|| self.linears.get(&prefixed_weight))
-            .or_else(|| self.linears.get(name))
-            .or_else(|| self.linears.get(&with_weight))
+            .or_else(|| self.core.linears.get(&prefixed_weight))
+            .or_else(|| self.core.linears.get(name))
+            .or_else(|| self.core.linears.get(&with_weight))
             .or_else(|| {
                 if name == "lm_head.weight" {
-                    self.linears.get("lm_head")
+                    self.core.linears.get("lm_head")
                 } else {
                     None
                 }
             })
     }
     fn v(&self, name: &str) -> Option<&Vec<f32>> {
-        let prefixed = format!("{}{}", self.prefix, name);
-        self.vectors
+        let prefixed = format!("{}{}", self.core.prefix, name);
+        self.core
+            .vectors
             .get(&prefixed)
-            .or_else(|| self.vectors.get(name))
+            .or_else(|| self.core.vectors.get(name))
     }
 
     /// Resolve a 1-D tensor, failing loudly with its name when absent. Silent
@@ -559,11 +600,27 @@ impl Model {
     fn linear(&self, x: &[f32], name: &str) -> Result<Vec<f32>, String> {
         if let Some(w) = self.w(name) {
             let mut y = vec![0.0f32; w.rows];
-            matmul_t(x, 1, x.len(), w, &mut y, self.threads);
+            matmul_t(x, 1, x.len(), w, &mut y, self.core.threads);
             return Ok(y);
         }
         if let Some(ql) = self.ql(name) {
-            return Ok(ql.matmul(x, self.threads));
+            return Ok(ql.matmul(x, self.core.threads));
+        }
+        // Tied checkpoints keep the embedding table as fp16 only; the same
+        // table is the lm_head. Decode it on the fly via the threaded f16
+        // matmul instead of maintaining a full f32 vocab x hidden matrix.
+        if name == "lm_head.weight" {
+            let embed = format!("{}embed_tokens.weight", self.core.prefix);
+            if let Some(w) = self
+                .core
+                .embeddings_f16
+                .get(&embed)
+                .or_else(|| self.core.embeddings_f16.get("model.embed_tokens.weight"))
+            {
+                let mut y = vec![0.0f32; w.rows];
+                matmul_f16(x, w, &mut y, self.core.threads);
+                return Ok(y);
+            }
         }
         Err(format!("missing linear weight `{}`", name))
     }
@@ -571,16 +628,16 @@ impl Model {
     /// Apply RoPE to the first `dim` elements of each head in `x`
     /// (head-major layout: head h starts at h*head_len).
     fn apply_rope(&self, x: &mut [f32], head_len: usize, num_heads: usize, pos: usize) {
-        let half = self.rope_half;
-        if half == 0 || pos >= self.context_size {
+        let half = self.core.rope_half;
+        if half == 0 || pos >= self.core.context_size {
             return;
         }
         let table_base = pos * half;
         for h in 0..num_heads {
             let base = h * head_len;
             for d in 0..half {
-                let c = self.rope_cos[table_base + d];
-                let s = self.rope_sin[table_base + d];
+                let c = self.core.rope_cos[table_base + d];
+                let s = self.core.rope_sin[table_base + d];
                 let a = x[base + d];
                 let b = x[base + d + half];
                 x[base + d] = a * c - b * s;
@@ -597,7 +654,7 @@ impl Model {
         state_idx: usize,
         pos: usize,
     ) -> Result<Vec<f32>, String> {
-        let cfg = &self.config;
+        let cfg = &self.core.config;
         let norm_w = self.vec(&format!("layers.{}.input_layernorm.weight", layer))?;
         let xn = Self::rms_norm(x, norm_w, cfg.rms_norm_eps);
 
@@ -645,7 +702,7 @@ impl Model {
 
         // Write the new K/V row as fp16 bits (halves context memory).
         let kv = nkv * hd;
-        if pos < self.context_size {
+        if pos < self.core.context_size {
             let st = &mut self.full_states[state_idx];
             for (dst, &src) in st.k[pos * kv..(pos + 1) * kv].iter_mut().zip(&k) {
                 *dst = f32_to_half(src);
@@ -658,7 +715,7 @@ impl Model {
         // Causal attention over cached keys/values, then sigmoid(gate).
         // Decode the used prefix through the f16 LUT once per token rather
         // than doing a slow powi-based conversion at every score/value read.
-        let tlen = pos.min(self.context_size - 1) + 1;
+        let tlen = pos.min(self.core.context_size - 1) + 1;
         let st = &self.full_states[state_idx];
         let k_f32: Vec<f32> = st.k[..tlen * kv].iter().map(|&b| half_f32(b)).collect();
         let v_f32: Vec<f32> = st.v[..tlen * kv].iter().map(|&b| half_f32(b)).collect();
@@ -679,7 +736,7 @@ impl Model {
         x: &[f32],
         state_idx: usize,
     ) -> Result<Vec<f32>, String> {
-        let cfg = &self.config;
+        let cfg = &self.core.config;
         let norm_w = self.vec(&format!("layers.{}.input_layernorm.weight", layer))?;
         let xn = Self::rms_norm(x, norm_w, cfg.rms_norm_eps);
 
@@ -816,11 +873,12 @@ impl Model {
     /// checkpoint (`model.language_model.`) resolves correctly.
     fn embedding_row(&self, token: u32) -> Result<Vec<f32>, String> {
         let id = token as usize;
-        let embed_name = format!("{}embed_tokens.weight", self.prefix);
+        let embed_name = format!("{}embed_tokens.weight", self.core.prefix);
         if let Some(emb) = self
+            .core
             .embeddings_f16
             .get(&embed_name)
-            .or_else(|| self.embeddings_f16.get("model.embed_tokens.weight"))
+            .or_else(|| self.core.embeddings_f16.get("model.embed_tokens.weight"))
         {
             if id >= emb.rows {
                 return Err(format!(
@@ -843,12 +901,12 @@ impl Model {
     }
 
     fn forward_token(&mut self, token: u32) -> Result<Vec<f32>, String> {
-        let num_layers = self.config.num_layers;
-        let hs = self.config.hidden_size;
-        let vocab = self.config.vocab_size;
-        let eps = self.config.rms_norm_eps;
-        let layer_types = self.config.layer_types.clone();
-        let intv = self.config.full_attention_interval;
+        let num_layers = self.core.config.num_layers;
+        let hs = self.core.config.hidden_size;
+        let vocab = self.core.config.vocab_size;
+        let eps = self.core.config.rms_norm_eps;
+        let layer_types = self.core.config.layer_types.clone();
+        let intv = self.core.config.full_attention_interval;
 
         let mut x = self.embedding_row(token)?;
 
@@ -913,15 +971,15 @@ impl Model {
     }
 
     pub fn forward(&mut self, input_ids: &[u32]) -> Result<Vec<f32>, String> {
-        if input_ids.len() > self.context_size.saturating_sub(self.position) {
+        if input_ids.len() > self.core.context_size.saturating_sub(self.position) {
             return Err(format!(
                 "context size exceeded: position {} + {} input tokens > context {}",
                 self.position,
                 input_ids.len(),
-                self.context_size
+                self.core.context_size
             ));
         }
-        let mut logits = vec![0.0f32; self.config.vocab_size];
+        let mut logits = vec![0.0f32; self.core.config.vocab_size];
         for &t in input_ids {
             logits = self.forward_token(t)?;
         }
@@ -1001,7 +1059,11 @@ impl Model {
             }
         }
 
-        Model {
+        let full_states = vec![FullAttnState {
+            k: vec![0u16; context_size * 4],
+            v: vec![0u16; context_size * 4],
+        }];
+        let core = Arc::new(ModelCore {
             config,
             prefix: "model.".into(),
             weights,
@@ -1010,14 +1072,16 @@ impl Model {
             vectors,
             threads: 1,
             context_size,
-            position: 0,
             rope_cos,
             rope_sin,
             rope_half,
-            full_states: vec![FullAttnState {
-                k: vec![0u16; context_size * 4],
-                v: vec![0u16; context_size * 4],
-            }],
+            full_template: full_states.clone(),
+            linear_template: Vec::new(),
+        });
+        Model {
+            core,
+            position: 0,
+            full_states,
             linear_states: Vec::new(),
         }
     }
@@ -1032,9 +1096,9 @@ mod tests {
         let mut m = Model::tiny();
         // Untied multimodal checkpoint: there is no f32 embedding in
         // `weights`; the fp16 table lives under the language-model prefix.
-        m.weights.remove("model.embed_tokens.weight");
-        m.prefix = "model.language_model.".into();
-        m.embeddings_f16.insert(
+        m.core_mut().weights.remove("model.embed_tokens.weight");
+        m.core_mut().prefix = "model.language_model.".into();
+        m.core_mut().embeddings_f16.insert(
             "model.language_model.embed_tokens.weight".into(),
             F16Matrix {
                 rows: 2,
@@ -1045,22 +1109,90 @@ mod tests {
         assert_eq!(m.embedding_row(1).unwrap(), vec![1.0f32; 4]);
 
         // A wrong prefix must fail loudly rather than mis-tokenize.
-        m.prefix = "model.".into();
+        m.core_mut().prefix = "model.".into();
         assert!(m.embedding_row(0).is_err());
     }
 
     #[test]
     fn kv_cache_stores_fp16_bits() {
         let m = Model::tiny();
-        let kv = m.config.num_key_value_heads * m.config.head_dim;
-        assert_eq!(m.full_states[0].k.len(), m.context_size * kv);
-        assert_eq!(m.full_states[0].v.len(), m.context_size * kv);
+        let kv = m.core.config.num_key_value_heads * m.core.config.head_dim;
+        assert_eq!(m.full_states[0].k.len(), m.core.context_size * kv);
+        assert_eq!(m.full_states[0].v.len(), m.core.context_size * kv);
         // A fresh cache is all-zero fp16 bits, and the LUT decoder used by
         // attention round-trips a representative value exactly.
         assert!(m.full_states[0].k.iter().all(|&b| b == 0));
         assert!(m.full_states[0].v.iter().all(|&b| b == 0));
         let bits = f32_to_half(1.25);
         assert!((half_f32(bits) - 1.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f16_embedding_matmul_matches_f32() {
+        let rows = 4usize;
+        let cols = 3usize;
+        let f32_data: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.25 - 0.5).collect();
+        let f16 = F16Matrix {
+            rows,
+            cols,
+            data: f32_data.iter().map(|&v| f32_to_half(v)).collect(),
+        };
+        let x = [0.5f32, -1.0, 2.0];
+        let mut got = vec![0.0f32; rows];
+        matmul_f16(&x, &f16, &mut got, 2);
+        for j in 0..rows {
+            let expect: f32 = x
+                .iter()
+                .zip(&f32_data[j * cols..(j + 1) * cols])
+                .map(|(a, b)| a * b)
+                .sum();
+            assert!(
+                (got[j] - expect).abs() < 1e-3,
+                "row {}: got {} expected {}",
+                j,
+                got[j],
+                expect
+            );
+        }
+    }
+
+    #[test]
+    fn spawned_instance_shares_weights_but_not_state() {
+        let mut m = Model::tiny();
+        let other = m.spawn();
+        // A forward pass on one instance must not move the other's position.
+        assert_eq!(other.position, 0);
+        m.forward(&[0]).unwrap();
+        assert_eq!(m.position, 1);
+        assert_eq!(other.position, 0);
+        assert_eq!(m.full_states[0].k.len(), other.full_states[0].k.len());
+        // Both see the same config from the shared core.
+        assert_eq!(m.config().vocab_size, other.config().vocab_size);
+    }
+
+    #[test]
+    fn tied_f16_embedding_supports_forward() {
+        let mut m = Model::tiny();
+        // Simulate a tied checkpoint: the embedding is fp16-only and the
+        // separate f32 lm_head matrix is absent, so lm_head must read the
+        // embedding table through the f16 matmul path.
+        let emb = m
+            .core_mut()
+            .weights
+            .remove("model.embed_tokens.weight")
+            .unwrap();
+        m.core_mut().weights.remove("lm_head.weight");
+        m.core_mut().embeddings_f16.insert(
+            "model.embed_tokens.weight".into(),
+            F16Matrix {
+                rows: emb.rows,
+                cols: emb.cols,
+                data: emb.data.iter().map(|&v| f32_to_half(v)).collect(),
+            },
+        );
+        let logits = m.forward(&[0]).unwrap();
+        assert_eq!(logits.len(), m.core.config.vocab_size);
+        assert!(logits.iter().all(|v| v.is_finite()));
     }
 
     #[test]
@@ -1103,11 +1235,11 @@ mod tests {
     #[test]
     fn rope_is_partial_and_position_indexed() {
         let m = Model::tiny(); // head_dim=4, partial_rotary_factor=0.5 -> 2 rotary dims
-        assert_eq!(m.rope_half, 1);
-        assert!((m.rope_cos[0] - 1.0).abs() < 1e-6);
-        assert!(m.rope_sin[0].abs() < 1e-6);
-        assert!((m.rope_cos[1] - 1.0f32.cos()).abs() < 1e-6);
-        assert!((m.rope_sin[1] - 1.0f32.sin()).abs() < 1e-6);
+        assert_eq!(m.core.rope_half, 1);
+        assert!((m.core.rope_cos[0] - 1.0).abs() < 1e-6);
+        assert!(m.core.rope_sin[0].abs() < 1e-6);
+        assert!((m.core.rope_cos[1] - 1.0f32.cos()).abs() < 1e-6);
+        assert!((m.core.rope_sin[1] - 1.0f32.sin()).abs() < 1e-6);
 
         // Position 0 is the identity rotation.
         let mut x = [1.0f32, 2.0, 3.0, 4.0];
@@ -1116,7 +1248,7 @@ mod tests {
 
         // Position 1 rotates only the first 2 dims (rotate-half layout).
         m.apply_rope(&mut x, 4, 1, 1);
-        let (c, s) = (m.rope_cos[1], m.rope_sin[1]);
+        let (c, s) = (m.core.rope_cos[1], m.core.rope_sin[1]);
         assert!((x[0] - (1.0 * c - 2.0 * s)).abs() < 1e-6);
         assert!((x[1] - (2.0 * c + 1.0 * s)).abs() < 1e-6);
         assert_eq!(x[2], 3.0); // dims past the rotary width are untouched

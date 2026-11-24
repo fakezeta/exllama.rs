@@ -61,8 +61,8 @@ checked off with a short note; open items are unchecked.
   grouping/scale/gate and the DeltaNet recurrence (with decay). `model.rs`
   now has 7 unit tests.
 - [x] **(P1) Fix doc drift.** Done — `AGENTS.md` counts/line numbers, `TODO.md`
-  stale "next steps", and this plan's baseline are updated to 102 passed /
-  11 ignored (88 after Phase 0, 99 after Phase 1).
+  stale "next steps", and this plan's baseline are updated to 107 passed /
+  11 ignored (88 after Phase 0, 99 after Phase 1, 102 after Phase 2).
 - [x] **(P1) Bounded request-line reading.** Done — see plan Phase 1 #4:
   `read_request()` reads the request line and headers through
   `Read::take(MAX_HEADER_BYTES + 1)` and rejects overlong lines. `http::tests`
@@ -95,15 +95,15 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
   All three modes validated on the real 0.8B EXL3 model: `f32` and `f16` gave
   byte-identical, coherent answers quickly; `packed` gave the same correct
   answer but at ~3.5 s/token (long requests hit client timeouts).
-- [x] **(P1) Reduce embedding memory.** Done for untied models — `embed_tokens`
-  is stored as raw fp16 code bits from the shard (2 bytes/weight) and one row is
-  decoded per token. Tied models (0.8B) still keep the f32 matrix because it is
-  also used by `lm_head` (~1 GB); for 9B this saves roughly 2 GB.
-- [ ] **(P2) Speed up the `packed` mode.** Its bottleneck is codebook decode
-  (not the dot product), so SIMD on `dot()` won't help. O(1) window extraction,
-  decode LUTs and stack buffers are already in place; further gains need SIMD
-  gather for the LUT or a different packed representation. Low priority — `f16`
-  gives 2× memory at near-f32 speed.
+- [x] **(P1) Reduce embedding memory.** Done for **all** models — `embed_tokens`
+  is stored as fp16 code bits (2 bytes/weight); one row is decoded per token and
+  tied `lm_head` uses the threaded `matmul_f16` instead of an f32 matrix. Saves
+  roughly 2 GB for 9B and ~1 GB for tied 0.8B.
+- [x] **(P2) Speed up the `packed` mode.** Done as far as stable std-only Rust
+  allows: `unpack_tile_f32()` looks up the codebook's f32 table directly,
+  removing per-codeword arithmetic and the fp16 conversion (bit-identical to
+  the reference path, asserted by a test). True SIMD gather has no portable
+  stable API; `f16` remains the recommended low-RAM mode.
 - [x] **(P1) Free shard bytes before allocating weights.** Done — quantized
   linears copy only their trellis; after the linear pass, `Shards::compact_to`
   drops all non-plain tensor byte ranges before plain tensors are decoded.
@@ -112,7 +112,7 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 - [x] **(P2) GPU weight-cache key.** Done — see plan Phase 2 #13: cache keys
   include a sampled-weight fingerprint so a recycled pointer cannot reuse a
   stale device tensor. GPU-only test added.
-- [ ] **(P2) Batched / continuous inference (partially done, see plan #11).** `n > 1` choices now share one prefill, and bounded admission (16 queued requests, 429 on overflow) prevents thread pileup. True multi-request batching / multiple Model instances deferred — needs shared weights split from per-request state, or N full copies (RAM scales linearly). See `AGENTS.md` §8.
+- [x] **(P2) Batched / continuous inference (see plan #11).** `n > 1` choices share one prefill; bounded admission (16 slots, 429) prevents pileup; `--instances N` creates independent `Model` instances over an Arc-shared core (weights shared, only KV/recurrent state duplicated) with a pooled lease. Matmul kernels are not batched across requests — that needs batch-aware attention/DeltaNet; see `AGENTS.md` §8.
 - [x] **(P2) KV cache quantization.** Done — full-attention KV cache stores fp16 bits (2 bytes/value) and decodes the used prefix via the `half_f32` LUT per step, halving context RAM. `model::tests::kv_cache_stores_fp16_bits` added.
 - [x] **(P2) Precompute RoPE cos/sin tables.** Done — tables built once at load; DeltaNet per-head scratch is also reused.
 - [x] **(P1) Guard the global threadpool against concurrent `run()` calls.** Done
@@ -210,15 +210,12 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 ## Suggested Next Steps (ordered)
 
 The authoritative phased plan (with acceptance criteria) is
-[`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md). **Phases 0–2 are complete** (Phase
-2 with documented deferrals); execute the remaining work in this order:
+[`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md). **Phases 0–2 are fully complete**;
+execute the remaining work in this order:
 
-1. **Deferred Phase 2 work (measure first):** true multi-request batching /
-   split shared weights, f16 tied-model embedding with a threaded lm_head
-   matmul, packed-mode SIMD gather. See plan items 11–12 and `AGENTS.md` §8.
-2. **Phase 3 — exploration.** Vision, other architectures, NFC / `chat_template`
+1. **Phase 3 — exploration.** Vision, other architectures, NFC / `chat_template`
    loading, structured logging, Anthropic endpoint.
-3. **Manual validation still worth doing:** the end-to-end benchmark
+2. **Manual validation still worth doing:** the end-to-end benchmark
    (`EXLLAMA_BENCH_MODEL=/path cargo test --release bench_generation_throughput -- --ignored --nocapture`),
    a real-client SSE smoke test (`curl -N`), and real-model runs on 2B/4B/9B
    and MUL1 codebooks (only the 0.8B 8-bpw MCG model has been exercised), and

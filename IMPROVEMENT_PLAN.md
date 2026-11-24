@@ -7,17 +7,17 @@ module. It complements `TODO.md`: that file tracks individual checked-off tasks,
 while this file groups the *open* work into executable phases with acceptance
 criteria.
 
-> **Status:** Phases 0 and 1 are **implemented and verified**; Phase 2 is
-> **implemented with documented deferrals** (see the completion notes below);
-> Phase 3 remains a plan. Commit only on explicit approval.
+> **Status:** Phases 0–2 are **implemented and verified** (see the completion
+> notes below); Phase 3 remains a plan. Commit only on explicit approval.
 
 ## Baseline (at time of review)
 
 - Branch `main`, tag `v0.4.2`, working tree clean at review time.
 - At review: `cargo test` **84 passed, 4 ignored**. After Phase 0:
   **88 passed, 10 ignored**. After Phase 1: **99 passed, 10 ignored**. After
-  Phase 2: **102 passed, 11 ignored** (6 real-model / `/tmp` fixtures explicitly
-  ignored with reasons, 5 benchmarks). `cargo fmt --all -- --check` and
+  Phase 2: **102 passed, 11 ignored**; after the deferred Phase 2 work:
+  **107 passed, 11 ignored** (6 real-model / `/tmp` fixtures explicitly ignored
+  with reasons, 5 benchmarks). `cargo fmt --all -- --check` and
   `cargo clippy --all-targets -- -D warnings` remain clean; the GPU feature
   also compiles and its cache-key test passes.
 - The **forward math is correct**. `src/model.rs` matches both `AGENTS.md` §6
@@ -188,14 +188,15 @@ tests silently return early when `/tmp` files are absent.
     all requests. Add a request queue and batch prefill via the existing
     multi-row sgemm path; potentially allow multiple `Model` instances behind
     a semaphore rather than a single mutex. This is the main throughput ceiling.
-    **Partially done / deferred:** bounded admission (`Engine::try_admit()`,
-    `MAX_QUEUED_REQUESTS = 16`, RAII guard, 429 on overflow) prevents thread
-    pileup, and `n > 1` choices share one prefill (item 10). True multi-request
-    batching / multiple model instances is deferred: it needs shared weights
-    split from per-request state (or N full model copies, with RAM scaling
-    linearly), plus batch-aware attention and DeltaNet — a large refactor with
-    no correctness safety net on this codebase. Rationale recorded in
-    `AGENTS.md` §8.
+    **Done:** `n > 1` choices share one prefill (item 10); bounded admission
+    (`Engine::try_admit()`, 16 slots, 429 overflow) prevents thread pileup.
+    For independent requests, `Model` was split into an `Arc`-shared
+    `ModelCore` (weights/config/tables) plus per-instance state; `Model::spawn()`
+    creates cheap instances and `--instances N` wires them into an `Engine`
+    pool with leases (`Vec<Mutex<Model>>` + `Condvar`). Extra instances cost
+    KV/recurrent state, not another copy of the weights. Matmul kernels are
+    still not batched across requests (that needs batch-aware attention and
+    DeltaNet); documented in `AGENTS.md` §8.
 
 12. **Memory optimizations (in order of value).**
     - f16 KV cache with per-step f32 upcast (halves context RAM).
@@ -206,14 +207,15 @@ tests silently return early when `/tmp` files are absent.
       the dot product).
     *Acceptance:* before/after numbers from `bench_generation_throughput` and
     peak-RSS measurements; no correctness regression.
-    **Partially done / deferred:** the full-attention KV cache now stores fp16
-    bits (`Vec<u16>`, 2 bytes/value) and decodes the used prefix through the
-    `half_f32` LUT each step — halving context RAM. `model::tests::kv_cache_stores_fp16_bits`
-    locks the layout down; all generation/HTTP tests still pass. The tied-model
-    f16 embedding is deferred (requires a new threaded f16 lm_head matmul to
-    avoid a per-token full-table decode), as is the packed-mode SIMD gather
-    (explicitly low priority). Real-model RSS numbers still require running the
-    benchmarks with `EXLLAMA_BENCH_MODEL`.
+    **Done:** fp16 KV cache (2 bytes/value, LUT-decoded per step) halves context
+    RAM (`kv_cache_stores_fp16_bits`). All plain embeddings are fp16 and tied
+    `lm_head` uses the new threaded `matmul_f16` (`f16_embedding_matmul_matches_f32`,
+    `tied_f16_embedding_supports_forward`). The packed decode hot path now uses
+    `unpack_tile_f32` — a direct codebook f32 LUT lookup that removes the
+    per-codeword arithmetic + fp16 conversion (bit-identical result, asserted
+    against `unpack_tile`). True SIMD gather is not available on stable std-only
+    Rust (no portable gather API); the arithmetic bottleneck it targeted is
+    gone. Real-model RSS numbers still require `EXLLAMA_BENCH_MODEL`.
 
 13. **GPU weight-cache key.** `compute.rs` (~270-289) keys cached device
     tensors by raw pointer; an address reuse can yield a stale entry (bounded
@@ -243,8 +245,8 @@ tests silently return early when `/tmp` files are absent.
 
 ## Suggested execution order
 
-**Phases 0–2 are implemented** (Phase 2 with the deferrals noted in items 11
-and 12) → **Phase 3**. Phase 2 added shared prefill for `n > 1`, bounded
-admission, and a fp16 KV cache; measure with `EXLLAMA_BENCH_MODEL` before
-tackling the deferred multi-request batching / f16 tied embedding / packed SIMD
-work. Do not commit until the user explicitly approves.
+**Phases 0–2 are fully implemented** → **Phase 3**. Phase 2 now includes shared
+prefill, bounded admission, multiple Arc-shared model instances (`--instances`),
+fp16 KV cache, fp16 tied embeddings, and the direct-LUT packed decode. Real-model
+timing/RSS numbers still need `EXLLAMA_BENCH_MODEL`. Do not commit until the
+user explicitly approves.

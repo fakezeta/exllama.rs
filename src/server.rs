@@ -8,8 +8,9 @@ use crate::{json::Json, rng::Rng};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::TcpStream;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -346,8 +347,45 @@ impl Drop for AdmissionGuard<'_> {
     }
 }
 
+/// Exclusive use of one model instance. Returning the lease hands the slot
+/// back to the pool so another request can decode with the same shared weights.
+struct ModelLease<'a> {
+    engine: &'a Engine,
+    guard: Option<MutexGuard<'a, Model>>,
+    idx: usize,
+}
+
+impl Drop for ModelLease<'_> {
+    fn drop(&mut self) {
+        self.guard.take(); // release the model before advertising the slot
+        let mut available = self
+            .engine
+            .available
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        available.push(self.idx);
+        self.engine.ready.notify_one();
+    }
+}
+
+impl Deref for ModelLease<'_> {
+    type Target = Model;
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_ref().unwrap()
+    }
+}
+
+impl DerefMut for ModelLease<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard.as_mut().unwrap()
+    }
+}
+
 pub struct Engine {
-    model: Mutex<Model>,
+    /// Independent instances sharing the loaded weights (Arc-shared core).
+    models: Vec<Mutex<Model>>,
+    available: Mutex<Vec<usize>>,
+    ready: Condvar,
     tokenizer: Tokenizer,
     pub model_name: String,
     pub default_max_tokens: usize,
@@ -366,8 +404,40 @@ impl Engine {
         threads: usize,
         default_enable_thinking: bool,
     ) -> Self {
+        Self::new_with_instances(
+            model,
+            tokenizer,
+            model_name,
+            default_max_tokens,
+            threads,
+            default_enable_thinking,
+            1,
+        )
+    }
+
+    /// Build `instances` independent decoding states over the same loaded
+    /// weights. Extra instances duplicate only KV/recurrent state, not the
+    /// multi-GB weight matrices.
+    pub fn new_with_instances(
+        model: Model,
+        tokenizer: Tokenizer,
+        model_name: String,
+        default_max_tokens: usize,
+        threads: usize,
+        default_enable_thinking: bool,
+        instances: usize,
+    ) -> Self {
+        let instances = instances.max(1);
+        let mut models = Vec::with_capacity(instances);
+        models.push(Mutex::new(model));
+        for _ in 1..instances {
+            let spawned = models[0].lock().unwrap_or_else(|e| e.into_inner()).spawn();
+            models.push(Mutex::new(spawned));
+        }
         Engine {
-            model: Mutex::new(model),
+            models,
+            available: Mutex::new((0..instances).collect()),
+            ready: Condvar::new(),
             tokenizer,
             model_name,
             default_max_tokens,
@@ -376,6 +446,26 @@ impl Engine {
             admission: Admission {
                 active: AtomicUsize::new(0),
             },
+        }
+    }
+
+    /// Wait for a free model instance and hold it until the lease drops.
+    fn acquire_model(&self) -> ModelLease<'_> {
+        let idx = {
+            let mut available = self.available.lock().unwrap_or_else(|e| e.into_inner());
+            while available.is_empty() {
+                available = self
+                    .ready
+                    .wait(available)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+            available.pop().unwrap()
+        };
+        let guard = self.models[idx].lock().unwrap_or_else(|e| e.into_inner());
+        ModelLease {
+            engine: self,
+            guard: Some(guard),
+            idx,
         }
     }
 
@@ -393,7 +483,7 @@ impl Engine {
         if prompt_ids.is_empty() {
             return Err("empty prompt: no tokens to generate from".into());
         }
-        let mut model = self.model.lock().unwrap_or_else(|e| e.into_inner());
+        let mut model = self.acquire_model();
         model.reset();
         const PROMPT_BATCH: usize = 32;
         let prompt_start = std::time::Instant::now();
@@ -465,7 +555,7 @@ impl Engine {
             params.max_tokens
         };
 
-        let mut model = self.model.lock().unwrap_or_else(|e| e.into_inner());
+        let mut model = self.acquire_model();
         // A supplied PrefillState lets `n > 1` choices share one prompt pass:
         // restore the post-prefill KV/DeltaNet state and the final logits.
         let (prompt_tokens, mut logits) = match prefill {
@@ -2453,6 +2543,44 @@ mod tests {
         assert_eq!(res.completion_tokens, 0);
         assert_eq!(res.finish_reason, "length");
         assert!(res.logprobs.is_empty());
+    }
+
+    #[test]
+    fn multiple_instances_serve_concurrent_requests() {
+        let engine = Arc::new(Engine::new_with_instances(
+            crate::model::Model::tiny(),
+            Tokenizer::tiny(),
+            "tiny-model".into(),
+            8,
+            1,
+            false,
+            2,
+        ));
+        let params = Params {
+            temperature: 0.0,
+            max_tokens: 4,
+            enable_thinking: false,
+            ..Default::default()
+        };
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let engine = engine.clone();
+            let p = params.clone();
+            handles.push(std::thread::spawn(move || {
+                let messages = vec![Message {
+                    role: "user".into(),
+                    content: "hi".into(),
+                    ..Default::default()
+                }];
+                engine
+                    .run_chat(&messages, &p, |_, _| true)
+                    .expect("concurrent generation should succeed")
+            }));
+        }
+        for h in handles {
+            let res = h.join().expect("worker thread panicked");
+            assert!(res.completion_tokens > 0);
+        }
     }
 
     #[test]
