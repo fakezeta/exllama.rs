@@ -315,7 +315,7 @@ and no activations cross the bus during prefill/decode.
   compiles it transitively). Device GEMMs use fp16 inputs with f32 accumulate,
   so outputs can differ slightly from the f32 CPU path.
 - Verified: `cargo test` (115 passed / 11 ignored), `cargo test --features gpu`
-  (124 passed / 11 ignored), fmt and clippy clean with and without `gpu`.
+  (126 passed / 11 ignored), fmt and clippy clean with and without `gpu`.
   Device-op tests run on candle's CPU device; **real-GPU correctness and
   throughput must be validated on the target hardware** with
   `EXLLAMA_BENCH_COMPUTE=gpu` A/B runs (the benchmark accepts `gpu` now).
@@ -344,6 +344,19 @@ changed to `rope_half < head_dim/2` so the full forward exercises partial
 rotation, and `gpu::tests::rope_preserves_unrotated_tail` checks the numbers.
 Weight-upload errors now include tensor names and dimensions. Verification:
 115 passed / 11 ignored, 124 with `--features gpu`; fmt and clippy clean.
+
+#### Follow-up device-forward audit
+A full audit found two more bugs that produced *no* shape error: 2-D q/k
+RMSNorm reduced over dim 0 (pooling statistics across heads) instead of the
+last dim, and `mat()` resolved untied `lm_head.weight` to the embedding table
+before `q()` was tried — both `(vocab, hidden)`, so logits silently came from
+the wrong weights. Fixed by reducing over the last dim and treating the
+embedding as a last-resort tied-checkpoint fallback in `linear()`. Added
+head-divisibility, projection-length, Hadamard-divisibility and context
+guards with named diagnostics. Regression tests:
+`rms_norm_2d_normalizes_each_head` and
+`linear_prefers_quantized_lm_head_over_tied_embedding`. Verification:
+115 passed / 11 ignored, 126 with `--features gpu`; fmt and clippy clean.
 
 ### REMINDER — future work: fully on-device sampling
 Sampling still runs on the host after the single logits copy. Implement

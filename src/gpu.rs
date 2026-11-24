@@ -77,6 +77,30 @@ impl GpuWeights {
         rope_half: usize,
         device: &Device,
     ) -> Result<Arc<Self>, String> {
+        // Both attention paths map query heads onto KV heads by integer
+        // division. A non-divisible count would index past the KV head array
+        // in `narrow` (or silently group the wrong heads), so reject it up
+        // front with a clear message.
+        if config.num_key_value_heads == 0
+            || !config
+                .num_attention_heads
+                .is_multiple_of(config.num_key_value_heads)
+        {
+            return Err(format!(
+                "num_attention_heads ({}) must be a multiple of num_key_value_heads ({})",
+                config.num_attention_heads, config.num_key_value_heads
+            ));
+        }
+        if config.linear_num_key_heads == 0
+            || !config
+                .linear_num_value_heads
+                .is_multiple_of(config.linear_num_key_heads)
+        {
+            return Err(format!(
+                "linear_num_value_heads ({}) must be a multiple of linear_num_key_heads ({})",
+                config.linear_num_value_heads, config.linear_num_key_heads
+            ));
+        }
         let mut mats = HashMap::new();
         for (name, m) in &ex.weights {
             if m.data.len() != m.rows * m.cols {
@@ -177,8 +201,11 @@ impl GpuWeights {
             format!("{}.weight", name),
         ];
         if name == "lm_head.weight" {
+            // EXL3 stores the (possibly quantized) head under the bare base
+            // name. The embedding table is handled as a *last* resort in
+            // `linear()` — putting it here would shadow an untied quantized
+            // head (both have shape (vocab, hidden), so no error is raised).
             out.push("lm_head".to_string());
-            out.push(format!("{}embed_tokens.weight", self.prefix));
         }
         out
     }
@@ -201,7 +228,14 @@ impl GpuWeights {
 
     /// hadamard H128 applied independently to each 128-element block.
     fn hadamard(&self, v: &Tensor) -> Result<Tensor, String> {
-        let blocks = v.dim(0).ce()? / 128;
+        let len = v.elem_count();
+        if len == 0 || !len.is_multiple_of(128) {
+            return Err(format!(
+                "Hadamard needs a multiple of 128 elements, got {}",
+                len
+            ));
+        }
+        let blocks = len / 128;
         let out = v.reshape((blocks, 128)).ce()?.matmul(&self.h128).ce()?;
         out.flatten_all().ce()
     }
@@ -209,6 +243,13 @@ impl GpuWeights {
     /// `y = W @ x`, W stored (out, in) F16. The GEMM is done on device.
     fn matmul_w(w: &Tensor, x: &Tensor) -> Result<Tensor, String> {
         let k = x.dim(0).ce()?;
+        let in_dim = w.dim(1).ce()?;
+        if in_dim != k {
+            return Err(format!(
+                "matmul: weight input dim {} does not match input length {}",
+                in_dim, k
+            ));
+        }
         let x16 = x.to_dtype(DType::F16).ce()?.reshape((k, 1)).ce()?;
         let y = w.matmul(&x16).ce()?;
         y.to_dtype(DType::F32).ce()?.flatten_all().ce()
@@ -218,10 +259,26 @@ impl GpuWeights {
     /// `y = svh * (H_n @ (W_hat^T @ (H_k @ (x * suh))))`.
     fn q_matmul(&self, parts: &(Tensor, Tensor, Tensor), x: &Tensor) -> Result<Tensor, String> {
         let (w, suh, svh) = parts;
+        if x.elem_count() != suh.elem_count() {
+            return Err(format!(
+                "quantized linear input has {} elements but suh has {}",
+                x.elem_count(),
+                suh.elem_count()
+            ));
+        }
         let xr = self.hadamard(&x.mul(suh).ce()?)?;
         let t = Self::matmul_w(w, &xr)?;
         let t = self.hadamard(&t)?;
         t.mul(svh).ce()
+    }
+
+    /// Resolve the embedding table (shared by the token lookup and the tied
+    /// lm_head fallback).
+    fn embedding_table(&self) -> Option<&Tensor> {
+        let name = format!("{}embed_tokens.weight", self.prefix);
+        self.mats
+            .get(&name)
+            .or_else(|| self.mats.get("model.embed_tokens.weight"))
     }
 
     fn linear(&self, name: &str, x: &Tensor) -> Result<Tensor, String> {
@@ -231,22 +288,46 @@ impl GpuWeights {
         if let Some(q) = self.q(name) {
             return self.q_matmul(q, x);
         }
+        // Tied checkpoints have no separate lm_head: the embedding table is
+        // the output projection. Only try it after the plain and quantized
+        // heads so an untied quantized lm_head is never shadowed.
+        if name == "lm_head.weight" {
+            if let Some(w) = self.embedding_table() {
+                return Self::matmul_w(w, x);
+            }
+        }
         Err(format!("missing linear weight `{}`", name))
     }
 
     fn embedding(&self, token: u32) -> Result<Tensor, String> {
-        let name = format!("{}embed_tokens.weight", self.prefix);
         let table = self
-            .mats
-            .get(&name)
-            .or_else(|| self.mats.get("model.embed_tokens.weight"))
+            .embedding_table()
             .ok_or_else(|| "missing embedding tensor `embed_tokens.weight`".to_string())?;
         let row = table.get(token as usize).ce()?;
         row.to_dtype(DType::F32).ce()
     }
 
     fn rms_norm(&self, x: &Tensor, w: &Tensor) -> Result<Tensor, String> {
-        let ss = x.sqr().ce()?.mean_keepdim(0).ce()?;
+        // Reduce over the *last* dim. For a 1-D `(hidden,)` vector that is the
+        // whole vector; for the 2-D `(heads, head_dim)` q/k norms it must be
+        // one scale *per head* — reducing over dim 0 instead would share a
+        // scale across heads and diverge from CPU `Model::rms_norm` (which
+        // normalizes each q/k head independently).
+        let rank = x.rank();
+        let expected_w = if rank == 2 {
+            x.dim(1).ce()?
+        } else {
+            x.elem_count()
+        };
+        if w.elem_count() != expected_w {
+            return Err(format!(
+                "RMSNorm weight has {} elements, expected {} (input rank {})",
+                w.elem_count(),
+                expected_w,
+                rank
+            ));
+        }
+        let ss = x.sqr().ce()?.mean_keepdim(rank - 1).ce()?;
         let scale = ss
             .affine(1.0, self.cfg.rms_norm_eps as f64)
             .ce()?
@@ -463,6 +544,22 @@ impl GpuRunner {
 
     /// Run the tokens on device and copy back only the final logits.
     pub(crate) fn forward(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        // Reject an overlong prompt before mutating any state. (The CPU
+        // wrapper checks this too, but the guard here keeps direct callers
+        // from leaving a half-written KV/conv state behind on error.)
+        let room = self
+            .weights
+            .cfg
+            .context_size
+            .saturating_sub(self.state.position);
+        if ids.len() > room {
+            return Err(format!(
+                "context size exceeded: position {} + {} input tokens > context {}",
+                self.state.position,
+                ids.len(),
+                self.weights.cfg.context_size
+            ));
+        }
         if ids.is_empty() {
             return Ok(vec![0.0; self.weights.cfg.vocab_size]);
         }
@@ -494,12 +591,36 @@ impl GpuRunner {
         let qp = w.linear(&format!("layers.{}.self_attn.q_proj", layer), &xn)?;
         let kp = w.linear(&format!("layers.{}.self_attn.k_proj", layer), &xn)?;
         let vp = w.linear(&format!("layers.{}.self_attn.v_proj", layer), &xn)?;
+        if qp.elem_count() != 2 * nh * hd
+            || kp.elem_count() != nkv * hd
+            || vp.elem_count() != nkv * hd
+        {
+            return Err(format!(
+                "layer {}: q/k/v projection sizes are {}/{}/{} (expected {}/{}/{})",
+                layer,
+                qp.elem_count(),
+                kp.elem_count(),
+                vp.elem_count(),
+                2 * nh * hd,
+                nkv * hd,
+                nkv * hd
+            ));
+        }
 
         // Per head the projection is [query(hd) | gate(hd)], i.e. (nh, hd*2)
         // — NOT (nh, 2, hd). Matches CPU `split_q_gate`.
         let qp2 = qp.reshape((nh, hd * 2)).ce()?;
         let q = qp2.narrow(1, 0, hd).ce()?.flatten_all().ce()?;
         let gate = qp2.narrow(1, hd, hd).ce()?.flatten_all().ce()?;
+        if q.elem_count() != nh * hd || gate.elem_count() != nh * hd {
+            return Err(format!(
+                "layer {}: split q/gate have {}/{} elements, expected {} each",
+                layer,
+                q.elem_count(),
+                gate.elem_count(),
+                nh * hd
+            ));
+        }
 
         let qn_w = w.vec(&format!("layers.{}.self_attn.q_norm.weight", layer))?;
         let kn_w = w.vec(&format!("layers.{}.self_attn.k_norm.weight", layer))?;
@@ -518,10 +639,17 @@ impl GpuRunner {
         // Write this position's K/V row into the fp16 cache.
         let kv = nkv * hd;
         let (kc, vc) = &mut self.state.full[idx];
-        if k.elem_count() != kv {
+        if q.elem_count() != nh * hd || k.elem_count() != kv {
             return Err(format!(
-                "layer {}: RoPE output has {} elements, expected nkv*head_dim={} (nkv={}, head_dim={}, rope_half={})",
-                layer, k.elem_count(), kv, nkv, hd, w.cfg.rope_half
+                "layer {}: RoPE output sizes are q={} (want {}) and k={} (want nkv*head_dim={}; nkv={}, head_dim={}, rope_half={})",
+                layer,
+                q.elem_count(),
+                nh * hd,
+                k.elem_count(),
+                kv,
+                nkv,
+                hd,
+                w.cfg.rope_half
             ));
         }
         let krow = k.reshape((1, kv)).ce()?.to_dtype(DType::F16).ce()?;
@@ -619,6 +747,16 @@ impl GpuRunner {
         let conv_dim = key_dim * 2 + val_dim;
         let kernel = cfg.linear_conv_kernel_dim;
         let cw = w.vec(&format!("layers.{}.linear_attn.conv1d.weight", layer))?;
+        if cw.elem_count() != conv_dim * kernel {
+            return Err(format!(
+                "layer {}: conv1d weight has {} elements, expected {} (conv_dim={}, kernel={})",
+                layer,
+                cw.elem_count(),
+                conv_dim * kernel,
+                conv_dim,
+                kernel
+            ));
+        }
         let cw = cw.reshape((conv_dim, kernel)).ce()?;
 
         let (conv, conv_pos, sstate) = &mut self.state.linear[layer_idx(w, layer, false)];
@@ -655,6 +793,21 @@ impl GpuRunner {
 
         let alog = w.vec(&format!("layers.{}.linear_attn.A_log", layer))?;
         let dtbias = w.vec(&format!("layers.{}.linear_attn.dt_bias", layer))?;
+        if a.elem_count() != nvh
+            || b.elem_count() != nvh
+            || alog.elem_count() != nvh
+            || dtbias.elem_count() != nvh
+        {
+            return Err(format!(
+                "layer {}: in_proj_a/b, A_log, dt_bias must each have {} elements (got {}/{}/{}/{})",
+                layer,
+                nvh,
+                a.elem_count(),
+                b.elem_count(),
+                alog.elem_count(),
+                dtbias.elem_count()
+            ));
+        }
         let ab = a.add(dtbias).ce()?;
         // Stable softplus: max(x,0) + log(1 + exp(-|x|)).
         let softplus = ab
@@ -701,6 +854,16 @@ impl GpuRunner {
         let o_all = Tensor::cat(&outs, 0).ce()?;
 
         let norm_w2 = w.vec(&format!("layers.{}.linear_attn.norm.weight", layer))?;
+        if norm_w2.elem_count() != vd || z.elem_count() != nvh * vd {
+            return Err(format!(
+                "layer {}: norm.weight has {} elements (expected {}) and in_proj_z has {} (expected {})",
+                layer,
+                norm_w2.elem_count(),
+                vd,
+                z.elem_count(),
+                nvh * vd
+            ));
+        }
         let o2 = o_all.reshape((nvh, vd)).ce()?;
         let ss = o2.sqr().ce()?.sum_keepdim(1).ce()?;
         let scale = ss
@@ -911,6 +1074,59 @@ mod tests {
             .zip([0.0f32, 0.5, -0.5, 1.0].iter())
             .map(|(v, w)| v * scale * (1.0 + w))
             .collect();
+        for (a, b) in got.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-5, "{} vs {}", a, b);
+        }
+    }
+
+    /// q_norm/k_norm pass a 2-D `(heads, head_dim)` tensor. Each head must be
+    /// normalized independently, matching CPU `forward_full_attn` — reducing
+    /// across heads instead produces one scale per feature shared by all
+    /// heads, which silently corrupts attention.
+    #[test]
+    fn rms_norm_2d_normalizes_each_head() {
+        let dev = Device::Cpu;
+        let cfg = GpuCfg {
+            num_layers: 0,
+            hidden_size: 2,
+            vocab_size: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            head_dim: 2,
+            layer_types: Vec::new(),
+            full_attention_interval: 1,
+            linear_conv_kernel_dim: 2,
+            linear_key_head_dim: 1,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_value_head_dim: 1,
+            rms_norm_eps: 1e-6,
+            context_size: 1,
+            rope_half: 0,
+        };
+        let gw = GpuWeights {
+            device: dev.clone(),
+            prefix: String::new(),
+            cfg,
+            mats: HashMap::new(),
+            qhat: HashMap::new(),
+            vecs: HashMap::new(),
+            rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
+            rope_sin: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
+            h128: Tensor::zeros((128, 128), DType::F32, &dev).unwrap(),
+        };
+        let x = Tensor::from_slice(&[3.0f32, 4.0, 5.0, 12.0], (2, 2), &dev).unwrap();
+        let w = Tensor::from_slice(&[0.0f32, 0.0], (2,), &dev).unwrap();
+        let got = gw
+            .rms_norm(&x, &w)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let scale = |a: f32, b: f32| 1.0 / ((a * a + b * b) / 2.0 + 1e-6).sqrt();
+        let (s0, s1) = (scale(3.0, 4.0), scale(5.0, 12.0));
+        let expected = [3.0 * s0, 4.0 * s0, 5.0 * s1, 12.0 * s1];
         for (a, b) in got.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-5, "{} vs {}", a, b);
         }
@@ -1202,6 +1418,97 @@ mod tests {
         let got = gw.q_matmul(&parts, &xt).unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(got.len(), n);
         assert!(got.iter().all(|v| v.is_finite()));
+    }
+
+    /// Untied checkpoints quantize lm_head under the bare name `lm_head`,
+    /// while still storing an embedding table. `linear()` must use the
+    /// quantized head, not the (correctly shaped) embedding fallback.
+    #[test]
+    fn linear_prefers_quantized_lm_head_over_tied_embedding() {
+        let dev = Device::Cpu;
+        let (k, n) = (128usize, 128usize);
+        let wf: Vec<f16> = (0..k * n)
+            .map(|i| f16::from_f32(((i * 11) % 17) as f32 / 20.0 - 0.4))
+            .collect();
+        let su: Vec<f32> = (0..k).map(|i| 1.0 + (i % 3) as f32 / 10.0).collect();
+        let sv: Vec<f32> = (0..n).map(|i| 1.0 + (i % 5) as f32 / 10.0).collect();
+        let parts = (
+            Tensor::from_slice(&wf, (n, k), &dev).unwrap(),
+            Tensor::from_slice(&su, (k,), &dev).unwrap(),
+            Tensor::from_slice(&sv, (n,), &dev).unwrap(),
+        );
+        let emb: Vec<f16> = (0..k * n)
+            .map(|i| f16::from_f32(((i * 3) % 7) as f32 / 10.0))
+            .collect();
+        let mut mats = HashMap::new();
+        mats.insert(
+            "embed_tokens.weight".to_string(),
+            Tensor::from_slice(&emb, (n, k), &dev).unwrap(),
+        );
+        let mut qhat = HashMap::new();
+        qhat.insert("lm_head".to_string(), parts.clone());
+        let cfg = GpuCfg {
+            num_layers: 0,
+            hidden_size: k,
+            vocab_size: n,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 1,
+            layer_types: Vec::new(),
+            full_attention_interval: 1,
+            linear_conv_kernel_dim: 2,
+            linear_key_head_dim: 1,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_value_head_dim: 1,
+            rms_norm_eps: 1e-6,
+            context_size: 1,
+            rope_half: 0,
+        };
+        let scale = 1.0 / 128.0f32.sqrt();
+        let mut h = vec![0.0f32; 128 * 128];
+        for i in 0..128 {
+            for j in 0..128 {
+                h[i * 128 + j] = if (i & j).count_ones() % 2 == 0 {
+                    scale
+                } else {
+                    -scale
+                };
+            }
+        }
+        let gw = GpuWeights {
+            device: dev.clone(),
+            prefix: String::new(),
+            cfg,
+            mats,
+            qhat,
+            vecs: HashMap::new(),
+            rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
+            rope_sin: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
+            h128: Tensor::from_slice(&h, (128, 128), &dev).unwrap(),
+        };
+        let x: Vec<f32> = (0..k).map(|i| (i % 7) as f32 / 10.0 - 0.3).collect();
+        let xt = Tensor::from_slice(&x, (k,), &dev).unwrap();
+        let got = gw
+            .linear("lm_head.weight", &xt)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let expected = gw.q_matmul(&parts, &xt).unwrap().to_vec1::<f32>().unwrap();
+        let tied = GpuWeights::matmul_w(gw.embedding_table().unwrap(), &xt)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for i in 0..n {
+            assert!((got[i] - expected[i]).abs() < 1e-5, "logit {} mismatch", i);
+        }
+        // Guard against a vacuous pass: the two paths must actually differ.
+        assert!(
+            got.iter()
+                .zip(tied.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-3),
+            "quantized head and tied embedding produced identical logits"
+        );
     }
 
     #[test]
