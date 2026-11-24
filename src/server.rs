@@ -111,6 +111,11 @@ pub struct GenResult {
     /// One entry per generated completion token (empty unless `logprobs` is on).
     /// Delimiters and stop tokens are excluded, matching `completion_tokens`.
     pub logprobs: Vec<TokenLogprob>,
+    /// Seconds spent in the prompt forward pass(es). `0.0` when the prompt was
+    /// restored from a shared `PrefillState` (its cost is amortized elsewhere).
+    pub prefill_seconds: f64,
+    /// Seconds spent in the decode loop (sampling + one forward per token).
+    pub decode_seconds: f64,
 }
 
 /// Post-prefill state that can be restored for every choice when `n > 1`,
@@ -558,10 +563,13 @@ impl Engine {
         let mut model = self.acquire_model();
         // A supplied PrefillState lets `n > 1` choices share one prompt pass:
         // restore the post-prefill KV/DeltaNet state and the final logits.
-        let (prompt_tokens, mut logits) = match prefill {
+        // Track prefill and decode time separately so callers (and benchmarks)
+        // can report a meaningful decode rate instead of dividing completion
+        // tokens by the total request time, which includes the prompt pass.
+        let (prompt_tokens, prefill_secs, mut logits) = match prefill {
             Some(ps) => {
                 model.restore(&ps.model);
-                (ps.prompt_tokens, ps.logits.clone())
+                (ps.prompt_tokens, 0.0, ps.logits.clone())
             }
             None => {
                 if prompt_ids.is_empty() {
@@ -584,7 +592,11 @@ impl Engine {
                         processed as f64 / secs
                     );
                 }
-                (prompt_ids.len(), logits)
+                (
+                    prompt_ids.len(),
+                    prompt_start.elapsed().as_secs_f64().max(1e-6),
+                    logits,
+                )
             }
         };
         // Clamp the generation budget to the room left in the KV cache.
@@ -605,6 +617,8 @@ impl Engine {
                 completion_tokens: 0,
                 finish_reason: "length".into(),
                 logprobs: Vec::new(),
+                prefill_seconds: prefill_secs,
+                decode_seconds: 0.0,
             });
         }
 
@@ -742,6 +756,8 @@ impl Engine {
             completion_tokens: completion.len(),
             finish_reason: finish,
             logprobs,
+            prefill_seconds: prefill_secs,
+            decode_seconds: decode_secs,
         })
     }
 
@@ -2546,6 +2562,38 @@ mod tests {
     }
 
     #[test]
+    fn generation_reports_prefill_and_decode_time_separately() {
+        let engine = tiny_engine();
+        let params = Params {
+            temperature: 0.0,
+            max_tokens: 4,
+            enable_thinking: false,
+            ..Default::default()
+        };
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "hi".into(),
+            ..Default::default()
+        }];
+
+        // A fresh request times both phases.
+        let fresh = engine.run_chat(&messages, &params, |_, _| true).unwrap();
+        assert!(fresh.prefill_seconds > 0.0, "fresh prefill must be timed");
+        assert!(fresh.decode_seconds > 0.0, "decode loop must be timed");
+        assert!(fresh.completion_tokens > 0);
+
+        // A shared (restored) prefill reports 0 for that phase — its cost is
+        // accounted for by the request that prepared it — but decode is timed.
+        let prefill = engine.prepare_chat_prefill(&messages, &params).unwrap();
+        let restored = engine
+            .run_chat_inner_with_prefill(&messages, &params, Some(&prefill), |_, _| true, |_| {})
+            .unwrap();
+        assert_eq!(restored.prompt_tokens, fresh.prompt_tokens);
+        assert_eq!(restored.prefill_seconds, 0.0);
+        assert!(restored.decode_seconds > 0.0);
+    }
+
+    #[test]
     fn multiple_instances_serve_concurrent_requests() {
         let engine = Arc::new(Engine::new_with_instances(
             crate::model::Model::tiny(),
@@ -3272,9 +3320,29 @@ mod tests {
         assert_ne!(default_seed(), default_seed());
     }
 
+    /// Thread count for the opt-in benchmarks: all available CPUs by default
+    /// (like the server), overridable with `EXLLAMA_BENCH_THREADS`.
+    fn bench_threads() -> usize {
+        std::env::var("EXLLAMA_BENCH_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            })
+    }
+
+    /// Weight cache mode for the opt-in benchmarks (`--weight-mode` equivalent).
+    fn bench_weight_mode() -> String {
+        std::env::var("EXLLAMA_BENCH_WEIGHT_MODE").unwrap_or_else(|_| "f32".into())
+    }
+
     /// Opt-in end-to-end throughput benchmark. Requires a real EXL3 model:
     ///   EXLLAMA_BENCH_MODEL=/path/to/model cargo test --release \
     ///       bench_generation_throughput -- --ignored --nocapture
+    /// Optional: EXLLAMA_BENCH_THREADS=N EXLLAMA_BENCH_WEIGHT_MODE=f16|f32|packed
     #[test]
     #[ignore]
     fn bench_generation_throughput() {
@@ -3282,10 +3350,23 @@ mod tests {
             Ok(p) => p,
             Err(_) => return,
         };
-        let model = crate::model::Model::load(&dir, 4096, 4, "f32").unwrap();
+        let threads = bench_threads();
+        let weight_mode = bench_weight_mode();
+        // The server calls both at startup; benchmarks must do the same.
+        // Without them matmuls run sequentially (no threadpool) and fall back
+        // to single-threaded sgemm, making the numbers unrepresentative.
+        crate::threadpool::init(threads);
+        let backend = crate::compute::init("auto", threads);
+        eprintln!(
+            "BENCH config: threads={} weight_mode={} backend={}",
+            threads,
+            weight_mode,
+            backend.name()
+        );
+        let model = crate::model::Model::load(&dir, 4096, threads, &weight_mode).unwrap();
         let tok_path = std::path::Path::new(&dir).join("tokenizer.json");
         let tokenizer = Tokenizer::load(&tok_path.to_string_lossy()).unwrap();
-        let engine = Engine::new(model, tokenizer, "bench".into(), 32, 4, true);
+        let engine = Engine::new(model, tokenizer, "bench".into(), 32, threads, true);
         let params = Params {
             temperature: 0.0,
             max_tokens: 32,
@@ -3302,14 +3383,27 @@ mod tests {
         let res = engine.run_chat(&messages, &params, |_, _| true).unwrap();
         let secs = t0.elapsed().as_secs_f64().max(1e-6);
         let total = res.prompt_tokens + res.completion_tokens;
+        // Time the two phases separately: completion tokens / total request
+        // time was mislabeled "decode tok/s" (it included the prompt pass).
+        let prefill_rate = if res.prefill_seconds > 0.0 {
+            res.prompt_tokens as f64 / res.prefill_seconds
+        } else {
+            0.0
+        };
+        let decode_rate = if res.decode_seconds > 0.0 {
+            res.completion_tokens as f64 / res.decode_seconds
+        } else {
+            0.0
+        };
         eprintln!(
             "BENCH generation: {} prompt + {} completion tokens in {:.2}s \
-             ({:.2} tok/s overall, {:.2} decode tok/s, finish={})",
+             ({:.2} tok/s overall, {:.2} prefill tok/s, {:.2} decode tok/s, finish={})",
             res.prompt_tokens,
             res.completion_tokens,
             secs,
             total as f64 / secs,
-            res.completion_tokens as f64 / secs,
+            prefill_rate,
+            decode_rate,
             res.finish_reason
         );
     }
@@ -3325,10 +3419,20 @@ mod tests {
             Ok(p) => p,
             Err(_) => return,
         };
-        let model = crate::model::Model::load(&dir, 4096, 4, "f32").unwrap();
+        let threads = bench_threads();
+        let weight_mode = bench_weight_mode();
+        crate::threadpool::init(threads);
+        let backend = crate::compute::init("auto", threads);
+        eprintln!(
+            "BENCH config: threads={} weight_mode={} backend={}",
+            threads,
+            weight_mode,
+            backend.name()
+        );
+        let model = crate::model::Model::load(&dir, 4096, threads, &weight_mode).unwrap();
         let tok_path = std::path::Path::new(&dir).join("tokenizer.json");
         let tokenizer = Tokenizer::load(&tok_path.to_string_lossy()).unwrap();
-        let engine = Engine::new(model, tokenizer, "bench".into(), 32, 4, false);
+        let engine = Engine::new(model, tokenizer, "bench".into(), 32, threads, false);
         let params = Params {
             temperature: 0.0,
             max_tokens: 16,

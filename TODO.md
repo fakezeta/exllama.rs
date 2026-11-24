@@ -61,8 +61,9 @@ checked off with a short note; open items are unchecked.
   grouping/scale/gate and the DeltaNet recurrence (with decay). `model.rs`
   now has 7 unit tests.
 - [x] **(P1) Fix doc drift.** Done — `AGENTS.md` counts/line numbers, `TODO.md`
-  stale "next steps", and this plan's baseline are updated to 107 passed /
-  11 ignored (88 after Phase 0, 99 after Phase 1, 102 after Phase 2).
+  stale "next steps", and this plan's baseline are updated to 108 passed /
+  11 ignored (88 after Phase 0, 99 after Phase 1, 102 after Phase 2, 108 after
+  the benchmark fixes).
 - [x] **(P1) Bounded request-line reading.** Done — see plan Phase 1 #4:
   `read_request()` reads the request line and headers through
   `Read::take(MAX_HEADER_BYTES + 1)` and rejects overlong lines. `http::tests`
@@ -194,7 +195,7 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 - [ ] **(P2) Structured logging** with configurable verbosity (`RUST_LOG`-like env var). A temporary `EXLLAMA_DEBUG` logit dump exists but is ad-hoc.
 - [ ] **(P2) Docker image / Dockerfile** for easy deployment.
 - [x] **(P2) Example/test scripts.** Done — `tests/` contains smoke and diagnostic scripts with `tests/README.md`.
-- [x] **(P3) Benchmark suite (baseline).** Ignored tests `bench_generation_throughput` (requires `EXLLAMA_BENCH_MODEL`), `bench_blas_vs_scalar`, `bench_quant_matmul` and `profile_packed_decode_vs_dot` cover end-to-end, CPU and quantized paths.
+- [x] **(P3) Benchmark suite (baseline).** Ignored tests `bench_generation_throughput` (requires `EXLLAMA_BENCH_MODEL`), `bench_blas_vs_scalar`, `bench_quant_matmul` and `profile_packed_decode_vs_dot` cover end-to-end, CPU and quantized paths. `bench_generation_throughput` and `bench_n_choices_prefill_reuse` now initialize the threadpool/compute backend like the server, take `EXLLAMA_BENCH_THREADS` / `EXLLAMA_BENCH_WEIGHT_MODE`, and report prefill vs decode time separately (the old "decode tok/s" divided by total time).
 
 ---
 

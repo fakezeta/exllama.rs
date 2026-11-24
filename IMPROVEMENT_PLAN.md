@@ -16,7 +16,7 @@ criteria.
 - At review: `cargo test` **84 passed, 4 ignored**. After Phase 0:
   **88 passed, 10 ignored**. After Phase 1: **99 passed, 10 ignored**. After
   Phase 2: **102 passed, 11 ignored**; after the deferred Phase 2 work:
-  **107 passed, 11 ignored** (6 real-model / `/tmp` fixtures explicitly ignored
+  **108 passed, 11 ignored** (6 real-model / `/tmp` fixtures explicitly ignored
   with reasons, 5 benchmarks). `cargo fmt --all -- --check` and
   `cargo clippy --all-targets -- -D warnings` remain clean; the GPU feature
   also compiles and its cache-key test passes.
@@ -250,3 +250,11 @@ prefill, bounded admission, multiple Arc-shared model instances (`--instances`),
 fp16 KV cache, fp16 tied embeddings, and the direct-LUT packed decode. Real-model
 timing/RSS numbers still need `EXLLAMA_BENCH_MODEL`. Do not commit until the
 user explicitly approves.
+
+**Post-review benchmark fixes (not a new phase):** the opt-in benchmarks now
+initialize the threadpool and compute backend exactly like the server (before,
+matmuls ran single-threaded and the thread count was ignored), accept
+`EXLLAMA_BENCH_THREADS` / `EXLLAMA_BENCH_WEIGHT_MODE`, and report prefill and
+decode rates separately via new `GenResult` timing fields — the old
+"decode tok/s" was completion tokens divided by total request time (including
+the prompt pass). Verified: 108 passed / 11 ignored, fmt and clippy clean.

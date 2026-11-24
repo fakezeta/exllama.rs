@@ -23,7 +23,7 @@ This document is a complete orienteering guide for AI agents (or humans) continu
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build                      # debug
 cargo build --release            # optimized binary at target/release/exllama-server
-cargo test                       # 107 unit tests (11 ignored: real-model / /tmp fixtures + benchmarks)
+cargo test                       # 108 unit tests (11 ignored: real-model / /tmp fixtures + benchmarks)
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings   # must pass (CI enforces)
 ```
@@ -134,7 +134,7 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 
 ### `src/server.rs` — Inference engine + API handlers
 - `Engine { models: Vec<Mutex<Model>>, available, ready, tokenizer, model_name, default_max_tokens, threads, default_enable_thinking }`.
-- `GenResult { text, reasoning_content, prompt_tokens, completion_tokens, finish_reason, logprobs }`.
+- `GenResult { text, reasoning_content, prompt_tokens, completion_tokens, finish_reason, logprobs, prefill_seconds, decode_seconds }`. The two timing fields let callers report a true decode rate (completion tokens / decode time) instead of dividing by total request time. A restored `PrefillState` reports `prefill_seconds = 0.0` because its cost is amortized over the choices that shared it.
 - `PrefillState` + `prepare_prefill()` / `prepare_chat_prefill()` / `prepare_completion_prefill()` — one prompt forward pass captured as a `Model::snapshot()` plus final logits; `generate_inner` takes `Option<&PrefillState>` and restores it for each choice. Both endpoints prepare once when `n > 1`.
 - Bounded admission: `Engine::try_admit()` reserves one of `MAX_QUEUED_REQUESTS = 16` slots (RAII `AdmissionGuard`); excess requests get a 429 instead of piling up. `Engine` owns `models: Vec<Mutex<Model>>` with an available-slot `Vec` + `Condvar`; `ModelLease` hands out one instance for the whole request. `--instances N` (default 1) creates N instances sharing the Arc model core; extra instances cost state, not weights.
 - `Params` (Clone) adds `n`, `user`, `response_format`, `logprobs`, `top_logprobs` and an internal `deadline: Option<Instant>` override (never set by the API; used by tests). `parse_params_inner(body, engine, chat)` handles the different chat/completions shapes (`logprobs` bool vs integer). `ResponseFormat::JsonObject` adds a best-effort prompt hint (`apply_response_format_chat/text`); no constrained decoding.
@@ -340,6 +340,22 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 - Verify dequantization with a tiny synthetic EXL3 model if possible.
 - Sampling: `temperature <= 0` → argmax.
 
+### Benchmark a real model
+```bash
+EXLLAMA_BENCH_MODEL=/path/to/model cargo test --release \
+  bench_generation_throughput -- --ignored --nocapture
+# optional: EXLLAMA_BENCH_THREADS=N (default: all CPUs)
+#           EXLLAMA_BENCH_WEIGHT_MODE=f16|f32|packed (default: f32)
+```
+The opt-in benchmarks initialize the global threadpool and compute backend
+**exactly like `main()` does** — do not remove those calls. Without them,
+`threadpool::run()` executes jobs sequentially and `compute::backend()` falls
+back to single-threaded sgemm, so the reported tok/s is a single-core number
+that ignores `--threads`. The report splits prefill and decode time; use the
+`decode tok/s` figure, not completion-tokens-over-total-time. Load time and RSS
+are dominated by the f32 decode cache (8x on-disk at 4 bpw); `--weight-mode f16`
+roughly halves both at near-f32 speed.
+
 ---
 
 ## 8. Known Limitations & Gotchas
@@ -391,7 +407,7 @@ Final: `x = RMSNorm(x)`; `logits = lm_head(x)`.
 | `tests::cli_parses_instance_count` | `--instances` parsing and bounds |
 | `fuzz::tests` | Seeded random inputs against JSON/HTTP/regex/chat/tokenizer/API parsers (no panics) |
 
-Run `cargo test` — 107 pass, 11 ignored on the current state. The ignored set
+Run `cargo test` — 108 pass, 11 ignored on the current state. The ignored set
 is 6 real-model / `/tmp`-fixture tests (now explicitly marked with reasons) plus
 5 benchmarks (including `bench_n_choices_prefill_reuse`). On a fresh clone the dequantization/matmul guarantee is still
 verified by the committed synthetic fixtures.
