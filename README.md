@@ -236,9 +236,20 @@ GitHub Actions builds and tests on every push and pull request for:
 | macOS ARM64 | `macos-latest` | `aarch64-apple-darwin` | `gpu-metal` |
 | Windows x86_64 | `windows-latest` | `x86_64-pc-windows-msvc` | — |
 
-The macOS build enables `gpu-metal` (Metal ships with macOS, so no extra setup). On tagged releases (`v*`), the **Release** workflow builds optimized binaries for all four targets and attaches them to a GitHub Release.
+The macOS build enables `gpu-metal` (Metal ships with macOS, so no extra setup).
 
-**GPU (CUDA) binaries:** the **Release (GPU builds)** workflow (`.github/workflows/release-gpu.yml`) is manually triggered via `workflow_dispatch`. It installs the CUDA toolkit (nvcc) and builds Linux/Windows binaries with `--features gpu-cuda`, optionally attaching them to an existing release by tag. It's separate because stock GitHub runners lack nvcc and CUDA adds ~2-3 GB / several minutes to CI.
+On tagged releases (`v*`), the **Release** workflow (`.github/workflows/release.yml`) builds and attaches **all six** binaries to the GitHub Release:
+
+| Archive | Runner | Features |
+|---------|--------|----------|
+| `exllama-server-linux-x86_64.tar.gz` | `ubuntu-latest` | — |
+| `exllama-server-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | — |
+| `exllama-server-macos-arm64.tar.gz` | `macos-latest` | `gpu-metal` |
+| `exllama-server-windows-x86_64.zip` | `windows-latest` | — |
+| `exllama-server-linux-x86_64-gpu-cuda.tar.gz` | `ubuntu-24.04` | `gpu-cuda` |
+| `exllama-server-windows-x86_64-gpu-cuda.zip` | `windows-2022` | `gpu-cuda` |
+
+The CUDA legs install the toolkit (nvcc, CUDA 12.6) on pinned runners — `ubuntu-latest` (26.04) has no CUDA 12.6 packages, and `windows-latest` ships an MSVC version CUDA 12.6 rejects. A CUDA build failure blocks the release, so a published tag always includes the GPU binaries. The old manually triggered `release-gpu.yml` workflow was removed; its binaries are now built automatically on every tag.
 
 ## License
 

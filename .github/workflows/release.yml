@@ -7,42 +7,119 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Headless runners have no GPU for nvidia-smi. candle-kernels (cudaforge) needs
+  # an explicit arch to generate PTX. sm_80 (Ampere) PTX is forward-compatible
+  # and JIT-compiles on newer NVIDIA GPUs at runtime. Ignored by CPU builds.
+  CUDA_COMPUTE_CAP: '80'
 
 permissions:
   contents: write
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - name: linux-x86_64
+            os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: exllama-server-linux-x86_64.tar.gz
             features: ""
-          - os: ubuntu-24.04-arm
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             archive: exllama-server-linux-arm64.tar.gz
             features: ""
-          - os: macos-latest
+          - name: macos-arm64
+            os: macos-latest
             target: aarch64-apple-darwin
             archive: exllama-server-macos-arm64.tar.gz
             features: "gpu-metal"
-          - os: windows-latest
+          - name: windows-x86_64
+            os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: exllama-server-windows-x86_64.zip
             features: ""
+          # GPU legs. CUDA requires pinned runners: ubuntu-latest (26.04) has no
+          # CUDA 12.6 repo packages, and windows-latest ships MSVC 14.52 which
+          # CUDA 12.6 rejects. Any GPU failure blocks the release so a tag never
+          # publishes without its GPU binaries.
+          - name: linux-x86_64-gpu-cuda
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: exllama-server-linux-x86_64-gpu-cuda.tar.gz
+            features: "gpu-cuda"
+            cuda: true
+          - name: windows-x86_64-gpu-cuda
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            archive: exllama-server-windows-x86_64-gpu-cuda.zip
+            features: "gpu-cuda"
+            cuda: true
 
     steps:
       - uses: actions/checkout@v4
 
+      # --- CUDA setup (GPU legs only): stock runners have no nvcc, and
+      # candle-kernels / cudarc need it to compile the CUDA backend. -----------
+      - name: Install CUDA repo + compiler (Linux)
+        if: matrix.cuda && runner.os == 'Linux'
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.6.0'
+          method: network
+          sub-packages: '["nvcc", "cudart", "nvrtc"]'
+          log-file-suffix: ${{ matrix.name }}
+
+      # The action's sub-packages input prepends "cuda-"; several 12.6 libs
+      # actually use a "lib" prefix, so install those explicitly.
+      - name: Install CUDA libraries (Linux)
+        if: matrix.cuda && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install \
+            libcublas-12-6 libcublas-dev-12-6 \
+            libcurand-12-6 libcurand-dev-12-6 \
+            cuda-cudart-dev-12-6 cuda-nvrtc-dev-12-6 \
+            cuda-driver-dev-12-6
+
+      - name: Install CUDA (Windows)
+        if: matrix.cuda && runner.os == 'Windows'
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.6.0'
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "nvrtc", "nvrtc_dev"]'
+
+      # nvcc invokes cl.exe on MSVC; Visual Studio is installed but not on PATH
+      # unless the developer command prompt is sourced.
+      - name: Set up MSVC environment (Windows)
+        if: matrix.cuda && runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # cudaforge passes -allow-unsupported-compiler when NVCC_CCBIN is set.
+      - name: Allow current MSVC for nvcc (Windows)
+        if: matrix.cuda && runner.os == 'Windows'
+        shell: pwsh
+        run: '"NVCC_CCBIN=cl.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8'
+
+      - name: Verify nvcc
+        if: matrix.cuda
+        run: nvcc --version
+
+      # --- Common build / package / upload ----------------------------------
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.features || 'cpu' }}
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
