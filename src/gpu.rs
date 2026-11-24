@@ -158,14 +158,12 @@ impl GpuWeights {
             }
         }
         let h128 = Tensor::from_slice(&h, (128, 128), device).ce()?;
-        // Fold both Hadamards into every W_hat once at load. The decode path
-        // then needs a single GEMV per quantized linear instead of two
-        // Hadamard GEMMs plus the W_hat GEMV.
+        // `upload_device` folds both Hadamards into W_hat on the host and
+        // uploads only the final matrix, so the device never needs the
+        // full-size intermediates a device-side fold would allocate.
         let mut qhat = HashMap::new();
         for (name, ql) in &ex.linears {
             let (w, suh, svh) = ql.upload_device(device)?;
-            let w = fold_hadamards(&w, &h128)
-                .map_err(|e| format!("{}: fold Hadamards into W_hat: {}", name, e))?;
             qhat.insert(name.clone(), (w, suh, svh));
         }
         let mut vecs = HashMap::new();
@@ -2080,18 +2078,37 @@ mod tests {
         let t = gw.hadamard(&t).unwrap();
         let expected = t.mul(&svh).unwrap().to_vec1::<f32>().unwrap();
 
-        // New decode path: folded weight, one GEMV.
+        // New decode path: one GEMV. Test both the device-side reference fold
+        // and the host fold used by `upload_device` in production.
         let folded = (fold_hadamards(&w, &h128).unwrap(), suh.clone(), svh.clone());
         let got = gw.q_matmul(&folded, &xt).unwrap().to_vec1::<f32>().unwrap();
-        // Observed max error ~0.3% of the largest logit (two extra fp16
-        // roundings from baking the Hadamards into the weight).
+        let host_bits = crate::exl3::fold_hadamards_host(&wf, n, k).unwrap();
+        let host_parts = (
+            Tensor::from_slice(&host_bits, (n, k), &dev).unwrap(),
+            suh.clone(),
+            svh.clone(),
+        );
+        let host_got = gw
+            .q_matmul(&host_parts, &xt)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // Observed max error ~0.3% of the largest logit (extra fp16 roundings
+        // from baking the Hadamards into the weight).
         let scale = got.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
             assert!(
                 (a - b).abs() < 5e-3 + 5e-3 * scale,
-                "logit {}: folded {} vs unfolded {}",
+                "logit {}: device-folded {} vs unfolded {}",
                 i,
                 a,
+                b
+            );
+            assert!(
+                (host_got[i] - b).abs() < 5e-3 + 5e-3 * scale,
+                "logit {}: host-folded {} vs unfolded {}",
+                i,
+                host_got[i],
                 b
             );
         }

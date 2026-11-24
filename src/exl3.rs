@@ -393,7 +393,7 @@ pub(crate) fn hadamard128(data: &mut [f32], base: usize, stride: usize, scale: f
 }
 
 /// Apply H_k (transform each 128-row block, for every column): `W = H_k @ W`.
-fn hadamard_rows(w: &mut [f32], rows: usize, cols: usize) {
+pub(crate) fn hadamard_rows(w: &mut [f32], rows: usize, cols: usize) {
     let scale = 1.0 / (128.0f32).sqrt();
     // Read a 128-element column slice into a stack buffer, transform it
     // contiguously, then write it back. The old strided butterfly touched 128
@@ -413,13 +413,40 @@ fn hadamard_rows(w: &mut [f32], rows: usize, cols: usize) {
 }
 
 /// Apply H_n (transform each 128-column block, for every row): `W = W @ H_n`.
-fn hadamard_cols(w: &mut [f32], rows: usize, cols: usize) {
+pub(crate) fn hadamard_cols(w: &mut [f32], rows: usize, cols: usize) {
     let scale = 1.0 / (128.0f32).sqrt();
     for cb in 0..(cols / 128) {
         for i in 0..rows {
             hadamard128(w, i * cols + cb * 128, 1, scale);
         }
     }
+}
+
+/// Fold both 128-block Hadamards into a W_hat `(n, k)` **on the host**, before
+/// the tensor is uploaded. Doing it here instead of with device matmuls keeps
+/// the GPU free of full-size intermediates: a 248320x1024 lm_head is ~508 MB
+/// in fp16, and the device fold needed several such buffers at once, which
+/// OOM'd on cards that already had ~3 GB in use by other processes.
+#[cfg(feature = "gpu")]
+pub(crate) fn fold_hadamards_host(
+    w: &[half::f16],
+    n: usize,
+    k: usize,
+) -> Result<Vec<half::f16>, String> {
+    if w.len() != n * k || n == 0 || k == 0 || !n.is_multiple_of(128) || !k.is_multiple_of(128) {
+        return Err(format!(
+            "W_hat dims {}x{} must both be non-zero multiples of 128 (buffer has {} values)",
+            n,
+            k,
+            w.len()
+        ));
+    }
+    // `hadamard_rows` applies H to each 128-row block: H_n @ W (rows are n).
+    // `hadamard_cols` applies H to each 128-column block: (H_n @ W) @ H_k.
+    let mut f: Vec<f32> = w.iter().map(|v| v.to_f32()).collect();
+    hadamard_rows(&mut f, n, k);
+    hadamard_cols(&mut f, n, k);
+    Ok(f.into_iter().map(half::f16::from_f32).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1115,10 +1142,12 @@ impl QuantLinear {
         Ok(())
     }
 
-    /// Upload this linear's W_hat directly to a device as an fp16 tensor.
-    /// Used by the device-resident GPU forward: the trellis is decoded once at
-    /// load and never crosses the bus again. Returns (W_hat (n,k) F16,
-    /// suh (k,) F32, svh (n,) F32).
+    /// Decode this linear's trellis, fold both Hadamards into W_hat on the
+    /// host, and upload the folded matrix as fp16. Used by the device-resident
+    /// GPU forward: the trellis is decoded once at load and never crosses the
+    /// bus again, and no full-size temporary weights are allocated on device.
+    /// Returns (folded W_hat `B = H_n @ W_hat @ H_k` (n,k) F16, suh (k,) F32,
+    /// svh (n,) F32).
     #[cfg(feature = "gpu")]
     pub(crate) fn upload_device(
         &self,
@@ -1157,9 +1186,15 @@ impl QuantLinear {
                 }
             }
         }
+        // Fold both Hadamards on the host, before upload. The device only
+        // ever allocates the final (n, k) tensor; doing this with device
+        // matmuls needed several full-size buffers and OOM'd on large
+        // linears (notably the vocab-sized lm_head).
+        let bits = fold_hadamards_host(&bits, self.n, self.k)
+            .map_err(|e| format!("{}: {}", self.name, e))?;
         let w = Tensor::from_slice(&bits, (self.n, self.k), device).map_err(|e| {
             format!(
-                "{}: upload W_hat ({}x{}, {} values): {}",
+                "{}: upload folded W_hat ({}x{}, {} values): {}",
                 self.name,
                 self.n,
                 self.k,
