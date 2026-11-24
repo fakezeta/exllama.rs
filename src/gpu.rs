@@ -1207,44 +1207,42 @@ fn layer_idx(w: &GpuWeights, layer: usize, _is_full: bool) -> usize {
 /// Fold both 128-block Hadamards into an EXL3 W_hat *at load time*, so each
 /// decode step needs one GEMV instead of two Hadamard GEMMs plus the W_hat GEMV.
 ///
-/// `w` is W_hat `(k, n)` F16, `h128` the normalized Sylvester H128 F32. Returns
-/// `B = (H_n @ W_hat^T @ H_k)^T` `(n, k)` F16: apply `H_k` to every 128-row
-/// block of W_hat, then `H_n` to every 128-column block, then transpose (both
-/// H matrices are symmetric and orthogonal).
+/// `w` is W_hat `(n, k)` F16, `h128` the normalized Sylvester H128 F32. Returns
+/// `B = H_n @ W_hat @ H_k`, also `(n, k)` F16. `H_n` is applied to each 128-row
+/// block and `H_k` to each 128-column block (both H matrices are symmetric and
+/// orthogonal). `(n, k)` is preserved — transposing it silently breaks every
+/// non-square quantized linear with an opaque `matmul` dimension error.
 pub(crate) fn fold_hadamards(w: &Tensor, h128: &Tensor) -> Result<Tensor, String> {
-    let k = w.dim(0).ce()?;
-    let n = w.dim(1).ce()?;
-    if k == 0 || n == 0 || !k.is_multiple_of(128) || !n.is_multiple_of(128) {
+    // W_hat is stored (n, k): output features first, input features second.
+    let n = w.dim(0).ce()?;
+    let k = w.dim(1).ce()?;
+    if n == 0 || k == 0 || !n.is_multiple_of(128) || !k.is_multiple_of(128) {
         return Err(format!(
             "W_hat dims {}x{} must both be non-zero multiples of 128",
-            k, n
+            n, k
         ));
     }
     let h = h128.to_dtype(DType::F16).ce()?;
-    let kb = k / 128;
-    // H_k @ W_hat: apply H to each 128-row block. Each block is permuted to
-    // (n,128) so a right-multiply by H^T (== H) applies H to its rows.
-    let rows = w
-        .reshape((kb, 128, n))
-        .ce()?
-        .permute((0, 2, 1))
-        .ce()?
-        .matmul(&h.repeat((kb, 1, 1)).ce()?.t().ce()?)
-        .ce()?
-        .permute((0, 2, 1))
-        .ce()?
-        .reshape((k, n))
-        .ce()?;
-    // (H_k @ W_hat) @ H_n: apply H to each 128-column block of every row.
+    // Left H_n: H @ block for each 128-row block of W_hat -> (n, k).
     let nb = n / 128;
+    let rows = h
+        .repeat((nb, 1, 1))
+        .ce()?
+        .matmul(&w.reshape((nb, 128, k)).ce()?)
+        .ce()?
+        .reshape((n, k))
+        .ce()?;
+    // Right H_k: block @ H^T for each 128-column block -> (n, k).
+    // H is symmetric, so block @ H^T == H @ block.
+    let kb = k / 128;
     let cols = rows
-        .reshape((k * nb, 128))
+        .reshape((n * kb, 128))
         .ce()?
         .matmul(&h.t().ce()?)
         .ce()?
-        .reshape((k, n))
+        .reshape((n, k))
         .ce()?;
-    cols.t().ce()
+    Ok(cols)
 }
 
 /// Batched GQA with a per-head output gate. `kc`/`vc` are `(context, nkv*hd)`
@@ -2048,8 +2046,8 @@ mod tests {
     #[test]
     fn folded_q_matmul_matches_unfolded() {
         let dev = Device::Cpu;
-        // Two 128-blocks each way so block boundaries are exercised.
-        let (k, n) = (256usize, 256usize);
+        // Non-square: k=128 (one H_k block), n=256 (two H_n blocks).
+        let (k, n) = (128usize, 256usize);
         let wf: Vec<f16> = (0..k * n)
             .map(|i| f16::from_f32(((i * 11) % 17) as f32 / 20.0 - 0.4))
             .collect();
@@ -2122,6 +2120,34 @@ mod tests {
                 a,
                 b
             );
+        }
+    }
+
+    /// Guard specifically against the v0.5.3 load bug where `fold_hadamards`
+    /// read W_hat's `(n, k)` dims backwards and transposed the result, so any
+    /// non-square quantized linear failed with a `matmul` dimension error.
+    #[test]
+    fn fold_preserves_shape_for_non_square_weights() {
+        let dev = Device::Cpu;
+        let scale = 1.0 / 128.0f32.sqrt();
+        let mut h = vec![0.0f32; 128 * 128];
+        for i in 0..128 {
+            for j in 0..128 {
+                h[i * 128 + j] = if (i & j).count_ones() % 2 == 0 {
+                    scale
+                } else {
+                    -scale
+                };
+            }
+        }
+        let h128 = Tensor::from_slice(&h, (128, 128), &dev).unwrap();
+        for (n, k) in [(256usize, 128usize), (128, 256), (1024, 128), (128, 1024)] {
+            let w = Tensor::from_slice(&vec![f16::from_f32(0.1); n * k], (n, k), &dev).unwrap();
+            let folded = fold_hadamards(&w, &h128).unwrap();
+            assert_eq!(folded.dims(), &[n, k], "folded shape for {}x{}", n, k);
+            let x = Tensor::from_slice(&vec![0.5f32; k], (k,), &dev).unwrap();
+            let out = GpuWeights::matmul_w(&folded, &x).unwrap();
+            assert_eq!(out.elem_count(), n, "output length for {}x{}", n, k);
         }
     }
 
