@@ -479,6 +479,7 @@ name = "exllama-server"
 version = "0.4.3"
 dependencies = [
  "candle-core",
+ "half",
  "matrixmultiply",
 ]
 

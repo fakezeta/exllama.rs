@@ -8,11 +8,11 @@ This document is a complete orienteering guide for AI agents (or humans) continu
 
 **Goal:** A minimal Rust inference server for ExLlamaV3 (EXL3) quantized models, focused on the **Qwen3.5 text decoder** (`Qwen3_5ForConditionalGeneration` / `Qwen3_5ForCausalLM`). It exposes an OpenAI-compatible HTTP API.
 
-**Dependency policy:** JSON, HTTP, tokenizer, regex, PRNG and dequantizer are hand-written in `src/` with the standard library only. The only (non-optional) crate is `matrixmultiply` for the SIMD sgemm kernel; `candle-core` is opt-in for GPU. Do not add general-purpose crates (serde, tokio, serde_json, etc.) without explicit approval.
+**Dependency policy:** JSON, HTTP, tokenizer, regex, PRNG and dequantizer are hand-written in `src/` with the standard library only. The only (non-optional) crate is `matrixmultiply` for the SIMD sgemm kernel; `candle-core` and `half` are opt-in for GPU. Do not add general-purpose crates (serde, tokio, serde_json, etc.) without explicit approval.
 
 **Model scope:** Qwen3.5 only. The vision tower of multimodal checkpoints is ignored; text-only inference works. Other architectures are out of scope.
 
-**Runtime:** CPU only. No GPU/CUDA/Python needed at runtime.
+**Runtime:** CPU by default; optional GPU builds (`gpu-metal`/`gpu-cuda`) run a device-resident forward. No Python needed at runtime.
 
 ---
 
@@ -24,6 +24,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cargo build                      # debug
 cargo build --release            # optimized binary at target/release/exllama-server
 cargo test                       # 115 unit tests (11 ignored: real-model / /tmp fixtures + benchmarks)
+cargo test --features gpu        # 121 tests (adds device-op tests on candle's CPU device)
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings   # must pass (CI enforces)
 ```
@@ -94,8 +95,15 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 - CLI `--compute auto|blas|gpu|scalar`. Global `OnceLock<Compute>` holds backend + optional candle device.
 - **NOTE:** for CPU decode GEMV (memory-bound), the hand-written threaded scalar dot is typically 3-4x *faster* than sgemm — so `auto` often picks `scalar`. That is expected, not a regression. sgemm wins for matrix-matrix (prefill batches).
 - `blas-src`/`openblas-src` were rejected: netlib needs a Fortran compiler, OpenBLAS needs a native lib — both break portable CI. `matrixmultiply` is pure Rust with SIMD kernels (the sgemm core used by ndarray).
-- Cargo features: `gpu` (candle-core), `gpu-metal` (Apple), `gpu-cuda` (NVIDIA); default build has no GPU deps.
-- GPU weight cache keys include a cheap fingerprint of sampled weight elements alongside `(pointer, rows, cols)`, so a recycled address cannot reuse a stale device tensor. `weight_fingerprint` has a GPU-only unit test.
+- Cargo features: `gpu` (candle-core + half), `gpu-metal` (Apple), `gpu-cuda` (NVIDIA); default build has no GPU deps.
+- GPU weight cache keys include a cheap fingerprint of sampled weight elements alongside `(pointer, rows, cols)`, so a recycled address cannot reuse a stale device tensor. `weight_fingerprint` has a GPU-only unit test. **Note:** the device-resident path in `gpu.rs` supersedes `compute::gpu_matmul` for quantized linears; the latter remains for plain matrices on the CPU fallback and for the old host-forward path.
+
+### `src/gpu.rs` — Device-resident decoder (feature `gpu`)
+- Built only with a `gpu` feature. `GpuWeights::build()` decodes all EXL3 W_hat tiles **once at load** and uploads them as fp16 device tensors; plain matrices and embeddings are uploaded as fp16, vectors/RoPE/H128 as fp32. No weight crosses the bus during inference.
+- `GpuRunner` owns shared `Arc<GpuWeights>` plus per-instance `GpuState`; `Model` delegates `forward()` to it when the GPU backend is active. Activations, fp16 KV cache and DeltaNet conv/recurrent state all stay on device for the whole request. Only the input token ids and the final logits cross host/device — one logits copy per `Model::forward` call (for prefill with many tokens: one copy for the whole prompt).
+- All forward math is reimplemented with candle tensor ops: RMSNorm, partial RoPE, per-128-block Hadamard, GQA attention with sigmoid gate, depthwise conv1d, Gated DeltaNet recurrence, per-head gated RMSNorm and the MLP. The CPU path in `model.rs` is unchanged and remains the fallback.
+- With the GPU backend, `Model::load()` loads EXL3 with the `packed` mode (host trellis as small fallback source) and ignores `--weight-mode`; logs `[gpu] device-resident forward active`.
+- **Future work:** sampling is still done on the host after the logits copy. Move temperature/top-k/top-p/greedy sampling onto the device so only the chosen token id crosses back (tracked in `TODO.md` and `IMPROVEMENT_PLAN.md`).
 
 ### `src/rng.rs` — SplitMix64 PRNG
 - `Rng::new(seed)`, `next_f64() -> f64`, `next_u32()`, private `next_u64()`. Used for sampling.
@@ -371,7 +379,7 @@ it matters — use `EXLLAMA_BENCH_COMPUTE` to A/B it on a given host.
 ## 8. Known Limitations & Gotchas
 
 - **Memory vs speed:** `--weight-mode` trades RAM for tokens/s, but the ranking is host-dependent. Measured on a 12th-gen x86 host (10 threads, 4 bpw 0.8B): `f32` (default) loads in ~10.6 s and decodes at **~11.9 tok/s** — the fastest decode mode there; `f16` (~2× on-disk) loads in ~10.3 s after the `decode_bits` LUT fix (54.6 s before it — its cache build used per-codeword arithmetic while f32 used a LUT) and decodes at ~8.6 tok/s; `packed` (~1× on-disk) loads in ~6.8 s but decodes at ~1.6 tok/s — not interactive. On CPU, SIMD on `dot()` would not help the packed path; its bottleneck is codebook decode, not the MACs. Tied-embedding models skip the lm_head decode (plain embedding matrix used directly). Peak RAM during load includes raw shard bytes plus decoded caches (in `f32` mode, several times on-disk); the old "≈ 2× on-disk" claim was inaccurate. Plain 2-D tensors are decoded once (previously stored in both `vectors` and `weights`), trellis byte ranges are compacted away after the linear pass, and untied embedding tables are stored as fp16 with per-row decode. Tied models no longer keep a ~1 GB f32 embedding: all plain embeddings are fp16 and tied `lm_head` uses the threaded `matmul_f16`. The full-attention KV cache is fp16 (2 bytes/value, LUT-decoded per step), halving context RAM. The packed decode hot path now uses `unpack_tile_f32()` (direct codebook f32 LUT) instead of per-codeword arithmetic + fp16 conversion; true SIMD gather remains unavailable on stable std-only Rust (no portable `simd` API), but the arithmetic bottleneck is gone.
-- **No GPU:** CPU only; large models are slow.
+- **GPU fidelity limits:** the device-resident path (feature `gpu`, backend `gpu`) keeps all weights/activations/state on device, but uses fp16 weights and fp16 activation casts around each GEMM (the CPU path uses f32), so outputs can differ slightly. The final logits are still copied to the host once per forward for sampling — **TODO: move sampling fully on device so only the token id crosses back**. Real-GPU correctness/throughput is not exercised on CI; only device-op unit tests on candle's CPU device run there. The host keeps the packed trellis (~1x disk) as a fallback source; no large host decode cache is built on GPU builds.
 - **Concurrency:** `n > 1` choices share one prefill via `PrefillState` (see §3). Independent requests can run in parallel with `--instances N` (default 1): N model instances share one Arc model core (weights/config) and only duplicate KV/recurrent state, so memory scales with instances' state rather than full weights. Bounded admission returns 429 past 16 queued requests. Matmuls are **not** batched across requests (that needs batch-aware attention/DeltaNet), and `threadpool::RUN_LOCK` still serializes matmul dispatch globally — instances overlap non-matmul work (tokenize, sampling, I/O, state handling) rather than two GEMVs at once.
 - **API fidelity limits:** `response_format: json_object` only adds a prompt hint — there is no grammar/constrained decoding or JSON validation. Streaming tool calls now produce indexed `tool_calls` deltas (name + argument fragments) with the XML withheld from content, but tool-call arguments are still assembled with the simple `<parameter=...>` parser, not full JSON streaming. That parser tolerates a missing `>` in the parameter header (name ends at a newline) and drops incomplete blocks from content; deeply malformed values still fall back to strings. Chat `top_logprobs` is capped at 20 (completions accept up to 20 as an extension; OpenAI allows 5). Logprobs exclude reasoning delimiters and stop tokens, so their count matches `completion_tokens`, not every token sampled internally; `<think>`/`</think>` also consume a forward step but are not counted in `completion_tokens`.
 - **No full Jinja template engine:** chat template covers text-only common cases; tool-call arguments and advanced Jinja features (e.g. `tojson` of tool definitions) are not implemented.
@@ -410,6 +418,7 @@ it matters — use `EXLLAMA_BENCH_COMPUTE` to A/B it on a given host.
 | `server::tests::admission_bounds_queued_requests` | Bounded request admission slots |
 | `model::tests::kv_cache_stores_fp16_bits` | fp16 KV cache layout and LUT decode |
 | `compute::tests::gpu_cache_fingerprint_detects_recycled_buffer` | GPU cache key disambiguates recycled buffers (feature `gpu`) |
+| `gpu::tests` (feature `gpu`) | Hadamard matrix vs CPU butterfly, RMSNorm, DeltaNet recurrence, f16 GEMM and bit round-trip on candle's CPU device |
 | `model::tests::spawned_instance_shares_weights_but_not_state` | Arc core sharing + independent per-instance state |
 | `model::tests::f16_embedding_matmul_matches_f32` / `tied_f16_embedding_supports_forward` | Threaded f16 lm_head matmul and tied embedding forward |
 | `server::tests::multiple_instances_serve_concurrent_requests` | Two model instances serving parallel requests |
@@ -417,7 +426,7 @@ it matters — use `EXLLAMA_BENCH_COMPUTE` to A/B it on a given host.
 | `tests::cli_parses_instance_count` | `--instances` parsing and bounds |
 | `fuzz::tests` | Seeded random inputs against JSON/HTTP/regex/chat/tokenizer/API parsers (no panics) |
 
-Run `cargo test` — 115 pass, 11 ignored on the current state. The ignored set
+Run `cargo test` — 115 pass, 11 ignored (121 with `--features gpu`). The ignored set
 is 6 real-model / `/tmp`-fixture tests (now explicitly marked with reasons) plus
 5 benchmarks (including `bench_n_choices_prefill_reuse`). On a fresh clone the dequantization/matmul guarantee is still
 verified by the committed synthetic fixtures.

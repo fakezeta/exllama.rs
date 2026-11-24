@@ -3370,7 +3370,7 @@ mod tests {
     }
 
     /// Compute backend for the opt-in benchmarks (`--compute` equivalent).
-    /// Set to `scalar` or `blas` to A/B the CPU decode paths on a given host.
+    /// Set to `scalar`, `blas` or `gpu` to A/B the decode paths on a given host.
     fn bench_compute() -> String {
         std::env::var("EXLLAMA_BENCH_COMPUTE").unwrap_or_else(|_| "auto".into())
     }
@@ -3379,7 +3379,7 @@ mod tests {
     ///   EXLLAMA_BENCH_MODEL=/path/to/model cargo test --release \
     ///       bench_generation_throughput -- --ignored --nocapture
     /// Optional: EXLLAMA_BENCH_THREADS=N EXLLAMA_BENCH_WEIGHT_MODE=f16|f32|packed
-    ///           EXLLAMA_BENCH_COMPUTE=auto|scalar|blas
+    ///           EXLLAMA_BENCH_COMPUTE=auto|scalar|blas|gpu
     #[test]
     #[ignore]
     fn bench_generation_throughput() {

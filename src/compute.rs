@@ -91,6 +91,12 @@ pub fn backend() -> Backend {
     COMPUTE.get().map(|c| c.backend).unwrap_or(Backend::Blas)
 }
 
+/// The selected device, for the device-resident forward path.
+#[cfg(feature = "gpu")]
+pub fn device() -> Option<candle_core::Device> {
+    COMPUTE.get().and_then(|c| c.device.clone())
+}
+
 /// Score the two CPU backends from the probe timings. Decode runs once per
 /// generated token while prefill runs once per request, so the GEMV timing is
 /// weighted 4x: a 4x GEMV win (observed on 12th-gen cores) must not be masked

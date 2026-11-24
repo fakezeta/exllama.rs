@@ -15,6 +15,8 @@ matrixmultiply = "0.3"
 
 # Optional GPU backend. Features are opt-in so default/CI builds stay portable.
 candle-core = { version = "0.11", optional = true }
+# fp16 element type for device tensors (candle already depends on it).
+half = { version = "2", optional = true }
 
 [features]
 default = []
@@ -22,7 +24,7 @@ default = []
 # GPU: compile candle with the right vendor backend for your platform:
 #   macOS / Apple Silicon:  cargo build --release --features gpu-metal
 #   NVIDIA Linux/Windows:   cargo build --release --features gpu-cuda
-gpu = ["dep:candle-core"]
+gpu = ["dep:candle-core", "dep:half"]
 gpu-metal = ["gpu", "candle-core/metal"]
 gpu-cuda = ["gpu", "candle-core/cuda"]
 

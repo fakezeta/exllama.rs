@@ -374,7 +374,7 @@ fn unpack_tile_f32(
 /// Apply a normalized 128-point Sylvester Hadamard transform to the strided
 /// vector `data[base + i*stride]`, `i = 0..128`.
 #[inline]
-fn hadamard128(data: &mut [f32], base: usize, stride: usize, scale: f32) {
+pub(crate) fn hadamard128(data: &mut [f32], base: usize, stride: usize, scale: f32) {
     for step in [1usize, 2, 4, 8, 16, 32, 64] {
         for i in 0..128 {
             if i & step == 0 {
@@ -1113,6 +1113,57 @@ impl QuantLinear {
         }
         self.what_f32 = Some(what);
         Ok(())
+    }
+
+    /// Upload this linear's W_hat directly to a device as an fp16 tensor.
+    /// Used by the device-resident GPU forward: the trellis is decoded once at
+    /// load and never crosses the bus again. Returns (W_hat (n,k) F16,
+    /// suh (k,) F32, svh (n,) F32).
+    #[cfg(feature = "gpu")]
+    pub(crate) fn upload_device(
+        &self,
+        device: &candle_core::Device,
+    ) -> Result<
+        (
+            candle_core::Tensor,
+            candle_core::Tensor,
+            candle_core::Tensor,
+        ),
+        String,
+    > {
+        use candle_core::Tensor;
+        use half::f16;
+        let trellis = self
+            .trellis
+            .as_ref()
+            .ok_or_else(|| format!("{}: trellis already consumed", self.name))?;
+        let mut bits = vec![f16::ZERO; self.k * self.n];
+        let mut tile = [0u16; 256];
+        for tk in 0..self.tiles_k {
+            for tn in 0..self.tiles_n {
+                let off = (tk * self.tiles_n + tn) * self.words_per_tile;
+                unpack_tile_bits(
+                    &trellis[off..off + self.words_per_tile],
+                    self.k_bits_int,
+                    self.k_half,
+                    self.cb,
+                    &mut tile,
+                );
+                for r in 0..16 {
+                    for c in 0..16 {
+                        bits[(tn * 16 + c) * self.k + tk * 16 + r] =
+                            f16::from_bits(tile[r * 16 + c]);
+                    }
+                }
+            }
+        }
+        let w = Tensor::from_slice(&bits, (self.n, self.k), device)
+            .map_err(|e| format!("{}: upload W_hat: {}", self.name, e))?;
+        let suh = Tensor::from_slice(&self.suh, (self.k,), device)
+            .map_err(|e| format!("{}: upload suh: {}", self.name, e))?;
+        let svh = Tensor::from_slice(&self.svh, (self.n,), device)
+            .map_err(|e| format!("{}: upload svh: {}", self.name, e))?;
+        Ok((w, suh, svh))
     }
 
     /// Compute `y = W @ x` where W is the dequantized (n, k) weight, directly

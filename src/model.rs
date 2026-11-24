@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::exl3::{f32_to_half, half_f32, matmul_f16, Exl3Model, QuantLinear};
+#[cfg(feature = "gpu")]
+use crate::gpu::{GpuRunner, GpuSnapshot, GpuWeights};
 use crate::json::Json;
 use crate::tensor::{dot, matmul_t, F16Matrix, Matrix};
 
@@ -67,6 +69,8 @@ pub(crate) struct ModelState {
     position: usize,
     full: Vec<(Vec<u16>, Vec<u16>)>,
     linear: Vec<(Vec<f32>, usize, Vec<f32>)>,
+    #[cfg(feature = "gpu")]
+    gpu: Option<GpuSnapshot>,
 }
 
 /// Shape of one GQA attention call, grouped to keep the helper signature small.
@@ -120,6 +124,9 @@ pub struct Model {
     position: usize,
     full_states: Vec<FullAttnState>,
     linear_states: Vec<LinearAttnState>,
+    /// Device-resident forward path; `None` on CPU builds/backends.
+    #[cfg(feature = "gpu")]
+    gpu: Option<GpuRunner>,
 }
 
 fn cfg_num(j: &Json, key: &str, default: usize) -> usize {
@@ -142,7 +149,15 @@ impl Model {
         if context_size == 0 {
             return Err("context_size must be > 0".into());
         }
-        let ex = Exl3Model::load(path, weight_mode)?;
+        // With the GPU backend, weights are uploaded to the device exactly once
+        // at load. Keep the packed trellis on the host as a small fallback
+        // source instead of building a large host f32/f16 decode cache.
+        #[cfg(feature = "gpu")]
+        let use_gpu = crate::compute::backend() == crate::compute::Backend::Gpu;
+        #[cfg(not(feature = "gpu"))]
+        let use_gpu = false;
+        let load_mode = if use_gpu { "packed" } else { weight_mode };
+        let ex = Exl3Model::load(path, load_mode)?;
         let cfg = &ex.config;
 
         let arch = cfg
@@ -273,6 +288,28 @@ impl Model {
             }
         }
 
+        #[cfg(feature = "gpu")]
+        let gpu = if use_gpu {
+            let device = crate::compute::device()
+                .ok_or_else(|| "GPU backend selected but no device available".to_string())?;
+            let weights = GpuWeights::build(
+                &ex,
+                &config,
+                context_size,
+                &rope_cos,
+                &rope_sin,
+                rope_half,
+                &device,
+            )?;
+            eprintln!(
+                "[gpu] device-resident forward active (--weight-mode {} ignored; weights are f16 on device)",
+                weight_mode
+            );
+            Some(GpuRunner::new(weights)?)
+        } else {
+            None
+        };
+
         let core = Arc::new(ModelCore {
             config,
             prefix,
@@ -293,17 +330,26 @@ impl Model {
             position: 0,
             full_states,
             linear_states,
+            #[cfg(feature = "gpu")]
+            gpu,
         })
     }
 
     /// Create another inference instance sharing the loaded weights/config but
     /// with fresh, zeroed KV and recurrent state.
     pub fn spawn(&self) -> Model {
+        #[cfg(feature = "gpu")]
+        let gpu = self
+            .gpu
+            .as_ref()
+            .map(|g| g.spawn().expect("spawn GPU state"));
         Model {
             core: Arc::clone(&self.core),
             position: 0,
             full_states: self.core.full_template.clone(),
             linear_states: self.core.linear_template.clone(),
+            #[cfg(feature = "gpu")]
+            gpu,
         }
     }
 
@@ -322,6 +368,10 @@ impl Model {
 
     pub fn reset(&mut self) {
         self.position = 0;
+        #[cfg(feature = "gpu")]
+        if let Some(g) = &mut self.gpu {
+            g.reset().expect("reset GPU state");
+        }
         for s in &mut self.full_states {
             s.k.fill(0);
             s.v.fill(0);
@@ -340,6 +390,11 @@ impl Model {
         let used = self.position * kv;
         ModelState {
             position: self.position,
+            #[cfg(feature = "gpu")]
+            gpu: self
+                .gpu
+                .as_ref()
+                .map(|g| g.snapshot().expect("snapshot GPU state")),
             full: self
                 .full_states
                 .iter()
@@ -359,6 +414,10 @@ impl Model {
         debug_assert_eq!(self.full_states.len(), state.full.len());
         debug_assert_eq!(self.linear_states.len(), state.linear.len());
         self.position = state.position;
+        #[cfg(feature = "gpu")]
+        if let (Some(g), Some(s)) = (&mut self.gpu, &state.gpu) {
+            g.restore(s).expect("restore GPU state");
+        }
         let kv = self.core.config.num_key_value_heads * self.core.config.head_dim;
         let used = state.position * kv;
         for (dst, (k, v)) in self.full_states.iter_mut().zip(&state.full) {
@@ -979,6 +1038,12 @@ impl Model {
                 self.core.context_size
             ));
         }
+        #[cfg(feature = "gpu")]
+        if let Some(g) = &mut self.gpu {
+            let logits = g.forward(input_ids)?;
+            self.position = g.position();
+            return Ok(logits);
+        }
         let mut logits = vec![0.0f32; self.core.config.vocab_size];
         for &t in input_ids {
             logits = self.forward_token(t)?;
@@ -1083,6 +1148,8 @@ impl Model {
             position: 0,
             full_states,
             linear_states: Vec::new(),
+            #[cfg(feature = "gpu")]
+            gpu: None,
         }
     }
 }

@@ -293,3 +293,35 @@ with regression tests based on the exact observed output:
 
 Verification: **115 passed, 11 ignored**, `cargo fmt --all -- --check` and
 `cargo clippy --all-targets -- -D warnings` clean.
+
+
+## Device-resident GPU forward (post-v0.4.3)
+
+Implemented per the requirement that, on GPU builds, all weights stay on device
+and no activations cross the bus during prefill/decode.
+
+- `src/gpu.rs` (new, feature `gpu`): `GpuWeights` decodes every EXL3 W_hat once
+  and uploads it as an fp16 device tensor; plain matrices/embeddings are fp16,
+  vectors/RoPE/H128 are fp32. `GpuRunner` owns shared weights plus per-instance
+  device state; the whole forward (RMSNorm, RoPE, Hadamard, GQA attention,
+  conv1d, Gated DeltaNet recurrence, gated RMSNorm, MLP, lm_head) runs with
+  candle tensor ops. KV cache and DeltaNet state stay on device. Prefill copies
+  logits to the host once for the whole prompt; decode once per token.
+- `Model::load` builds the GPU runner when the backend is `Gpu`, loads EXL3 in
+  `packed` mode (small host trellis as fallback) and ignores `--weight-mode`.
+  `Model::spawn`, `reset`, `snapshot`/`restore` and `forward` dispatch to it.
+  The CPU path is unchanged and remains the fallback.
+- `half` is an opt-in dependency under the `gpu` feature (candle already
+  compiles it transitively). Device GEMMs use fp16 inputs with f32 accumulate,
+  so outputs can differ slightly from the f32 CPU path.
+- Verified: `cargo test` (115 passed / 11 ignored), `cargo test --features gpu`
+  (121 passed / 11 ignored), fmt and clippy clean with and without `gpu`.
+  Device-op tests run on candle's CPU device; **real-GPU correctness and
+  throughput must be validated on the target hardware** with
+  `EXLLAMA_BENCH_COMPUTE=gpu` A/B runs (the benchmark accepts `gpu` now).
+
+### REMINDER — future work: fully on-device sampling
+Sampling still runs on the host after the single logits copy. Implement
+temperature / top-k / top-p / greedy sampling with candle ops so only the
+sampled token id crosses back, eliminating the last per-token device→host
+transfer. Tracked in `TODO.md` as a P1 item.

@@ -13,6 +13,14 @@ checked off with a short note; open items are unchecked.
 
 ## Validation & Correctness
 
+- [ ] **(P1) Move sampling fully on device (GPU path).** REMINDER from the
+  device-resident GPU work: the forward pass now keeps weights, activations,
+  KV cache and DeltaNet state on device, but the final logits are still copied
+  to the host once per `Model::forward` and sampled with the existing host
+  sampler. Next step: implement temperature / top-k / top-p / greedy sampling
+  with candle tensor ops so only the chosen token id crosses back. See
+  `src/gpu.rs` and `IMPROVEMENT_PLAN.md` (GPU section).
+
 - [x] **(P0) End-to-end test with a real EXL3 model.** Done — validated on
   `UnstableLlama/Qwen3.5-0.8B-exl3-8.00bpw`. Chat completions produce coherent
   answers ("The capital of France is **Paris**.", arithmetic, lists, greetings)
@@ -223,9 +231,10 @@ The authoritative phased plan (with acceptance criteria) is
 [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md). **Phases 0–2 are fully complete**;
 execute the remaining work in this order:
 
-1. **Phase 3 — exploration.** Vision, other architectures, NFC / `chat_template`
+1. **(GPU) Move sampling fully on device** — see reminder under Validation & Correctness; then validate real-GPU correctness/throughput with the A/B benchmark.
+2. **Phase 3 — exploration.** Vision, other architectures, NFC / `chat_template`
    loading, structured logging, Anthropic endpoint.
-2. **Manual validation still worth doing:** the end-to-end benchmark
+3. **Manual validation still worth doing:** the end-to-end benchmark
    (`EXLLAMA_BENCH_MODEL=/path cargo test --release bench_generation_throughput -- --ignored --nocapture`),
    a real-client SSE smoke test (`curl -N`), and real-model runs on 2B/4B/9B
    and MUL1 codebooks (only the 0.8B 8-bpw MCG model has been exercised), and
@@ -237,7 +246,7 @@ Commit only on explicit approval — see the status note in `IMPROVEMENT_PLAN.md
 
 ## Notes
 
-- Keep the core std-only (no general-purpose crates). `matrixmultiply` is the only required dependency; `candle` is opt-in for GPU. If a feature truly needs a crate, put it behind a feature flag and document the trade-off.
+- Keep the core std-only (no general-purpose crates). `matrixmultiply` is the only required dependency; `candle` and `half` are opt-in for GPU. If a feature truly needs a crate, put it behind a feature flag and document the trade-off.
 - Maintain `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings` — CI enforces both.
 - Update `AGENTS.md` whenever architecture or format details change.
 - Real-model diagnostics live in `tests/`; reference data and research notes are described in `AGENTS.md` §8.

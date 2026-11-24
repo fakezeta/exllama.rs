@@ -11,6 +11,8 @@ mod compute;
 mod exl3;
 #[cfg(test)]
 mod fuzz;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod http;
 mod json;
 mod model;

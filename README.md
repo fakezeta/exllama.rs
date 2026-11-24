@@ -42,7 +42,7 @@ startup. `--compute auto` (default) picks the best one available:
 |---------|-------|-------|-------|
 | `cpu-blas` | `matrixmultiply` `sgemm` | default | Pure Rust SIMD BLAS kernel, no native libs. |
 | `scalar` | (built-in) | default | Hand-written threaded dot products. Often fastest for memory-bound decode (GEMV); the auto probe benchmarks both CPU paths and picks the winner. |
-| `gpu` | `candle-core` | opt-in | CUDA or Metal. Much faster for large matmuls; falls back to CPU if no device is present. |
+| `gpu` | `candle-core` + `half` | opt-in | CUDA or Metal. Runs a **device-resident forward**: all weights, activations and state stay on device; falls back to CPU if no device is present. |
 
 Build with GPU support (off by default so CI stays portable):
 ```bash
@@ -60,6 +60,16 @@ Then select at runtime: `--compute auto` (default) or force one with
 For this CPU-only decode workload, the auto probe usually chooses `scalar`
 because GEMV is memory-bound and the hand-written threaded dot beats sgemm;
 prefill batches and GPU-backed runs benefit most from the BLAS/GPU paths.
+
+With `--compute gpu` (or `auto` on a GPU build), `Model::load` uploads every
+weight to the device **once** and runs the entire forward there — embeddings,
+all linears (including the EXL3 Hadamard/dequant math), KV cache and DeltaNet
+state. There is no per-layer host/device traffic: only the input token ids and
+the final logits cross the bus. `--weight-mode` is ignored in this mode (weights
+are fp16 on device); the host keeps only the small packed trellis as a fallback
+source. Sampling still happens on the host after the logits copy — moving it
+fully on device is tracked as future work. Outputs can differ slightly from
+the CPU path because the device GEMMs use fp16 activations.
 
 ## Usage
 
@@ -221,7 +231,7 @@ Supported request parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `m
 cargo test
 ```
 
-Tests cover JSON parsing, regex/pre-tokenizer behavior, chat-template rendering (including committed golden prompts in `tests/golden/`), tool-call parsing, EXL3 codebook/tile-layout correctness against the reference implementation, sampling, logprobs, `n`-choice handling, parameter validation, end-to-end HTTP/SSE behavior against a tiny synthetic model, and deterministic dependency-free fuzz smoke tests for the JSON/HTTP/regex/tokenizer/API parsers (`src/fuzz.rs`). Two suites need no model download and always run: `exl3::synthetic_tests` verifies all three `--weight-mode` paths against full dequantization for every EXL3 codebook using an in-memory fixture, and `model::tests` holds hand-computed golden tests for the decoder math (RMSNorm, RoPE, q_proj interleaving, GQA, DeltaNet). Tests that need `/tmp` reference files (real tokenizer / real EXL3 layer) are explicitly `#[ignore]`d with reasons — run them with `cargo test -- --ignored` when those files exist. Current totals: 115 passed, 11 ignored. For throughput benchmarking with a real model, see `bench_generation_throughput` and `bench_n_choices_prefill_reuse` in `src/server.rs`; both initialize the threadpool and compute backend exactly like the server and honor `EXLLAMA_BENCH_MODEL`, `EXLLAMA_BENCH_THREADS` (default: all CPUs), `EXLLAMA_BENCH_WEIGHT_MODE` (`f32`/`f16`/`packed`) and `EXLLAMA_BENCH_COMPUTE` (`auto`/`scalar`/`blas`, for A/B comparisons). The throughput report splits prefill and decode time, so `decode tok/s` is not diluted by the prompt pass.
+Tests cover JSON parsing, regex/pre-tokenizer behavior, chat-template rendering (including committed golden prompts in `tests/golden/`), tool-call parsing, EXL3 codebook/tile-layout correctness against the reference implementation, sampling, logprobs, `n`-choice handling, parameter validation, end-to-end HTTP/SSE behavior against a tiny synthetic model, and deterministic dependency-free fuzz smoke tests for the JSON/HTTP/regex/tokenizer/API parsers (`src/fuzz.rs`). Two suites need no model download and always run: `exl3::synthetic_tests` verifies all three `--weight-mode` paths against full dequantization for every EXL3 codebook using an in-memory fixture, and `model::tests` holds hand-computed golden tests for the decoder math (RMSNorm, RoPE, q_proj interleaving, GQA, DeltaNet). Tests that need `/tmp` reference files (real tokenizer / real EXL3 layer) are explicitly `#[ignore]`d with reasons — run them with `cargo test -- --ignored` when those files exist. Current totals: 115 passed, 11 ignored (121 with `--features gpu`, which adds device-op tests on candle's CPU device). For throughput benchmarking with a real model, see `bench_generation_throughput` and `bench_n_choices_prefill_reuse` in `src/server.rs`; both initialize the threadpool and compute backend exactly like the server and honor `EXLLAMA_BENCH_MODEL`, `EXLLAMA_BENCH_THREADS` (default: all CPUs), `EXLLAMA_BENCH_WEIGHT_MODE` (`f32`/`f16`/`packed`; ignored on GPU) and `EXLLAMA_BENCH_COMPUTE` (`auto`/`scalar`/`blas`/`gpu`, for A/B comparisons). The throughput report splits prefill and decode time, so `decode tok/s` is not diluted by the prompt pass.
 
 For manual end-to-end checks against a **running server**, see [`tests/README.md`](tests/README.md). It contains smoke-test and diagnostic shell scripts (`test_api.sh`, `test_diag.sh`, `test_sample.sh`, `test_prompts.sh`) that exercise the OpenAI-compatible endpoints with curl.
 
