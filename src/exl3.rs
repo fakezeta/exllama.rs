@@ -1157,8 +1157,32 @@ impl QuantLinear {
                 }
             }
         }
-        let w = Tensor::from_slice(&bits, (self.n, self.k), device)
-            .map_err(|e| format!("{}: upload W_hat: {}", self.name, e))?;
+        let w = Tensor::from_slice(&bits, (self.n, self.k), device).map_err(|e| {
+            format!(
+                "{}: upload W_hat ({}x{}, {} values): {}",
+                self.name,
+                self.n,
+                self.k,
+                bits.len(),
+                e
+            )
+        })?;
+        if self.suh.len() != self.k {
+            return Err(format!(
+                "{}: suh has {} values, expected k={}",
+                self.name,
+                self.suh.len(),
+                self.k
+            ));
+        }
+        if self.svh.len() != self.n {
+            return Err(format!(
+                "{}: svh has {} values, expected n={}",
+                self.name,
+                self.svh.len(),
+                self.n
+            ));
+        }
         let suh = Tensor::from_slice(&self.suh, (self.k,), device)
             .map_err(|e| format!("{}: upload suh: {}", self.name, e))?;
         let svh = Tensor::from_slice(&self.svh, (self.n,), device)

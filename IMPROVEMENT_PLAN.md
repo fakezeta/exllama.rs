@@ -315,7 +315,7 @@ and no activations cross the bus during prefill/decode.
   compiles it transitively). Device GEMMs use fp16 inputs with f32 accumulate,
   so outputs can differ slightly from the f32 CPU path.
 - Verified: `cargo test` (115 passed / 11 ignored), `cargo test --features gpu`
-  (123 passed / 11 ignored), fmt and clippy clean with and without `gpu`.
+  (124 passed / 11 ignored), fmt and clippy clean with and without `gpu`.
   Device-op tests run on candle's CPU device; **real-GPU correctness and
   throughput must be validated on the target hardware** with
   `EXLLAMA_BENCH_COMPUTE=gpu` A/B runs (the benchmark accepts `gpu` now).
@@ -332,6 +332,18 @@ per head, not `(nh,2,hd)`); RoPE tables are indexed with one row
 `gpu::tests::device_forward_runs_end_to_end_on_cpu` (multi-head tiny model,
 prefill + decode) and a synthetic `q_matmul` test — together they exercise
 every device forward branch and catch shape bugs without a GPU.
+
+#### Second GPU hotfix: partial RoPE tail
+A second real-model prefill then failed with `Shape mismatch, got buffer of
+size 128 which is compatible with shape [1, 512]`. `rope_half` is
+`head_dim*factor/2` (16 for the 0.8B model), so only the first 32 of 128 dims
+rotate; the GPU `rope()` returned only those 32 and dropped the tail, leaving
+`k` with 128 elements instead of `nkv*head_dim=512`. It now appends the
+unrotated tail (matching CPU `apply_rope`). The end-to-end test fixture was
+changed to `rope_half < head_dim/2` so the full forward exercises partial
+rotation, and `gpu::tests::rope_preserves_unrotated_tail` checks the numbers.
+Weight-upload errors now include tensor names and dimensions. Verification:
+115 passed / 11 ignored, 124 with `--features gpu`; fmt and clippy clean.
 
 ### REMINDER — future work: fully on-device sampling
 Sampling still runs on the host after the single logits copy. Implement

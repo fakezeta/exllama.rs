@@ -79,13 +79,35 @@ impl GpuWeights {
     ) -> Result<Arc<Self>, String> {
         let mut mats = HashMap::new();
         for (name, m) in &ex.weights {
+            if m.data.len() != m.rows * m.cols {
+                return Err(format!(
+                    "{}: weight buffer has {} elements, expected {} ({}, {})",
+                    name,
+                    m.data.len(),
+                    m.rows * m.cols,
+                    m.rows,
+                    m.cols
+                ));
+            }
             let vals: Vec<f16> = m.data.iter().map(|&v| f16::from_f32(v)).collect();
-            let t = Tensor::from_slice(&vals, (m.rows, m.cols), device).ce()?;
+            let t = Tensor::from_slice(&vals, (m.rows, m.cols), device)
+                .map_err(|e| format!("{}: upload matrix: {}", name, e))?;
             mats.insert(name.clone(), t);
         }
         for (name, emb) in &ex.embeddings_f16 {
+            if emb.data.len() != emb.rows * emb.cols {
+                return Err(format!(
+                    "{}: embedding buffer has {} elements, expected {} ({}, {})",
+                    name,
+                    emb.data.len(),
+                    emb.rows * emb.cols,
+                    emb.rows,
+                    emb.cols
+                ));
+            }
             let vals: Vec<f16> = emb.data.iter().map(|&b| f16::from_bits(b)).collect();
-            let t = Tensor::from_slice(&vals, (emb.rows, emb.cols), device).ce()?;
+            let t = Tensor::from_slice(&vals, (emb.rows, emb.cols), device)
+                .map_err(|e| format!("{}: upload embedding: {}", name, e))?;
             mats.insert(name.clone(), t);
         }
         let mut qhat = HashMap::new();
@@ -251,6 +273,16 @@ impl GpuWeights {
             return Ok(x.clone());
         }
         let x2 = x.reshape((heads, head_len)).ce()?;
+        let rotary = half * 2;
+        if head_len < rotary {
+            return Err(format!(
+                "partial rotary dim {} exceeds head_dim {}",
+                rotary, head_len
+            ));
+        }
+        // Only the first `rotary` dims are rotated — the rest of each head is
+        // passed through unchanged (CPU `Model::apply_rope`). Dropping the tail
+        // silently would shrink q/k and break the KV cache write.
         let a = x2.narrow(1, 0, half).ce()?;
         let b = x2.narrow(1, half, half).ce()?;
         // Tables are (context, rope_half) row-major: one *row* per position.
@@ -276,7 +308,14 @@ impl GpuWeights {
             .ce()?
             .add(&a.broadcast_mul(&s).ce()?)
             .ce()?;
-        Tensor::cat(&[na, nb], 1).ce()?.flatten_all().ce()
+        let rotated = Tensor::cat(&[na, nb], 1).ce()?;
+        let out = if head_len > rotary {
+            let tail = x2.narrow(1, rotary, head_len - rotary).ce()?;
+            Tensor::cat(&[rotated, tail], 1).ce()?
+        } else {
+            rotated
+        };
+        out.flatten_all().ce()
     }
 
     fn is_full(&self, layer: usize) -> bool {
@@ -479,6 +518,12 @@ impl GpuRunner {
         // Write this position's K/V row into the fp16 cache.
         let kv = nkv * hd;
         let (kc, vc) = &mut self.state.full[idx];
+        if k.elem_count() != kv {
+            return Err(format!(
+                "layer {}: RoPE output has {} elements, expected nkv*head_dim={} (nkv={}, head_dim={}, rope_half={})",
+                layer, k.elem_count(), kv, nkv, hd, w.cfg.rope_half
+            ));
+        }
         let krow = k.reshape((1, kv)).ce()?.to_dtype(DType::F16).ce()?;
         let vrow = vp
             .narrow(0, 0, kv)
@@ -871,6 +916,68 @@ mod tests {
         }
     }
 
+    /// Partial rotary: only the first `2*half` dims of each head rotate; the
+    /// remaining dims must pass through untouched (CPU `apply_rope`).
+    #[test]
+    fn rope_preserves_unrotated_tail() {
+        let dev = Device::Cpu;
+        let (heads, hd, half) = (2usize, 8usize, 2usize);
+        let cfg = GpuCfg {
+            num_layers: 0,
+            hidden_size: hd,
+            vocab_size: 4,
+            num_attention_heads: heads,
+            num_key_value_heads: heads,
+            head_dim: hd,
+            layer_types: Vec::new(),
+            full_attention_interval: 1,
+            linear_conv_kernel_dim: 2,
+            linear_key_head_dim: 1,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_value_head_dim: 1,
+            rms_norm_eps: 1e-6,
+            context_size: 2,
+            rope_half: half,
+        };
+        let gw = GpuWeights {
+            device: dev.clone(),
+            prefix: String::new(),
+            cfg,
+            mats: HashMap::new(),
+            qhat: HashMap::new(),
+            vecs: HashMap::new(),
+            // pos 0: cos=0.8, sin=0.6 for both rotary pairs.
+            rope_cos: Tensor::from_slice(&[0.8f32, 0.8, 0.8, 0.8], (2, half), &dev).unwrap(),
+            rope_sin: Tensor::from_slice(&[0.6f32, 0.6, 0.6, 0.6], (2, half), &dev).unwrap(),
+            h128: Tensor::zeros((128, 128), DType::F32, &dev).unwrap(),
+        };
+        let x: Vec<f32> = (0..(heads * hd)).map(|i| i as f32).collect();
+        let got = gw
+            .rope(
+                &Tensor::from_slice(&x, (heads * hd,), &dev).unwrap(),
+                heads,
+                hd,
+                0,
+            )
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(got.len(), heads * hd, "rope must preserve head length");
+        for h in 0..heads {
+            let base = h * hd;
+            for d in 0..half {
+                let (a, b) = (x[base + d], x[base + d + half]);
+                assert!((got[base + d] - (a * 0.8 - b * 0.6)).abs() < 1e-5);
+                assert!((got[base + d + half] - (b * 0.8 + a * 0.6)).abs() < 1e-5);
+            }
+            // Unrotated tail (dims 4..7) is copied verbatim.
+            for d in (half * 2)..hd {
+                assert_eq!(got[base + d], x[base + d], "tail dim {} changed", d);
+            }
+        }
+    }
+
     #[test]
     fn deltanet_step_device_matches_cpu_recurrence() {
         let dev = Device::Cpu;
@@ -963,7 +1070,9 @@ mod tests {
             linear_value_head_dim: 2,
             rms_norm_eps: 1e-6,
             context_size: 4,
-            rope_half: 2,
+            // Partial rotary (rotary=2 < head_dim=4) — the real-model case.
+            // A full-rotation fixture would not exercise the unrotated tail.
+            rope_half: 1,
         };
         let mut mats = HashMap::new();
         let mut vecs = HashMap::new();
@@ -1017,8 +1126,8 @@ mod tests {
             mats,
             qhat: HashMap::new(),
             vecs,
-            rope_cos: tiny_f32_mat(&dev, 4, 2),
-            rope_sin: tiny_f32_mat(&dev, 4, 2),
+            rope_cos: tiny_f32_mat(&dev, 4, 1),
+            rope_sin: tiny_f32_mat(&dev, 4, 1),
             h128: Tensor::zeros((128, 128), DType::F32, &dev).unwrap(),
         });
         let mut runner = GpuRunner::new(gw).unwrap();

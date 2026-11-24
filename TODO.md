@@ -30,6 +30,16 @@ checked off with a short note; open items are unchecked.
   forward on candle's CPU device) plus a synthetic `q_matmul` test — these
   catch such bugs without a GPU.
 
+- [x] **(P0) Fix partial-RoPE tail truncation on GPU.** A real-model prefill
+  failed with `Shape mismatch, got buffer of size 128 which is compatible with
+  shape [1, 512]`: `rope_half = head_dim*factor/2` (16 for `head_dim=128`), so
+  only the first 32 dims rotate, but `gpu::rope()` returned *only* those dims
+  and dropped the remaining 96. `k` then had 128 elements where the KV cache
+  row needed `nkv*head_dim=512`. It now concatenates the unrotated tail back
+  (matching CPU `Model::apply_rope`), with
+  `gpu::tests::rope_preserves_unrotated_tail` and a partial-rotary end-to-end
+  test; upload errors now include tensor names/dims for faster diagnosis.
+
 - [x] **(P0) End-to-end test with a real EXL3 model.** Done — validated on
   `UnstableLlama/Qwen3.5-0.8B-exl3-8.00bpw`. Chat completions produce coherent
   answers ("The capital of France is **Paris**.", arithmetic, lists, greetings)
@@ -79,9 +89,9 @@ checked off with a short note; open items are unchecked.
   now has 7 unit tests.
 - [x] **(P1) Fix doc drift.** Done — `AGENTS.md` counts/line numbers, `TODO.md`
   stale "next steps", and this plan's baseline are updated to 115 passed /
-  11 ignored (123 with `gpu`) — 88 after Phase 0, 99 after Phase 1, 102 after
+  11 ignored (124 with `gpu`) — 88 after Phase 0, 99 after Phase 1, 102 after
   Phase 2, 110 after the benchmark fixes, 115 after the tool-call parser fixes
-  and the GPU forward fixes (two new `gpu`-only tests).
+  and the GPU forward fixes (three new `gpu`-only tests).
 - [x] **(P1) Bounded request-line reading.** Done — see plan Phase 1 #4:
   `read_request()` reads the request line and headers through
   `Read::take(MAX_HEADER_BYTES + 1)` and rejects overlong lines. `http::tests`
