@@ -1,6 +1,6 @@
 [package]
 name = "exllama-server"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2021"
 description = "Minimal OpenAI-compatible inference server for ExLlamaV3 (EXL3) quantized models"
 
