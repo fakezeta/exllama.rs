@@ -233,7 +233,10 @@ impl GpuWeights {
             .recip()
             .ce()?;
         let w1 = w.affine(1.0, 1.0).ce()?;
-        x.broadcast_mul(&scale).ce()?.mul(&w1).ce()
+        // `w` is 1-D (head_dim,). `x` can be 1-D (hidden,) or 2-D
+        // (heads, head_dim) for q/k norms — candle's `.mul()` needs *exact*
+        // shapes, so use `.broadcast_mul()`.
+        x.broadcast_mul(&scale).ce()?.broadcast_mul(&w1).ce()
     }
 
     fn rope(
@@ -250,15 +253,16 @@ impl GpuWeights {
         let x2 = x.reshape((heads, head_len)).ce()?;
         let a = x2.narrow(1, 0, half).ce()?;
         let b = x2.narrow(1, half, half).ce()?;
+        // Tables are (context, rope_half) row-major: one *row* per position.
         let c = self
             .rope_cos
-            .narrow(0, pos, half)
+            .narrow(0, pos, 1)
             .ce()?
             .reshape((1, half))
             .ce()?;
         let s = self
             .rope_sin
-            .narrow(0, pos, half)
+            .narrow(0, pos, 1)
             .ce()?
             .reshape((1, half))
             .ce()?;
@@ -452,9 +456,11 @@ impl GpuRunner {
         let kp = w.linear(&format!("layers.{}.self_attn.k_proj", layer), &xn)?;
         let vp = w.linear(&format!("layers.{}.self_attn.v_proj", layer), &xn)?;
 
-        let qp2 = qp.reshape((nh, 2, hd)).ce()?;
+        // Per head the projection is [query(hd) | gate(hd)], i.e. (nh, hd*2)
+        // — NOT (nh, 2, hd). Matches CPU `split_q_gate`.
+        let qp2 = qp.reshape((nh, hd * 2)).ce()?;
         let q = qp2.narrow(1, 0, hd).ce()?.flatten_all().ce()?;
-        let gate = qp2.narrow(1, 1, hd).ce()?.flatten_all().ce()?;
+        let gate = qp2.narrow(1, hd, hd).ce()?.flatten_all().ce()?;
 
         let qn_w = w.vec(&format!("layers.{}.self_attn.q_norm.weight", layer))?;
         let kn_w = w.vec(&format!("layers.{}.self_attn.k_norm.weight", layer))?;
@@ -490,12 +496,16 @@ impl GpuRunner {
         let mut heads = Vec::with_capacity(nh);
         for h in 0..nh {
             let kh = h / groups;
+            // Cache row layout is (nkv, hd). Select one KV head (dim 1 has
+            // size nkv, *not* hd) and drop that dim to get (tlen, hd).
             let kmat = kc
                 .narrow(0, 0, tlen)
                 .ce()?
                 .reshape((tlen, nkv, hd))
                 .ce()?
-                .narrow(1, kh, hd)
+                .narrow(1, kh, 1)
+                .ce()?
+                .squeeze(1)
                 .ce()?
                 .to_dtype(DType::F32)
                 .ce()?;
@@ -510,7 +520,9 @@ impl GpuRunner {
                 .ce()?
                 .reshape((tlen, nkv, hd))
                 .ce()?
-                .narrow(1, kh, hd)
+                .narrow(1, kh, 1)
+                .ce()?
+                .squeeze(1)
                 .ce()?
                 .to_dtype(DType::F32)
                 .ce()?;
@@ -660,9 +672,11 @@ impl GpuRunner {
         let o_norm = o2
             .broadcast_mul(&scale)
             .ce()?
-            .mul(&nw)
+            // `nw` is (1, vd) and `z2` is (nvh, vd); `.mul()` requires exact
+            // shapes in candle, so broadcast both against (nvh, vd).
+            .broadcast_mul(&nw)
             .ce()?
-            .mul(&z2.silu().ce()?)
+            .broadcast_mul(&z2.silu().ce()?)
             .ce()?
             .flatten_all()
             .ce()?;
@@ -909,6 +923,176 @@ mod tests {
         for j in 0..vd {
             assert!((got_o[j] - o[j]).abs() < 1e-5, "{} vs {}", got_o[j], o[j]);
         }
+    }
+
+    fn tiny_mat(dev: &Device, rows: usize, cols: usize) -> Tensor {
+        let data: Vec<f16> = (0..rows * cols)
+            .map(|i| f16::from_f32(((i * 7) % 13) as f32 / 10.0 - 0.6))
+            .collect();
+        Tensor::from_slice(&data, (rows, cols), dev).unwrap()
+    }
+
+    fn tiny_f32_mat(dev: &Device, rows: usize, cols: usize) -> Tensor {
+        let data: Vec<f32> = (0..rows * cols).map(|i| (i % 7) as f32 / 20.0).collect();
+        Tensor::from_slice(&data, (rows, cols), dev).unwrap()
+    }
+
+    fn tiny_vec(dev: &Device, len: usize) -> Tensor {
+        let data: Vec<f32> = (0..len).map(|i| (i % 5) as f32 / 100.0).collect();
+        Tensor::from_slice(&data, (len,), dev).unwrap()
+    }
+
+    /// Runs the whole device forward on candle's CPU device with a tiny model.
+    /// This catches shape/broadcast bugs in every branch without needing a GPU.
+    #[test]
+    fn device_forward_runs_end_to_end_on_cpu() {
+        let dev = Device::Cpu;
+        let cfg = GpuCfg {
+            num_layers: 2,
+            hidden_size: 4,
+            vocab_size: 4,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            layer_types: vec!["linear_attention".into(), "full_attention".into()],
+            full_attention_interval: 1,
+            linear_conv_kernel_dim: 2,
+            linear_key_head_dim: 2,
+            linear_num_key_heads: 2,
+            linear_num_value_heads: 4,
+            linear_value_head_dim: 2,
+            rms_norm_eps: 1e-6,
+            context_size: 4,
+            rope_half: 2,
+        };
+        let mut mats = HashMap::new();
+        let mut vecs = HashMap::new();
+        let m = |name: &str, r: usize, c: usize, mats: &mut HashMap<String, Tensor>| {
+            mats.insert(name.to_string(), tiny_mat(&dev, r, c));
+        };
+        let v = |name: &str, n: usize, vecs: &mut HashMap<String, Tensor>| {
+            vecs.insert(name.to_string(), tiny_vec(&dev, n));
+        };
+
+        m("embed_tokens.weight", 4, 4, &mut mats);
+        m("lm_head.weight", 4, 4, &mut mats);
+        // Layer 0: linear attention (key_dim=4, val_dim=8, conv_dim=16).
+        m("layers.0.linear_attn.in_proj_qkv", 16, 4, &mut mats);
+        m("layers.0.linear_attn.in_proj_z", 8, 4, &mut mats);
+        m("layers.0.linear_attn.in_proj_b", 4, 4, &mut mats);
+        m("layers.0.linear_attn.in_proj_a", 4, 4, &mut mats);
+        m("layers.0.linear_attn.out_proj", 4, 8, &mut mats);
+        m("layers.0.mlp.gate_proj", 8, 4, &mut mats);
+        m("layers.0.mlp.up_proj", 8, 4, &mut mats);
+        m("layers.0.mlp.down_proj", 4, 8, &mut mats);
+        // Layer 1: full attention (nh=2, hd=4 -> q_proj out = 2*2*4).
+        m("layers.1.self_attn.q_proj", 16, 4, &mut mats);
+        m("layers.1.self_attn.k_proj", 4, 4, &mut mats);
+        m("layers.1.self_attn.v_proj", 4, 4, &mut mats);
+        m("layers.1.self_attn.o_proj", 4, 8, &mut mats);
+        m("layers.1.mlp.gate_proj", 8, 4, &mut mats);
+        m("layers.1.mlp.up_proj", 8, 4, &mut mats);
+        m("layers.1.mlp.down_proj", 4, 8, &mut mats);
+
+        for name in [
+            "layers.0.input_layernorm.weight",
+            "layers.0.post_attention_layernorm.weight",
+            "layers.1.input_layernorm.weight",
+            "layers.1.post_attention_layernorm.weight",
+            "norm.weight",
+        ] {
+            v(name, 4, &mut vecs);
+        }
+        v("layers.0.linear_attn.conv1d.weight", 32, &mut vecs);
+        v("layers.0.linear_attn.A_log", 4, &mut vecs);
+        v("layers.0.linear_attn.dt_bias", 4, &mut vecs);
+        v("layers.0.linear_attn.norm.weight", 2, &mut vecs);
+        v("layers.1.self_attn.q_norm.weight", 4, &mut vecs);
+        v("layers.1.self_attn.k_norm.weight", 4, &mut vecs);
+
+        let gw = Arc::new(GpuWeights {
+            device: dev.clone(),
+            prefix: String::new(),
+            cfg,
+            mats,
+            qhat: HashMap::new(),
+            vecs,
+            rope_cos: tiny_f32_mat(&dev, 4, 2),
+            rope_sin: tiny_f32_mat(&dev, 4, 2),
+            h128: Tensor::zeros((128, 128), DType::F32, &dev).unwrap(),
+        });
+        let mut runner = GpuRunner::new(gw).unwrap();
+        // Prefill three tokens (exercises full attention with tlen > 1).
+        let logits = runner.forward(&[0, 1, 2]).unwrap();
+        assert_eq!(logits.len(), 4);
+        assert!(logits.iter().all(|x| x.is_finite()), "non-finite logits");
+        // Decode one more token (continues both attention states).
+        let logits = runner.forward(&[3]).unwrap();
+        assert_eq!(logits.len(), 4);
+        assert!(logits.iter().all(|x| x.is_finite()), "non-finite logits");
+    }
+
+    #[test]
+    fn quantized_matmul_runs_on_device() {
+        let dev = Device::Cpu;
+        let (k, n) = (128usize, 128usize);
+        let wf: Vec<f16> = (0..k * n)
+            .map(|i| f16::from_f32(((i * 11) % 17) as f32 / 20.0 - 0.4))
+            .collect();
+        let su: Vec<f32> = (0..k).map(|i| 1.0 + (i % 3) as f32 / 10.0).collect();
+        let sv: Vec<f32> = (0..n).map(|i| 1.0 + (i % 5) as f32 / 10.0).collect();
+        let x: Vec<f32> = (0..k).map(|i| (i % 7) as f32 / 10.0 - 0.3).collect();
+        let parts = (
+            Tensor::from_slice(&wf, (n, k), &dev).unwrap(),
+            Tensor::from_slice(&su, (k,), &dev).unwrap(),
+            Tensor::from_slice(&sv, (n,), &dev).unwrap(),
+        );
+        let xt = Tensor::from_slice(&x, (k,), &dev).unwrap();
+        let cfg = GpuCfg {
+            num_layers: 0,
+            hidden_size: k,
+            vocab_size: n,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 1,
+            layer_types: Vec::new(),
+            full_attention_interval: 1,
+            linear_conv_kernel_dim: 1,
+            linear_key_head_dim: 1,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_value_head_dim: 1,
+            rms_norm_eps: 1e-6,
+            context_size: 1,
+            rope_half: 0,
+        };
+        let gw = GpuWeights {
+            device: dev.clone(),
+            prefix: String::new(),
+            cfg,
+            mats: HashMap::new(),
+            qhat: HashMap::new(),
+            vecs: HashMap::new(),
+            rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
+            rope_sin: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
+            h128: {
+                let scale = 1.0 / 128.0f32.sqrt();
+                let mut h = vec![0.0f32; 128 * 128];
+                for i in 0..128 {
+                    for j in 0..128 {
+                        h[i * 128 + j] = if (i & j).count_ones() % 2 == 0 {
+                            scale
+                        } else {
+                            -scale
+                        };
+                    }
+                }
+                Tensor::from_slice(&h, (128, 128), &dev).unwrap()
+            },
+        };
+        let got = gw.q_matmul(&parts, &xt).unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(got.len(), n);
+        assert!(got.iter().all(|v| v.is_finite()));
     }
 
     #[test]

@@ -315,10 +315,23 @@ and no activations cross the bus during prefill/decode.
   compiles it transitively). Device GEMMs use fp16 inputs with f32 accumulate,
   so outputs can differ slightly from the f32 CPU path.
 - Verified: `cargo test` (115 passed / 11 ignored), `cargo test --features gpu`
-  (121 passed / 11 ignored), fmt and clippy clean with and without `gpu`.
+  (123 passed / 11 ignored), fmt and clippy clean with and without `gpu`.
   Device-op tests run on candle's CPU device; **real-GPU correctness and
   throughput must be validated on the target hardware** with
   `EXLLAMA_BENCH_COMPUTE=gpu` A/B runs (the benchmark accepts `gpu` now).
+
+### Follow-up: GPU forward shape/indexing fixes
+A real-model prefill failed with `shape mismatch in mul, lhs: [16,128],
+rhs: [1,128]`. Candle's `.mul()` needs exactly equal shapes (only
+`broadcast_mul()` broadcasts). Fixed in `src/gpu.rs`: `rms_norm` now
+broadcasts the 1-D weight over 2-D q/k tensors; per-head gated norm broadcasts
+`(1,vd)` and `(nvh,vd)`; q_proj reshape is `(nh,hd*2)` (query|gate contiguous
+per head, not `(nh,2,hd)`); RoPE tables are indexed with one row
+(`narrow(0,pos,1)`); and the full-attention KV gather selects one KV head
+(`narrow(1,kh,1)` + `squeeze(1)`). Added
+`gpu::tests::device_forward_runs_end_to_end_on_cpu` (multi-head tiny model,
+prefill + decode) and a synthetic `q_matmul` test — together they exercise
+every device forward branch and catch shape bugs without a GPU.
 
 ### REMINDER — future work: fully on-device sampling
 Sampling still runs on the host after the single logits copy. Implement
