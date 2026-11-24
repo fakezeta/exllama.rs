@@ -969,6 +969,22 @@ pub(crate) struct DeviceSample {
     pub top: Vec<(u32, f32)>,
 }
 
+/// Host-side inverse-CDF draw over an already top-k/top-p-filtered weight
+/// vector. Kept off device because candle 0.11's `Tensor::cumsum` materializes
+/// an `(n, n)` upper-triangular matrix — ~246 GB at `vocab = 248320`.
+fn inverse_cdf(weights: &[f32], u: f32) -> u32 {
+    let total: f64 = weights.iter().map(|&v| v as f64).sum();
+    let target = (u as f64) * total;
+    let mut cum = 0.0f64;
+    for (i, &v) in weights.iter().enumerate() {
+        cum += v as f64;
+        if cum >= target {
+            return i as u32;
+        }
+    }
+    weights.len().saturating_sub(1) as u32
+}
+
 impl GpuRunner {
     /// Sample from the logits produced by the last `forward_logits` call,
     /// entirely on device. `u` is a host-provided uniform in `[0, 1)` from the
@@ -1194,16 +1210,17 @@ impl GpuRunner {
                 sel = sel.broadcast_mul(&nucleus).ce()?;
             }
             let ws = w.broadcast_mul(&sel).ce()?;
-            let cdf = ws.cumsum(0).ce()?;
-            let total = cdf.get(vocab - 1).ce()?;
-            let target = total.affine(u as f64, 0.0).ce()?;
-            cdf.ge(&target.broadcast_as((vocab,)).ce()?)
+            // Candle 0.11 implements `cumsum` as a matmul against an
+            // upper-triangular (n, n) matrix. With vocab=248320 that single
+            // temporary is ~246 GB — an instant CUDA OOM on the first sample.
+            // The inverse-CDF walk is done on the host instead: one ~1 MB D2H
+            // copy of the already-filtered weights per token, no giant device
+            // allocation, and the same distribution.
+            let weights = ws.to_vec1::<f32>().ce()?;
+            let token = inverse_cdf(&weights, u);
+            Tensor::from_slice(&[token as i64], (1,), dev)
                 .ce()?
-                .to_dtype(DType::F32)
-                .ce()?
-                .argmax(0)
-                .ce()?
-                .to_dtype(DType::I64)
+                .squeeze(0)
                 .ce()?
         };
         let token1 = token_id.reshape((1,)).ce()?;
@@ -2606,6 +2623,33 @@ mod tests {
         runner.forward_logits(&[first.token]).unwrap();
         let second = runner.sample(&spec, &[first.token], 0.25).unwrap();
         assert!(second.token < 8 && second.logprob.is_finite());
+    }
+
+    /// The old device sampler called `Tensor::cumsum`, which in candle 0.11
+    /// builds an `(n, n)` triangular matrix: ~246 GB at the real vocab size.
+    /// `inverse_cdf` must handle a full-size vocab vector on the host with a
+    /// bounded, tiny footprint and return the same id as a reference walk.
+    #[test]
+    fn inverse_cdf_handles_full_vocab_size() {
+        let n = 248_320usize;
+        let weights: Vec<f32> = (0..n)
+            .map(|i| ((i * 37) % 101) as f32 / 100.0 + 0.01)
+            .collect();
+        let u = 0.37f32;
+        let got = inverse_cdf(&weights, u);
+        let total: f64 = weights.iter().map(|&v| v as f64).sum();
+        let target = u as f64 * total;
+        let mut cum = 0.0f64;
+        let mut expect = (n - 1) as u32;
+        for (i, &v) in weights.iter().enumerate() {
+            cum += v as f64;
+            if cum >= target {
+                expect = i as u32;
+                break;
+            }
+        }
+        assert_eq!(got, expect);
+        assert!((got as usize) < n);
     }
 
     #[test]
