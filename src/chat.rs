@@ -292,16 +292,25 @@ mod tests {
     /// Qwen3.5 template, including the thinking-mode generation suffix.
     #[test]
     fn prompts_match_committed_golden_files() {
+        // `.gitattributes` forces LF for these files, but a checkout with
+        // core.autocrlf=true can still yield CRLF on Windows. Normalize both
+        // sides so the assertion is about template content, not line endings.
+        fn lf(s: &str) -> String {
+            s.replace("\r\n", "\n")
+        }
         let simple = apply_chat_template(&[msg("user", "Hello")], true, true);
-        assert_eq!(simple, include_str!("../tests/golden/chat_simple.txt"));
+        assert_eq!(
+            lf(&simple),
+            lf(include_str!("../tests/golden/chat_simple.txt"))
+        );
         let with_system = apply_chat_template(
             &[msg("system", "Be helpful"), msg("user", "Hi")],
             true,
             false,
         );
         assert_eq!(
-            with_system,
-            include_str!("../tests/golden/chat_with_system.txt")
+            lf(&with_system),
+            lf(include_str!("../tests/golden/chat_with_system.txt"))
         );
     }
 
