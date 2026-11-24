@@ -27,6 +27,16 @@ impl<T> CandleExt<T> for candle_core::Result<T> {
     }
 }
 
+/// Candle's matmul requires *contiguous* operands on CUDA. `permute`,
+/// `transpose` and `t` return strided views, so a CPU-device test can pass
+/// while the real GPU rejects the same op with
+/// "matmul is only supported for contiguous tensors". All runtime matmuls go
+/// through here; `.contiguous()` is a cheap no-op for already-contiguous
+/// tensors.
+fn matmul_c(a: &Tensor, b: &Tensor) -> Result<Tensor, String> {
+    a.contiguous().ce()?.matmul(&b.contiguous().ce()?).ce()
+}
+
 /// Config values the device forward needs (copied out of `ModelConfig`).
 #[derive(Clone)]
 struct GpuCfg {
@@ -244,7 +254,7 @@ impl GpuWeights {
             ));
         }
         let blocks = len / 128;
-        let out = v.reshape((blocks, 128)).ce()?.matmul(&self.h128).ce()?;
+        let out = matmul_c(&v.reshape((blocks, 128)).ce()?, &self.h128)?;
         out.flatten_all().ce()
     }
 
@@ -259,7 +269,7 @@ impl GpuWeights {
             ));
         }
         let x16 = x.to_dtype(DType::F16).ce()?.reshape((k, 1)).ce()?;
-        let y = w.matmul(&x16).ce()?;
+        let y = matmul_c(w, &x16)?;
         y.to_dtype(DType::F32).ce()?.flatten_all().ce()
     }
 
@@ -1225,21 +1235,13 @@ pub(crate) fn fold_hadamards(w: &Tensor, h128: &Tensor) -> Result<Tensor, String
     let h = h128.to_dtype(DType::F16).ce()?;
     // Left H_n: H @ block for each 128-row block of W_hat -> (n, k).
     let nb = n / 128;
-    let rows = h
-        .repeat((nb, 1, 1))
-        .ce()?
-        .matmul(&w.reshape((nb, 128, k)).ce()?)
-        .ce()?
+    let rows = matmul_c(&h.repeat((nb, 1, 1)).ce()?, &w.reshape((nb, 128, k)).ce()?)?
         .reshape((n, k))
         .ce()?;
     // Right H_k: block @ H^T for each 128-column block -> (n, k).
     // H is symmetric, so block @ H^T == H @ block.
     let kb = k / 128;
-    let cols = rows
-        .reshape((n * kb, 128))
-        .ce()?
-        .matmul(&h.t().ce()?)
-        .ce()?
+    let cols = matmul_c(&rows.reshape((n * kb, 128)).ce()?, &h.t().ce()?)?
         .reshape((n, k))
         .ce()?;
     Ok(cols)
@@ -1285,22 +1287,14 @@ fn gqa_attention(
     let qg = q.reshape((nkv, groups, hd)).ce()?;
     let gate2 = gate.reshape((nkv, groups, hd)).ce()?;
     // scores[kh, t, g] = sum_d kmat[kh, t, d] * qg[kh, g, d]
-    let scores = kmat
-        .permute((1, 0, 2))
-        .ce()?
-        .matmul(&qg.transpose(1, 2).ce()?)
-        .ce()?
+    let scores = matmul_c(&kmat.permute((1, 0, 2)).ce()?, &qg.transpose(1, 2).ce()?)?
         .affine(scale as f64, 0.0)
         .ce()?;
     let m = scores.max_keepdim(1).ce()?;
     let e = scores.broadcast_sub(&m).ce()?.exp().ce()?;
     let probs = e.broadcast_div(&e.sum_keepdim(1).ce()?).ce()?;
     // out[kh, g, d] = sum_t probs[kh, t, g] * vmat[kh, t, d]
-    let out = vmat
-        .permute((1, 2, 0))
-        .ce()?
-        .matmul(&probs)
-        .ce()?
+    let out = matmul_c(&vmat.permute((1, 2, 0)).ce()?, &probs)?
         .transpose(1, 2)
         .ce()?;
     let sig = gate2
@@ -1336,27 +1330,17 @@ fn deltanet_step(
         .ce()?;
     let kh = k.broadcast_div(&kn).ce()?;
     let s = state.affine(g.exp() as f64, 0.0).ce()?;
-    let mem = s
-        .t()
-        .ce()?
-        .matmul(&kh.reshape((kd, 1)).ce()?)
-        .ce()?
+    let mem = matmul_c(&s.t().ce()?, &kh.reshape((kd, 1)).ce()?)?
         .flatten_all()
         .ce()?;
     let delta = v.sub(&mem).ce()?.affine(beta as f64, 0.0).ce()?;
     let s2 = s
-        .add(
-            &kh.reshape((kd, 1))
-                .ce()?
-                .matmul(&delta.reshape((1, vd)).ce()?)
-                .ce()?,
-        )
+        .add(&matmul_c(
+            &kh.reshape((kd, 1)).ce()?,
+            &delta.reshape((1, vd)).ce()?,
+        )?)
         .ce()?;
-    let o = s2
-        .t()
-        .ce()?
-        .matmul(&qh.reshape((kd, 1)).ce()?)
-        .ce()?
+    let o = matmul_c(&s2.t().ce()?, &qh.reshape((kd, 1)).ce()?)?
         .flatten_all()
         .ce()?;
     Ok((s2, o))
@@ -1440,11 +1424,7 @@ fn deltanet_step_all(
     // (nvh, kd, 1)
     let kh_col = kh.unsqueeze(2).ce()?;
     // mem = S^T @ k_hat -> (nvh, vd)
-    let mem = s
-        .transpose(1, 2)
-        .ce()?
-        .matmul(&kh_col)
-        .ce()?
+    let mem = matmul_c(&s.transpose(1, 2).ce()?, &kh_col)?
         .squeeze(2)
         .ce()?;
     let v2 = v.reshape((nvh, vd)).ce()?;
@@ -1454,14 +1434,8 @@ fn deltanet_step_all(
         .broadcast_mul(&beta.unsqueeze(1).ce()?)
         .ce()?;
     // S' = S + k_hat (x) delta, then o = S'^T @ q_hat.
-    let s2 = s
-        .add(&kh_col.matmul(&delta.unsqueeze(1).ce()?).ce()?)
-        .ce()?;
-    let o = s2
-        .transpose(1, 2)
-        .ce()?
-        .matmul(&qh.unsqueeze(2).ce()?)
-        .ce()?
+    let s2 = s.add(&matmul_c(&kh_col, &delta.unsqueeze(1).ce()?)?).ce()?;
+    let o = matmul_c(&s2.transpose(1, 2).ce()?, &qh.unsqueeze(2).ce()?)?
         .squeeze(2)
         .ce()?;
     Ok((s2, o.flatten_all().ce()?))

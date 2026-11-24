@@ -329,9 +329,14 @@ fn gpu_matmul(
         Ok(t) => t,
         Err(_) => return false,
     };
+    // CUDA matmul requires contiguous operands; `t()` returns a strided view.
+    let wt = match ws.t().and_then(|t| t.contiguous()) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
     let res = xs
         .reshape((1usize, x_cols))
-        .and_then(|x2| x2.matmul(&ws.t()?))
+        .and_then(|x2| x2.matmul(&wt))
         .and_then(|o| o.reshape((w_rows,)))
         .and_then(|o| o.to_vec1::<f32>());
     match res {
