@@ -1139,6 +1139,9 @@ fn argmax(v: &[f32]) -> u32 {
 /// Hard cap aligned with OpenAI (`top_logprobs` <= 20, `n` <= 128).
 const MAX_TOP_LOGPROBS: usize = 20;
 const MAX_N: usize = 128;
+/// Cap on `top_k`: the device sampler uses repeated argmax, so each retained
+/// candidate costs a device tensor. Large values would OOM on the first token.
+const MAX_TOP_K: usize = 1024;
 const JSON_HINT: &str =
     "\n\nRespond with a single valid JSON object and nothing else. Do not use markdown code fences.";
 
@@ -1416,6 +1419,12 @@ fn parse_params_inner(body: &Json, engine: &Engine, chat: bool) -> Result<Params
     if let Some(v) = json_int(body, "top_k")? {
         if v < 0 || (v as u64) > usize::MAX as u64 {
             return Err(bad("top_k must be a non-negative integer"));
+        }
+        // The device sampler implements top-k with one device tensor per
+        // retained candidate; an uncapped value would try to allocate one
+        // vocab-sized tensor per candidate and OOM on the first token.
+        if v as u64 > MAX_TOP_K as u64 {
+            return Err(bad(&format!("top_k must be <= {}", MAX_TOP_K)));
         }
         p.top_k = v as usize;
     }

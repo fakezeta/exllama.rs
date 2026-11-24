@@ -162,8 +162,10 @@ impl GpuWeights {
         // uploads only the final matrix, so the device never needs the
         // full-size intermediates a device-side fold would allocate.
         let mut qhat = HashMap::new();
+        let mut qhat_bytes = 0usize;
         for (name, ql) in &ex.linears {
             let (w, suh, svh) = ql.upload_device(device)?;
+            qhat_bytes += w.elem_count() * 2 + suh.elem_count() * 4 + svh.elem_count() * 4;
             qhat.insert(name.clone(), (w, suh, svh));
         }
         let mut vecs = HashMap::new();
@@ -173,11 +175,21 @@ impl GpuWeights {
         }
         let rope_cos_t = Tensor::from_slice(rope_cos, (context_size, rope_half), device).ce()?;
         let rope_sin_t = Tensor::from_slice(rope_sin, (context_size, rope_half), device).ce()?;
+        // `mats` holds only fp16 tensors (plain matrices + embeddings).
+        let mats_bytes: usize = mats.values().map(|t| t.elem_count() * 2).sum();
         eprintln!(
-            "[gpu] weights uploaded: {} matrices, {} quantized linears, {} vectors",
+            "[gpu] weights uploaded: {} matrices ({:.1} MiB), {} quantized linears ({:.1} MiB), {} vectors; config: layers={} ctx={} nh={} nkv={} hd={} nvh={}",
             mats.len(),
+            mats_bytes as f64 / 1048576.0,
             qhat.len(),
-            vecs.len()
+            qhat_bytes as f64 / 1048576.0,
+            vecs.len(),
+            config.num_layers,
+            context_size,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+            config.linear_num_value_heads,
         );
         Ok(Arc::new(Self {
             device: device.clone(),
@@ -447,6 +459,17 @@ pub(crate) struct GpuSnapshot {
 impl GpuState {
     fn new(w: &GpuWeights) -> Result<Self, String> {
         let cfg = &w.cfg;
+        if cfg.context_size > 8192 {
+            // KV caches are allocated for the full context up front; at very
+            // large values this is the dominant VRAM cost and a likely OOM.
+            let nfull = (0..cfg.num_layers).filter(|&i| w.is_full(i)).count();
+            let kv = cfg.num_key_value_heads * cfg.head_dim;
+            let mib = (nfull * 2 * cfg.context_size * kv * 2) as f64 / 1048576.0;
+            eprintln!(
+                "[gpu] warning: context_size={} reserves ~{:.1} MiB of KV cache on device (reduce --context-size if OOM)",
+                cfg.context_size, mib
+            );
+        }
         let mut full = Vec::new();
         let mut linear = Vec::new();
         for i in 0..cfg.num_layers {
@@ -1083,7 +1106,11 @@ impl GpuRunner {
             let scores = p.affine((1.0 / temp) as f64, 0.0).ce()?;
             let smax = scores.max(0).ce()?;
             let w = scores.broadcast_sub(&smax).ce()?.exp().ce()?;
-            let top_k_on = spec.top_k >= 1 && spec.top_k < vocab;
+            // Defense in depth: `server::parse_params` caps top_k, but Params
+            // can be constructed programmatically in tests/embeddings. Each
+            // retained candidate costs a full vocab-sized device tensor here.
+            let top_k = spec.top_k.min(vocab).min(1024);
+            let top_k_on = top_k >= 1;
             let mut sel = if top_k_on {
                 Tensor::zeros((vocab,), DType::F32, dev).ce()?
             } else {
@@ -1091,8 +1118,8 @@ impl GpuRunner {
             };
             if top_k_on {
                 let mut masked = scores.clone();
-                let mut ids = Vec::with_capacity(spec.top_k);
-                for _ in 0..spec.top_k {
+                let mut ids = Vec::with_capacity(top_k);
+                for _ in 0..top_k {
                     let id = masked
                         .argmax(0)
                         .ce()?
@@ -1111,7 +1138,7 @@ impl GpuRunner {
                 }
                 let idx = Tensor::cat(&ids, 0).ce()?;
                 sel = sel
-                    .scatter(&idx, &Tensor::ones((spec.top_k,), DType::F32, dev).ce()?, 0)
+                    .scatter(&idx, &Tensor::ones((top_k,), DType::F32, dev).ce()?, 0)
                     .ce()?;
             }
             if spec.top_p > 0.0 && spec.top_p < 1.0 {
