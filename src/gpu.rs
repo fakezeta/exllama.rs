@@ -55,7 +55,9 @@ pub(crate) struct GpuWeights {
     cfg: GpuCfg,
     /// Plain matrices and fp16 embedding tables, both (out, in) F16.
     mats: HashMap<String, Tensor>,
-    /// Quantized linears: (W_hat (n,k) F16, suh (k,) F32, svh (n,) F32).
+    /// Quantized linears: (folded `B = (H_n @ W_hat^T @ H_k)^T` (n,k) F16,
+    /// suh (k,) F32, svh (n,) F32). Both Hadamards are baked into `B` at load,
+    /// so a decode step is one GEMV instead of three.
     qhat: HashMap<String, (Tensor, Tensor, Tensor)>,
     /// 1-D tensors (norms, conv weights, A_log, dt_bias), F32.
     vecs: HashMap<String, Tensor>,
@@ -134,17 +136,6 @@ impl GpuWeights {
                 .map_err(|e| format!("{}: upload embedding: {}", name, e))?;
             mats.insert(name.clone(), t);
         }
-        let mut qhat = HashMap::new();
-        for (name, ql) in &ex.linears {
-            qhat.insert(name.clone(), ql.upload_device(device)?);
-        }
-        let mut vecs = HashMap::new();
-        for (name, v) in &ex.vectors {
-            let t = Tensor::from_slice(v, (v.len(),), device).ce()?;
-            vecs.insert(name.clone(), t);
-        }
-        let rope_cos_t = Tensor::from_slice(rope_cos, (context_size, rope_half), device).ce()?;
-        let rope_sin_t = Tensor::from_slice(rope_sin, (context_size, rope_half), device).ce()?;
         let scale = 1.0 / (128.0f32).sqrt();
         let mut h = vec![0.0f32; 128 * 128];
         for i in 0..128 {
@@ -157,6 +148,23 @@ impl GpuWeights {
             }
         }
         let h128 = Tensor::from_slice(&h, (128, 128), device).ce()?;
+        // Fold both Hadamards into every W_hat once at load. The decode path
+        // then needs a single GEMV per quantized linear instead of two
+        // Hadamard GEMMs plus the W_hat GEMV.
+        let mut qhat = HashMap::new();
+        for (name, ql) in &ex.linears {
+            let (w, suh, svh) = ql.upload_device(device)?;
+            let w = fold_hadamards(&w, &h128)
+                .map_err(|e| format!("{}: fold Hadamards into W_hat: {}", name, e))?;
+            qhat.insert(name.clone(), (w, suh, svh));
+        }
+        let mut vecs = HashMap::new();
+        for (name, v) in &ex.vectors {
+            let t = Tensor::from_slice(v, (v.len(),), device).ce()?;
+            vecs.insert(name.clone(), t);
+        }
+        let rope_cos_t = Tensor::from_slice(rope_cos, (context_size, rope_half), device).ce()?;
+        let rope_sin_t = Tensor::from_slice(rope_sin, (context_size, rope_half), device).ce()?;
         eprintln!(
             "[gpu] weights uploaded: {} matrices, {} quantized linears, {} vectors",
             mats.len(),
@@ -255,8 +263,9 @@ impl GpuWeights {
         y.to_dtype(DType::F32).ce()?.flatten_all().ce()
     }
 
-    /// One EXL3 quantized linear, entirely on device:
-    /// `y = svh * (H_n @ (W_hat^T @ (H_k @ (x * suh))))`.
+    /// One EXL3 quantized linear, entirely on device. Both Hadamards are
+    /// already folded into `w` at load time, so this is
+    /// `y = svh * (B @ (x * suh))` — a single GEMV.
     fn q_matmul(&self, parts: &(Tensor, Tensor, Tensor), x: &Tensor) -> Result<Tensor, String> {
         let (w, suh, svh) = parts;
         if x.elem_count() != suh.elem_count() {
@@ -266,9 +275,8 @@ impl GpuWeights {
                 suh.elem_count()
             ));
         }
-        let xr = self.hadamard(&x.mul(suh).ce()?)?;
+        let xr = x.mul(suh).ce()?;
         let t = Self::matmul_w(w, &xr)?;
-        let t = self.hadamard(&t)?;
         t.mul(svh).ce()
     }
 
@@ -415,6 +423,8 @@ pub(crate) struct GpuState {
     full: Vec<(Tensor, Tensor)>,
     /// conv (hist, conv_dim) and recurrent state (nvh, kd, vd), fp32.
     linear: Vec<(Tensor, usize, Tensor)>,
+    /// Logits from the most recent forward, kept on device for sampling.
+    logits: Option<Tensor>,
 }
 
 /// Compact post-prefill snapshot (only the used KV prefix).
@@ -422,6 +432,8 @@ pub(crate) struct GpuSnapshot {
     position: usize,
     full: Vec<(Tensor, Tensor)>,
     linear: Vec<(Tensor, usize, Tensor)>,
+    /// Post-prefill logits, so `n > 1` choices can sample without a host copy.
+    logits: Option<Tensor>,
 }
 
 impl GpuState {
@@ -461,6 +473,7 @@ impl GpuState {
             position: 0,
             full,
             linear,
+            logits: None,
         })
     }
 
@@ -483,6 +496,7 @@ impl GpuState {
                 .iter()
                 .map(|(c, p, s)| Ok((c.copy().ce()?, *p, s.copy().ce()?)))
                 .collect::<Result<Vec<_>, String>>()?,
+            logits: self.logits.as_ref().map(|t| t.copy().expect("copy logits")),
         })
     }
 
@@ -505,6 +519,10 @@ impl GpuState {
                 .slice_scatter(ss, 0, 0)
                 .ce()?;
         }
+        self.logits = snap
+            .logits
+            .as_ref()
+            .map(|t| t.copy().expect("restore logits"));
         Ok(())
     }
 }
@@ -542,8 +560,9 @@ impl GpuRunner {
         self.state.position
     }
 
-    /// Run the tokens on device and copy back only the final logits.
-    pub(crate) fn forward(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
+    /// Run the tokens on device, keeping the resulting logits on device.
+    /// Callers that sample on device use this so only a token id crosses back.
+    pub(crate) fn forward_logits(&mut self, ids: &[u32]) -> Result<(), String> {
         // Reject an overlong prompt before mutating any state. (The CPU
         // wrapper checks this too, but the guard here keeps direct callers
         // from leaving a half-written KV/conv state behind on error.)
@@ -561,7 +580,15 @@ impl GpuRunner {
             ));
         }
         if ids.is_empty() {
-            return Ok(vec![0.0; self.weights.cfg.vocab_size]);
+            self.state.logits = Some(
+                Tensor::zeros(
+                    (self.weights.cfg.vocab_size,),
+                    DType::F32,
+                    &self.weights.device,
+                )
+                .ce()?,
+            );
+            return Ok(());
         }
         let mut logits = Tensor::zeros(
             (self.weights.cfg.vocab_size,),
@@ -572,7 +599,24 @@ impl GpuRunner {
         for &t in ids {
             logits = self.forward_token(t)?;
         }
-        logits.to_vec1::<f32>().ce()
+        self.state.logits = Some(logits);
+        Ok(())
+    }
+
+    /// Run the tokens on device and copy back the final logits (host-sampling
+    /// path and tests).
+    pub(crate) fn forward(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        self.forward_logits(ids)?;
+        self.state
+            .logits
+            .as_ref()
+            .ok_or_else(|| "no logits after forward".to_string())?
+            .to_vec1::<f32>()
+            .ce()
+    }
+
+    pub(crate) fn has_logits(&self) -> bool {
+        self.state.logits.is_some()
     }
 
     fn forward_full_attn(
@@ -663,63 +707,7 @@ impl GpuRunner {
         *kc = kc.slice_scatter(&krow, 0, pos).ce()?;
         *vc = vc.slice_scatter(&vrow, 0, pos).ce()?;
 
-        let tlen = pos + 1;
-        let scale = 1.0 / (hd as f32).sqrt();
-        let groups = nh / nkv;
-        let mut heads = Vec::with_capacity(nh);
-        for h in 0..nh {
-            let kh = h / groups;
-            // Cache row layout is (nkv, hd). Select one KV head (dim 1 has
-            // size nkv, *not* hd) and drop that dim to get (tlen, hd).
-            let kmat = kc
-                .narrow(0, 0, tlen)
-                .ce()?
-                .reshape((tlen, nkv, hd))
-                .ce()?
-                .narrow(1, kh, 1)
-                .ce()?
-                .squeeze(1)
-                .ce()?
-                .to_dtype(DType::F32)
-                .ce()?;
-            let qh = q.narrow(0, h * hd, hd).ce()?.reshape((1, hd)).ce()?;
-            let mut scores = kmat.matmul(&qh.t().ce()?).ce()?.flatten_all().ce()?;
-            scores = scores.affine(scale as f64, 0.0).ce()?;
-            let m = scores.max_keepdim(0).ce()?;
-            let e = scores.broadcast_sub(&m).ce()?.exp().ce()?;
-            let probs = e.broadcast_div(&e.sum_keepdim(0).ce()?).ce()?;
-            let vmat = vc
-                .narrow(0, 0, tlen)
-                .ce()?
-                .reshape((tlen, nkv, hd))
-                .ce()?
-                .narrow(1, kh, 1)
-                .ce()?
-                .squeeze(1)
-                .ce()?
-                .to_dtype(DType::F32)
-                .ce()?;
-            let mut out = probs
-                .reshape((1, tlen))
-                .ce()?
-                .matmul(&vmat)
-                .ce()?
-                .flatten_all()
-                .ce()?;
-            let gh = gate.narrow(0, h * hd, hd).ce()?;
-            let sig = gh
-                .neg()
-                .ce()?
-                .exp()
-                .ce()?
-                .affine(1.0, 1.0)
-                .ce()?
-                .recip()
-                .ce()?;
-            out = out.mul(&sig).ce()?;
-            heads.push(out);
-        }
-        let attn = Tensor::cat(&heads, 0).ce()?;
+        let attn = gqa_attention(kc, vc, &q, &gate, pos + 1, nh, nkv, hd)?;
         let y = w.linear(&format!("layers.{}.self_attn.o_proj", layer), &attn)?;
         if y.dim(0).ce()? != cfg.hidden_size {
             return Err(format!("layer {}: unexpected o_proj shape", layer));
@@ -789,7 +777,6 @@ impl GpuRunner {
         let q = conv_out.narrow(0, 0, key_dim).ce()?;
         let k = conv_out.narrow(0, key_dim, key_dim).ce()?;
         let v = conv_out.narrow(0, 2 * key_dim, val_dim).ce()?;
-        let rep = nvh / nkh;
 
         let alog = w.vec(&format!("layers.{}.linear_attn.A_log", layer))?;
         let dtbias = w.vec(&format!("layers.{}.linear_attn.dt_bias", layer))?;
@@ -834,24 +821,14 @@ impl GpuRunner {
             .recip()
             .ce()?;
 
-        // Recurrent update, one value head at a time; all ops stay on device.
-        let mut new_heads = Vec::with_capacity(nvh);
-        let mut outs = Vec::with_capacity(nvh);
-        let sstate_copy = sstate.copy().ce()?;
-        for vh in 0..nvh {
-            let kh_idx = vh / rep;
-            let qh = q.narrow(0, kh_idx * kd, kd).ce()?;
-            let kh = k.narrow(0, kh_idx * kd, kd).ce()?;
-            let vh_vec = v.narrow(0, vh * vd, vd).ce()?;
-            let s = sstate_copy.get(vh).ce()?.reshape((kd, vd)).ce()?;
-            let gi = g.get(vh).ce()?.to_vec0::<f32>().ce()?;
-            let bi = beta.get(vh).ce()?.to_vec0::<f32>().ce()?;
-            let (ns, o) = deltanet_step(&s, &qh, &kh, &vh_vec, gi, bi, kd, vd)?;
-            new_heads.push(ns.reshape((1, kd, vd)).ce()?);
-            outs.push(o);
-        }
-        *sstate = Tensor::cat(&new_heads, 0).ce()?;
-        let o_all = Tensor::cat(&outs, 0).ce()?;
+        // Recurrent update for *all* value heads in one batched device op.
+        // The old loop pulled `g[vh]`/`beta[vh]` to the host with `to_vec0()`
+        // for every head — nvh (32) * layers (18) full device synchronizations
+        // per token — and launched ~15 kernels per head. Keeping the decay and
+        // gating factors on device removes both the syncs and most launches.
+        let (new_state, o_all) =
+            deltanet_step_all(sstate, &q, &k, &v, &g, &beta, nkh, nvh, kd, vd)?;
+        *sstate = new_state;
 
         let norm_w2 = w.vec(&format!("layers.{}.linear_attn.norm.weight", layer))?;
         if norm_w2.elem_count() != vd || z.elem_count() != nvh * vd {
@@ -936,9 +913,408 @@ impl GpuRunner {
     }
 }
 
+/// Sampling parameters mirrored from `server::Params` for the device path.
+#[derive(Clone, Debug)]
+pub(crate) struct SampleSpec {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: usize,
+    pub repetition_penalty: f32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+    pub logit_bias: Vec<(u32, f32)>,
+    /// How many top logprobs to return (0 = none).
+    pub top_n: usize,
+}
+
+/// Compact result of one device sampling step. Only a token id, its logprob
+/// and a handful of top alternatives cross back to the host — never the full
+/// vocabulary of logits.
+#[derive(Clone, Debug)]
+pub(crate) struct DeviceSample {
+    pub token: u32,
+    pub logprob: f32,
+    /// Descending (token id, logprob) pairs, empty unless `top_n > 0`.
+    pub top: Vec<(u32, f32)>,
+}
+
+impl GpuRunner {
+    /// Sample from the logits produced by the last `forward_logits` call,
+    /// entirely on device. `u` is a host-provided uniform in `[0, 1)` from the
+    /// request RNG (one f32, instead of a vocabulary-sized logits copy).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sample(
+        &self,
+        spec: &SampleSpec,
+        history: &[u32],
+        u: f32,
+    ) -> Result<DeviceSample, String> {
+        let dev = &self.weights.device;
+        let vocab = self.weights.cfg.vocab_size;
+        let logits = self
+            .state
+            .logits
+            .as_ref()
+            .ok_or_else(|| "device sample called before any forward".to_string())?;
+        if logits.elem_count() != vocab {
+            return Err(format!(
+                "device sample: logits have {} elements, expected vocab {}",
+                logits.elem_count(),
+                vocab
+            ));
+        }
+        let to_i64 = |ids: &[u32]| -> Vec<i64> { ids.iter().map(|&t| t as i64).collect() };
+        // The host `prepare_logits` silently ignores ids outside the vocab;
+        // device `scatter` would not, so filter them to the same behavior.
+        let history: Vec<u32> = history
+            .iter()
+            .copied()
+            .filter(|&t| (t as usize) < vocab)
+            .collect();
+        let logit_bias: Vec<(u32, f32)> = spec
+            .logit_bias
+            .iter()
+            .copied()
+            .filter(|(id, _)| (*id as usize) < vocab)
+            .collect();
+
+        // ---- logit processors (mirrors server::prepare_logits) ----
+        let need_penalty = (spec.repetition_penalty > 0.0 && spec.repetition_penalty != 1.0)
+            || spec.presence_penalty != 0.0
+            || spec.frequency_penalty != 0.0;
+        let mut p = logits.clone();
+        if (need_penalty && !history.is_empty()) || !logit_bias.is_empty() {
+            let zero =
+                || -> Result<Tensor, String> { Tensor::zeros((vocab,), DType::F32, dev).ce() };
+            if need_penalty && !history.is_empty() {
+                let idx = Tensor::from_slice(&to_i64(&history), (history.len(),), dev).ce()?;
+                let ones = Tensor::ones((history.len(),), DType::F32, dev).ce()?;
+                let seen = zero()?.scatter(&idx, &ones, 0).ce()?;
+                if spec.repetition_penalty > 0.0 && spec.repetition_penalty != 1.0 {
+                    let rep = spec.repetition_penalty;
+                    // f = positive ? 1/rep : rep, applied only where seen.
+                    let pos = logits.gt(0.0).ce()?.to_dtype(DType::F32).ce()?;
+                    let neg = pos.affine(-1.0, 1.0).ce()?;
+                    let f = pos
+                        .affine((1.0 / rep) as f64, 0.0)
+                        .ce()?
+                        .broadcast_add(&neg.affine(rep as f64, 0.0).ce()?)
+                        .ce()?;
+                    // f - 1 (affine is self*scale + shift: use 1/-1 here,
+                    // affine(-1, 1) would give 1 - f and invert the penalty).
+                    let mult = f
+                        .affine(1.0, -1.0)
+                        .ce()?
+                        .broadcast_mul(&seen)
+                        .ce()?
+                        .affine(1.0, 1.0)
+                        .ce()?;
+                    p = p.broadcast_mul(&mult).ce()?;
+                }
+                if spec.presence_penalty != 0.0 || spec.frequency_penalty != 0.0 {
+                    let ones = Tensor::ones((history.len(),), DType::F32, dev).ce()?;
+                    let counts = zero()?.scatter_add(&idx, &ones, 0).ce()?;
+                    let add = seen.affine(-spec.presence_penalty as f64, 0.0).ce()?;
+                    let add = if spec.frequency_penalty != 0.0 {
+                        add.broadcast_sub(&counts.affine(spec.frequency_penalty as f64, 0.0).ce()?)
+                            .ce()?
+                    } else {
+                        add
+                    };
+                    p = p.broadcast_add(&add).ce()?;
+                }
+            }
+            if !logit_bias.is_empty() {
+                let ids: Vec<u32> = logit_bias.iter().map(|&(id, _)| id).collect();
+                let vals: Vec<f32> = logit_bias.iter().map(|&(_, b)| b).collect();
+                let idx = Tensor::from_slice(&to_i64(&ids), (ids.len(),), dev).ce()?;
+                let b = Tensor::from_slice(&vals, (vals.len(),), dev).ce()?;
+                let bias = zero()?.scatter(&idx, &b, 0).ce()?;
+                p = p.broadcast_add(&bias).ce()?;
+            }
+        }
+
+        // logprob(v) = v - max - ln(sum(exp(v - max))), over the *adjusted*
+        // distribution before temperature / top-k / top-p (vLLM convention).
+        let max_p = p.max(0).ce()?;
+        let sum_p = p.broadcast_sub(&max_p).ce()?.exp().ce()?.sum(0).ce()?;
+        let lognorm = sum_p.log().ce()?.broadcast_add(&max_p).ce()?;
+
+        // Top logprobs: repeated argmax on device (candle 0.11 has no topk).
+        // Each pass masks the previously selected logit to -inf.
+        let mut top_ids: Vec<Tensor> = Vec::new();
+        let mut top_vals: Vec<Tensor> = Vec::new();
+        if spec.top_n > 0 {
+            let mut masked = p.clone();
+            for _ in 0..spec.top_n.min(vocab) {
+                let id = masked
+                    .argmax(0)
+                    .ce()?
+                    .to_dtype(DType::I64)
+                    .ce()?
+                    .reshape((1,))
+                    .ce()?;
+                let val = masked.gather(&id, 0).ce()?;
+                masked = masked
+                    .scatter(
+                        &id,
+                        &Tensor::from_slice(&[f32::NEG_INFINITY], (1,), dev).ce()?,
+                        0,
+                    )
+                    .ce()?;
+                top_ids.push(id);
+                top_vals.push(val);
+            }
+        }
+
+        // ---- sampling transforms ----
+        let temp = spec.temperature;
+        let token_id = if temp <= 0.0 {
+            p.argmax(0).ce()?.to_dtype(DType::I64).ce()?
+        } else {
+            let scores = p.affine((1.0 / temp) as f64, 0.0).ce()?;
+            let smax = scores.max(0).ce()?;
+            let w = scores.broadcast_sub(&smax).ce()?.exp().ce()?;
+            let top_k_on = spec.top_k >= 1 && spec.top_k < vocab;
+            let mut sel = if top_k_on {
+                Tensor::zeros((vocab,), DType::F32, dev).ce()?
+            } else {
+                Tensor::ones((vocab,), DType::F32, dev).ce()?
+            };
+            if top_k_on {
+                let mut masked = scores.clone();
+                let mut ids = Vec::with_capacity(spec.top_k);
+                for _ in 0..spec.top_k {
+                    let id = masked
+                        .argmax(0)
+                        .ce()?
+                        .to_dtype(DType::I64)
+                        .ce()?
+                        .reshape((1,))
+                        .ce()?;
+                    ids.push(id.clone());
+                    masked = masked
+                        .scatter(
+                            &id,
+                            &Tensor::from_slice(&[f32::NEG_INFINITY], (1,), dev).ce()?,
+                            0,
+                        )
+                        .ce()?;
+                }
+                let idx = Tensor::cat(&ids, 0).ce()?;
+                sel = sel
+                    .scatter(&idx, &Tensor::ones((spec.top_k,), DType::F32, dev).ce()?, 0)
+                    .ce()?;
+            }
+            if spec.top_p > 0.0 && spec.top_p < 1.0 {
+                // Nucleus = smallest set of highest-logit tokens whose mass is
+                // >= top_p. exp is monotonic, so a threshold search on the
+                // logit value finds exactly the sorted-prefix the host sampler
+                // uses, without needing a sort (candle 0.11 has no topk/sort).
+                // Mass is measured over the candidates already kept by top-k,
+                // matching the host sampler's top-k then top-p order.
+                let target = w
+                    .broadcast_mul(&sel)
+                    .ce()?
+                    .sum(0)
+                    .ce()?
+                    .affine(spec.top_p as f64, 0.0)
+                    .ce()?;
+                let mut lo = smax
+                    .broadcast_add(&Tensor::from_slice(&[-40.0f32], (1,), dev).ce()?)
+                    .ce()?;
+                let mut hi = smax.clone();
+                for _ in 0..32 {
+                    let mid = lo.broadcast_add(&hi).ce()?.affine(0.5, 0.0).ce()?;
+                    let sel_mid = scores
+                        .ge(&mid.broadcast_as((vocab,)).ce()?)
+                        .ce()?
+                        .to_dtype(DType::F32)
+                        .ce()?;
+                    let mass = w
+                        .broadcast_mul(&sel_mid)
+                        .ce()?
+                        .broadcast_mul(&sel)
+                        .ce()?
+                        .sum(0)
+                        .ce()?;
+                    let take = mass.ge(&target).ce()?.to_dtype(DType::F32).ce()?;
+                    let keep = take.affine(-1.0, 1.0).ce()?;
+                    lo = mid
+                        .broadcast_mul(&take)
+                        .ce()?
+                        .broadcast_add(&lo.broadcast_mul(&keep).ce()?)
+                        .ce()?;
+                    hi = mid
+                        .broadcast_mul(&keep)
+                        .ce()?
+                        .broadcast_add(&hi.broadcast_mul(&take).ce()?)
+                        .ce()?;
+                }
+                let nucleus = scores
+                    .ge(&lo.broadcast_as((vocab,)).ce()?)
+                    .ce()?
+                    .to_dtype(DType::F32)
+                    .ce()?;
+                sel = sel.broadcast_mul(&nucleus).ce()?;
+            }
+            let ws = w.broadcast_mul(&sel).ce()?;
+            let cdf = ws.cumsum(0).ce()?;
+            let total = cdf.get(vocab - 1).ce()?;
+            let target = total.affine(u as f64, 0.0).ce()?;
+            cdf.ge(&target.broadcast_as((vocab,)).ce()?)
+                .ce()?
+                .to_dtype(DType::F32)
+                .ce()?
+                .argmax(0)
+                .ce()?
+                .to_dtype(DType::I64)
+                .ce()?
+        };
+        let token1 = token_id.reshape((1,)).ce()?;
+        let chosen = p.gather(&token1, 0).ce()?;
+        let lp = chosen.broadcast_sub(&lognorm).ce()?;
+
+        // One small host transfer: token id, its logprob, and top pairs.
+        let mut parts = vec![
+            token_id.to_dtype(DType::F32).ce()?.reshape((1,)).ce()?,
+            lp.reshape((1,)).ce()?,
+        ];
+        for (id, value) in top_ids.iter().zip(&top_vals) {
+            parts.push(id.to_dtype(DType::F32).ce()?.reshape((1,)).ce()?);
+            parts.push(value.broadcast_sub(&lognorm).ce()?.reshape((1,)).ce()?);
+        }
+        let out = Tensor::cat(&parts, 0).ce()?.to_vec1::<f32>().ce()?;
+        let token = out[0] as u32;
+        let logprob = out[1];
+        let top = (2..out.len())
+            .step_by(2)
+            .map(|i| (out[i] as u32, out[i + 1]))
+            .collect();
+        Ok(DeviceSample {
+            token,
+            logprob,
+            top,
+        })
+    }
+}
+
 /// Map a layer number to its index in the linear-attention state list.
 fn layer_idx(w: &GpuWeights, layer: usize, _is_full: bool) -> usize {
     (0..layer).filter(|&i| !w.is_full(i)).count()
+}
+
+/// Fold both 128-block Hadamards into an EXL3 W_hat *at load time*, so each
+/// decode step needs one GEMV instead of two Hadamard GEMMs plus the W_hat GEMV.
+///
+/// `w` is W_hat `(k, n)` F16, `h128` the normalized Sylvester H128 F32. Returns
+/// `B = (H_n @ W_hat^T @ H_k)^T` `(n, k)` F16: apply `H_k` to every 128-row
+/// block of W_hat, then `H_n` to every 128-column block, then transpose (both
+/// H matrices are symmetric and orthogonal).
+pub(crate) fn fold_hadamards(w: &Tensor, h128: &Tensor) -> Result<Tensor, String> {
+    let k = w.dim(0).ce()?;
+    let n = w.dim(1).ce()?;
+    if k == 0 || n == 0 || !k.is_multiple_of(128) || !n.is_multiple_of(128) {
+        return Err(format!(
+            "W_hat dims {}x{} must both be non-zero multiples of 128",
+            k, n
+        ));
+    }
+    let h = h128.to_dtype(DType::F16).ce()?;
+    let kb = k / 128;
+    // H_k @ W_hat: apply H to each 128-row block. Each block is permuted to
+    // (n,128) so a right-multiply by H^T (== H) applies H to its rows.
+    let rows = w
+        .reshape((kb, 128, n))
+        .ce()?
+        .permute((0, 2, 1))
+        .ce()?
+        .matmul(&h.repeat((kb, 1, 1)).ce()?.t().ce()?)
+        .ce()?
+        .permute((0, 2, 1))
+        .ce()?
+        .reshape((k, n))
+        .ce()?;
+    // (H_k @ W_hat) @ H_n: apply H to each 128-column block of every row.
+    let nb = n / 128;
+    let cols = rows
+        .reshape((k * nb, 128))
+        .ce()?
+        .matmul(&h.t().ce()?)
+        .ce()?
+        .reshape((k, n))
+        .ce()?;
+    cols.t().ce()
+}
+
+/// Batched GQA with a per-head output gate. `kc`/`vc` are `(context, nkv*hd)`
+/// fp16 caches, `q`/`gate` are `(nh*hd,)` fp32. Returns the `(nh*hd,)` fp32
+/// attention output in head-major order.
+///
+/// Grouping the heads into `(nkv, groups, hd)` replaces the old per-query-head
+/// loop (~16 tiny kernels per head, per layer, per token) with a handful of
+/// batched matmuls. The math is identical to that loop;
+/// `gqa_batched_matches_per_head` pins it against a literal transcription of
+/// the old implementation.
+#[allow(clippy::too_many_arguments)]
+fn gqa_attention(
+    kc: &Tensor,
+    vc: &Tensor,
+    q: &Tensor,
+    gate: &Tensor,
+    tlen: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+) -> Result<Tensor, String> {
+    let scale = 1.0 / (hd as f32).sqrt();
+    let groups = nh / nkv;
+    // Cache row layout is (nkv, hd); select the used prefix only.
+    let kmat = kc
+        .narrow(0, 0, tlen)
+        .ce()?
+        .reshape((tlen, nkv, hd))
+        .ce()?
+        .to_dtype(DType::F32)
+        .ce()?;
+    let vmat = vc
+        .narrow(0, 0, tlen)
+        .ce()?
+        .reshape((tlen, nkv, hd))
+        .ce()?
+        .to_dtype(DType::F32)
+        .ce()?;
+    let qg = q.reshape((nkv, groups, hd)).ce()?;
+    let gate2 = gate.reshape((nkv, groups, hd)).ce()?;
+    // scores[kh, t, g] = sum_d kmat[kh, t, d] * qg[kh, g, d]
+    let scores = kmat
+        .permute((1, 0, 2))
+        .ce()?
+        .matmul(&qg.transpose(1, 2).ce()?)
+        .ce()?
+        .affine(scale as f64, 0.0)
+        .ce()?;
+    let m = scores.max_keepdim(1).ce()?;
+    let e = scores.broadcast_sub(&m).ce()?.exp().ce()?;
+    let probs = e.broadcast_div(&e.sum_keepdim(1).ce()?).ce()?;
+    // out[kh, g, d] = sum_t probs[kh, t, g] * vmat[kh, t, d]
+    let out = vmat
+        .permute((1, 2, 0))
+        .ce()?
+        .matmul(&probs)
+        .ce()?
+        .transpose(1, 2)
+        .ce()?;
+    let sig = gate2
+        .neg()
+        .ce()?
+        .exp()
+        .ce()?
+        .affine(1.0, 1.0)
+        .ce()?
+        .recip()
+        .ce()?;
+    out.mul(&sig).ce()?.flatten_all().ce()
 }
 
 /// One Gated DeltaNet recurrence step, entirely on device.
@@ -997,6 +1373,100 @@ fn k_add_eps(v: &Tensor) -> Result<Tensor, String> {
         .ce()?
         .sqrt()
         .ce()
+}
+
+/// Row-wise L2 norm with the same `+1e-6` epsilon as `k_add_eps`, for a
+/// `(rows, dim)` tensor. Returns `(rows,)`.
+fn k_add_eps_rows(v: &Tensor) -> Result<Tensor, String> {
+    v.sqr()
+        .ce()?
+        .sum(1)
+        .ce()?
+        .affine(1.0, 1e-6)
+        .ce()?
+        .sqrt()
+        .ce()
+}
+
+/// Batched Gated DeltaNet recurrence: every value head advances in one set of
+/// device ops. This is numerically identical to calling `deltanet_step` once
+/// per head, but with no `to_vec0()` host round-trip for `g`/`beta` and only a
+/// handful of batched matmuls instead of ~15 small kernels per head.
+///
+/// `state` is `(nvh, kd, vd)`, `q`/`k` are `(nkh * kd,)`, `v` is `(nvh * vd,)`,
+/// and `g`/`beta` are `(nvh,)`. Heads are laid out as in the CPU forward: key
+/// head `vh / rep` is shared by `rep = nvh / nkh` consecutive value heads.
+#[allow(clippy::too_many_arguments)]
+fn deltanet_step_all(
+    state: &Tensor,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    nkh: usize,
+    nvh: usize,
+    kd: usize,
+    vd: usize,
+) -> Result<(Tensor, Tensor), String> {
+    let rep = nvh / nkh;
+    // q/k are per key head; repeat each key head `rep` times so head i lines
+    // up with value heads i*rep .. i*rep+rep. unsqueeze(1) + repeat gives
+    // [h0,h0,h1,h1,...] order (a plain repeat of the matrix would give
+    // [h0,h1,...,h0,h1,...] instead).
+    let repeat_heads = |t: &Tensor| -> Result<Tensor, String> {
+        t.reshape((nkh, kd))
+            .ce()?
+            .unsqueeze(1)
+            .ce()?
+            .repeat((1, rep, 1))
+            .ce()?
+            .reshape((nvh, kd))
+            .ce()
+    };
+    let qh = repeat_heads(q)?;
+    let kh = repeat_heads(k)?;
+    let qh = qh
+        .broadcast_div(&k_add_eps_rows(&qh)?.unsqueeze(1).ce()?)
+        .ce()?
+        .affine(1.0 / (kd as f64).sqrt(), 0.0)
+        .ce()?;
+    let kh = kh
+        .broadcast_div(&k_add_eps_rows(&kh)?.unsqueeze(1).ce()?)
+        .ce()?;
+
+    // exp(g) < 1 decays each head's recurrent state; broadcast over (kd, vd).
+    let s = state
+        .broadcast_mul(&g.exp().ce()?.reshape((nvh, 1, 1)).ce()?)
+        .ce()?;
+    // (nvh, kd, 1)
+    let kh_col = kh.unsqueeze(2).ce()?;
+    // mem = S^T @ k_hat -> (nvh, vd)
+    let mem = s
+        .transpose(1, 2)
+        .ce()?
+        .matmul(&kh_col)
+        .ce()?
+        .squeeze(2)
+        .ce()?;
+    let v2 = v.reshape((nvh, vd)).ce()?;
+    let delta = v2
+        .sub(&mem)
+        .ce()?
+        .broadcast_mul(&beta.unsqueeze(1).ce()?)
+        .ce()?;
+    // S' = S + k_hat (x) delta, then o = S'^T @ q_hat.
+    let s2 = s
+        .add(&kh_col.matmul(&delta.unsqueeze(1).ce()?).ce()?)
+        .ce()?;
+    let o = s2
+        .transpose(1, 2)
+        .ce()?
+        .matmul(&qh.unsqueeze(2).ce()?)
+        .ce()?
+        .squeeze(2)
+        .ce()?;
+    Ok((s2, o.flatten_all().ce()?))
 }
 
 #[cfg(test)]
@@ -1248,6 +1718,152 @@ mod tests {
         }
     }
 
+    /// The batched recurrence must be numerically identical to running the
+    /// original per-head `deltanet_step` for each value head. This guards the
+    /// hot-path rewrite that removed nvh host syncs per layer per token.
+    #[test]
+    fn deltanet_all_matches_per_head() {
+        let dev = Device::Cpu;
+        let (nkh, nvh, kd, vd) = (2usize, 4usize, 2usize, 3usize);
+        let rep = nvh / nkh;
+        let sdata: Vec<f32> = (0..nvh * kd * vd)
+            .map(|i| ((i * 7) % 13) as f32 / 10.0 - 0.6)
+            .collect();
+        let qd: Vec<f32> = (0..nkh * kd)
+            .map(|i| ((i * 5) % 11) as f32 / 5.0 - 1.0)
+            .collect();
+        let kd_data: Vec<f32> = (0..nkh * kd)
+            .map(|i| ((i * 3) % 7) as f32 / 4.0 - 0.75)
+            .collect();
+        let vd_data: Vec<f32> = (0..nvh * vd)
+            .map(|i| ((i * 11) % 9) as f32 / 6.0 - 0.6)
+            .collect();
+        let gd: Vec<f32> = (0..nvh).map(|i| -0.1 - i as f32 * 0.05).collect();
+        let bd: Vec<f32> = (0..nvh).map(|i| 0.2 + i as f32 * 0.1).collect();
+
+        let st = Tensor::from_slice(&sdata, (nvh, kd, vd), &dev).unwrap();
+        let qt = Tensor::from_slice(&qd, (nkh * kd,), &dev).unwrap();
+        let kt = Tensor::from_slice(&kd_data, (nkh * kd,), &dev).unwrap();
+        let vt = Tensor::from_slice(&vd_data, (nvh * vd,), &dev).unwrap();
+        let gt = Tensor::from_slice(&gd, (nvh,), &dev).unwrap();
+        let bt = Tensor::from_slice(&bd, (nvh,), &dev).unwrap();
+        let (got_s, got_o) =
+            deltanet_step_all(&st, &qt, &kt, &vt, &gt, &bt, nkh, nvh, kd, vd).unwrap();
+
+        // Literal transcription of the old per-head hot loop.
+        let mut ref_s = vec![0.0f32; nvh * kd * vd];
+        let mut ref_o = vec![0.0f32; nvh * vd];
+        for vh in 0..nvh {
+            let ki = vh / rep;
+            let (ns, o) = deltanet_step(
+                &Tensor::from_slice(&sdata[vh * kd * vd..(vh + 1) * kd * vd], (kd, vd), &dev)
+                    .unwrap(),
+                &Tensor::from_slice(&qd[ki * kd..(ki + 1) * kd], (kd,), &dev).unwrap(),
+                &Tensor::from_slice(&kd_data[ki * kd..(ki + 1) * kd], (kd,), &dev).unwrap(),
+                &Tensor::from_slice(&vd_data[vh * vd..(vh + 1) * vd], (vd,), &dev).unwrap(),
+                gd[vh],
+                bd[vh],
+                kd,
+                vd,
+            )
+            .unwrap();
+            let ns = ns.reshape((kd * vd,)).unwrap().to_vec1::<f32>().unwrap();
+            ref_s[vh * kd * vd..(vh + 1) * kd * vd].copy_from_slice(&ns);
+            ref_o[vh * vd..(vh + 1) * vd].copy_from_slice(&o.to_vec1::<f32>().unwrap());
+        }
+        let got_s = got_s
+            .reshape((nvh * kd * vd,))
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let got_o = got_o.to_vec1::<f32>().unwrap();
+        for (i, (a, b)) in got_s.iter().zip(&ref_s).enumerate() {
+            assert!((a - b).abs() < 1e-5, "state[{}]: {} vs {}", i, a, b);
+        }
+        for (i, (a, b)) in got_o.iter().zip(&ref_o).enumerate() {
+            assert!((a - b).abs() < 1e-5, "out[{}]: {} vs {}", i, a, b);
+        }
+    }
+
+    /// Batched GQA must match the old per-query-head loop element for element.
+    #[test]
+    fn gqa_batched_matches_per_head() {
+        let dev = Device::Cpu;
+        let (tlen, nkv, groups, hd) = (4usize, 2usize, 2usize, 3usize);
+        let nh = nkv * groups;
+        // Multiples of 1/8 are exact in fp16, so cache conversion adds no noise.
+        let kd_data: Vec<f16> = (0..tlen * nkv * hd)
+            .map(|i| f16::from_f32(((i * 13) % 17) as f32 / 8.0 - 1.0))
+            .collect();
+        let vd_data: Vec<f16> = (0..tlen * nkv * hd)
+            .map(|i| f16::from_f32(((i * 5) % 11) as f32 / 8.0 - 1.0))
+            .collect();
+        let qd: Vec<f32> = (0..nh * hd)
+            .map(|i| ((i * 7) % 11) as f32 / 5.0 - 1.0)
+            .collect();
+        let gd: Vec<f32> = (0..nh * hd)
+            .map(|i| ((i * 3) % 9) as f32 / 4.0 - 1.0)
+            .collect();
+        let kc = Tensor::from_slice(&kd_data, (tlen, nkv * hd), &dev).unwrap();
+        let vc = Tensor::from_slice(&vd_data, (tlen, nkv * hd), &dev).unwrap();
+        let q = Tensor::from_slice(&qd, (nh * hd,), &dev).unwrap();
+        let gate = Tensor::from_slice(&gd, (nh * hd,), &dev).unwrap();
+
+        let got = gqa_attention(&kc, &vc, &q, &gate, tlen, nh, nkv, hd)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let kmat_all = kc
+            .to_dtype(DType::F32)
+            .unwrap()
+            .reshape((tlen, nkv, hd))
+            .unwrap();
+        let vmat_all = vc
+            .to_dtype(DType::F32)
+            .unwrap()
+            .reshape((tlen, nkv, hd))
+            .unwrap();
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut expected = vec![0.0f32; nh * hd];
+        for h in 0..nh {
+            let kh = h / groups;
+            let kmat = kmat_all.narrow(1, kh, 1).unwrap().squeeze(1).unwrap();
+            let vmat = vmat_all.narrow(1, kh, 1).unwrap().squeeze(1).unwrap();
+            let qh = q.narrow(0, h * hd, hd).unwrap().reshape((1, hd)).unwrap();
+            let mut scores = kmat
+                .matmul(&qh.t().unwrap())
+                .unwrap()
+                .flatten_all()
+                .unwrap();
+            scores = scores.affine(scale as f64, 0.0).unwrap();
+            let m = scores.max_keepdim(0).unwrap();
+            let e = scores.broadcast_sub(&m).unwrap().exp().unwrap();
+            let probs = e.broadcast_div(&e.sum_keepdim(0).unwrap()).unwrap();
+            let mut out = probs
+                .reshape((1, tlen))
+                .unwrap()
+                .matmul(&vmat)
+                .unwrap()
+                .flatten_all()
+                .unwrap();
+            let gh = gate.narrow(0, h * hd, hd).unwrap();
+            let sig = gh
+                .neg()
+                .unwrap()
+                .exp()
+                .unwrap()
+                .affine(1.0, 1.0)
+                .unwrap()
+                .recip()
+                .unwrap();
+            out = out.mul(&sig).unwrap();
+            expected[h * hd..(h + 1) * hd].copy_from_slice(&out.to_vec1::<f32>().unwrap());
+        }
+        for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
+            assert!((a - b).abs() < 1e-4, "attn[{}]: {} vs {}", i, a, b);
+        }
+    }
+
     fn tiny_mat(dev: &Device, rows: usize, cols: usize) -> Tensor {
         let data: Vec<f16> = (0..rows * cols)
             .map(|i| f16::from_f32(((i * 7) % 13) as f32 / 10.0 - 0.6))
@@ -1415,9 +2031,98 @@ mod tests {
                 Tensor::from_slice(&h, (128, 128), &dev).unwrap()
             },
         };
-        let got = gw.q_matmul(&parts, &xt).unwrap().to_vec1::<f32>().unwrap();
+        // q_matmul now consumes the load-time-folded weight.
+        let folded = (
+            fold_hadamards(&parts.0, &gw.h128).unwrap(),
+            parts.1.clone(),
+            parts.2.clone(),
+        );
+        let got = gw.q_matmul(&folded, &xt).unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(got.len(), n);
         assert!(got.iter().all(|v| v.is_finite()));
+    }
+
+    /// Folding both Hadamards into W_hat must not change the linear result
+    /// beyond the expected fp16 rounding (the old path mixed in f32, the new
+    /// one bakes the mix into the fp16 weight).
+    #[test]
+    fn folded_q_matmul_matches_unfolded() {
+        let dev = Device::Cpu;
+        // Two 128-blocks each way so block boundaries are exercised.
+        let (k, n) = (256usize, 256usize);
+        let wf: Vec<f16> = (0..k * n)
+            .map(|i| f16::from_f32(((i * 11) % 17) as f32 / 20.0 - 0.4))
+            .collect();
+        let su: Vec<f32> = (0..k).map(|i| 1.0 + (i % 3) as f32 / 10.0).collect();
+        let sv: Vec<f32> = (0..n).map(|i| 1.0 + (i % 5) as f32 / 10.0).collect();
+        let x: Vec<f32> = (0..k).map(|i| (i % 7) as f32 / 10.0 - 0.3).collect();
+        let scale = 1.0 / 128.0f32.sqrt();
+        let mut h = vec![0.0f32; 128 * 128];
+        for i in 0..128 {
+            for j in 0..128 {
+                h[i * 128 + j] = if (i & j).count_ones() % 2 == 0 {
+                    scale
+                } else {
+                    -scale
+                };
+            }
+        }
+        let h128 = Tensor::from_slice(&h, (128, 128), &dev).unwrap();
+        let cfg = GpuCfg {
+            num_layers: 0,
+            hidden_size: k,
+            vocab_size: n,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 1,
+            layer_types: Vec::new(),
+            full_attention_interval: 1,
+            linear_conv_kernel_dim: 1,
+            linear_key_head_dim: 1,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_value_head_dim: 1,
+            rms_norm_eps: 1e-6,
+            context_size: 1,
+            rope_half: 0,
+        };
+        let gw = GpuWeights {
+            device: dev.clone(),
+            prefix: String::new(),
+            cfg,
+            mats: HashMap::new(),
+            qhat: HashMap::new(),
+            vecs: HashMap::new(),
+            rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
+            rope_sin: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
+            h128: h128.clone(),
+        };
+        let w = Tensor::from_slice(&wf, (n, k), &dev).unwrap();
+        let suh = Tensor::from_slice(&su, (k,), &dev).unwrap();
+        let svh = Tensor::from_slice(&sv, (n,), &dev).unwrap();
+        let xt = Tensor::from_slice(&x, (k,), &dev).unwrap();
+
+        // Old decode path: two f32 Hadamard GEMMs around one f16 W_hat GEMV.
+        let xr = gw.hadamard(&xt.mul(&suh).unwrap()).unwrap();
+        let t = GpuWeights::matmul_w(&w, &xr).unwrap();
+        let t = gw.hadamard(&t).unwrap();
+        let expected = t.mul(&svh).unwrap().to_vec1::<f32>().unwrap();
+
+        // New decode path: folded weight, one GEMV.
+        let folded = (fold_hadamards(&w, &h128).unwrap(), suh.clone(), svh.clone());
+        let got = gw.q_matmul(&folded, &xt).unwrap().to_vec1::<f32>().unwrap();
+        // Observed max error ~0.3% of the largest logit (two extra fp16
+        // roundings from baking the Hadamards into the weight).
+        let scale = got.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
+            assert!(
+                (a - b).abs() < 5e-3 + 5e-3 * scale,
+                "logit {}: folded {} vs unfolded {}",
+                i,
+                a,
+                b
+            );
+        }
     }
 
     /// Untied checkpoints quantize lm_head under the bare name `lm_head`,
@@ -1446,7 +2151,6 @@ mod tests {
             Tensor::from_slice(&emb, (n, k), &dev).unwrap(),
         );
         let mut qhat = HashMap::new();
-        qhat.insert("lm_head".to_string(), parts.clone());
         let cfg = GpuCfg {
             num_layers: 0,
             hidden_size: k,
@@ -1476,6 +2180,13 @@ mod tests {
                 };
             }
         }
+        let h128 = Tensor::from_slice(&h, (128, 128), &dev).unwrap();
+        let folded = (
+            fold_hadamards(&parts.0, &h128).unwrap(),
+            parts.1.clone(),
+            parts.2.clone(),
+        );
+        qhat.insert("lm_head".to_string(), folded.clone());
         let gw = GpuWeights {
             device: dev.clone(),
             prefix: String::new(),
@@ -1485,7 +2196,7 @@ mod tests {
             vecs: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
             rope_sin: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
-            h128: Tensor::from_slice(&h, (128, 128), &dev).unwrap(),
+            h128,
         };
         let x: Vec<f32> = (0..k).map(|i| (i % 7) as f32 / 10.0 - 0.3).collect();
         let xt = Tensor::from_slice(&x, (k,), &dev).unwrap();
@@ -1494,7 +2205,7 @@ mod tests {
             .unwrap()
             .to_vec1::<f32>()
             .unwrap();
-        let expected = gw.q_matmul(&parts, &xt).unwrap().to_vec1::<f32>().unwrap();
+        let expected = gw.q_matmul(&folded, &xt).unwrap().to_vec1::<f32>().unwrap();
         let tied = GpuWeights::matmul_w(gw.embedding_table().unwrap(), &xt)
             .unwrap()
             .to_vec1::<f32>()
@@ -1534,6 +2245,323 @@ mod tests {
             // tolerance while still catching real arithmetic errors.
             assert!((got[j] - expect).abs() < 1e-3, "{} vs {}", got[j], expect);
         }
+    }
+
+    /// A runner whose logits are a small host-provided vector, so the device
+    /// sampler can be compared directly against the host sampler.
+    fn sampler_runner(logits: &[f32]) -> GpuRunner {
+        let dev = Device::Cpu;
+        let cfg = GpuCfg {
+            num_layers: 0,
+            hidden_size: 4,
+            vocab_size: logits.len(),
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            layer_types: Vec::new(),
+            full_attention_interval: 1,
+            linear_conv_kernel_dim: 2,
+            linear_key_head_dim: 1,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_value_head_dim: 1,
+            rms_norm_eps: 1e-6,
+            context_size: 1,
+            rope_half: 0,
+        };
+        let gw = Arc::new(GpuWeights {
+            device: dev.clone(),
+            prefix: String::new(),
+            cfg,
+            mats: HashMap::new(),
+            qhat: HashMap::new(),
+            vecs: HashMap::new(),
+            rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
+            rope_sin: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
+            h128: Tensor::zeros((128, 128), DType::F32, &dev).unwrap(),
+        });
+        let mut r = GpuRunner::new(gw).unwrap();
+        r.state.logits = Some(Tensor::from_slice(logits, (logits.len(),), &dev).unwrap());
+        r
+    }
+
+    fn sample_logits() -> Vec<f32> {
+        (0..64).map(|i| ((i * 7) % 23) as f32 / 5.0 - 2.0).collect()
+    }
+
+    fn sample_params(spec: &SampleSpec) -> crate::server::Params {
+        crate::server::Params {
+            temperature: spec.temperature,
+            top_p: spec.top_p,
+            top_k: spec.top_k,
+            repetition_penalty: spec.repetition_penalty,
+            presence_penalty: spec.presence_penalty,
+            frequency_penalty: spec.frequency_penalty,
+            logit_bias: spec.logit_bias.clone(),
+            ..crate::server::Params::default()
+        }
+    }
+
+    /// Greedy and temperature-only sampling must agree with the host sampler,
+    /// including all logit penalties/bias, for the same RNG draw.
+    #[test]
+    fn device_sample_matches_host_greedy_and_softmax() {
+        let logits = sample_logits();
+        let history = [3u32, 5, 3, 9];
+        let base = SampleSpec {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.5,
+            presence_penalty: 0.2,
+            frequency_penalty: 0.1,
+            logit_bias: vec![(2, 3.0), (11, -2.0)],
+            top_n: 0,
+        };
+        // Greedy: no randomness involved.
+        let got = sampler_runner(&logits)
+            .sample(&base, &history, 0.5)
+            .unwrap();
+        let host = crate::server::sample(
+            &logits,
+            &sample_params(&base),
+            &mut crate::rng::Rng::new(1),
+            &history,
+        );
+        assert_eq!(got.token, host, "greedy token");
+
+        // Plain temperature sampling: compare against a transcription of
+        // sample_softmax with the exact same uniform.
+        let spec = SampleSpec {
+            temperature: 0.8,
+            ..base.clone()
+        };
+        let u = 0.37f64;
+        let got = sampler_runner(&logits)
+            .sample(&spec, &history, u as f32)
+            .unwrap();
+        let mut buf = Vec::new();
+        let p = crate::server::prepare_logits(&logits, &sample_params(&spec), &history, &mut buf);
+        let max = p.iter().cloned().fold(f32::NEG_INFINITY, f32::max) / spec.temperature;
+        let sum: f64 = p
+            .iter()
+            .map(|&l| (l / spec.temperature - max).exp() as f64)
+            .sum();
+        let target = u * sum;
+        let mut cum = 0.0f64;
+        let mut expect = (p.len() - 1) as u32;
+        for (i, &l) in p.iter().enumerate() {
+            cum += (l / spec.temperature - max).exp() as f64;
+            if cum >= target {
+                expect = i as u32;
+                break;
+            }
+        }
+        assert_eq!(got.token, expect, "softmax token");
+    }
+
+    /// top-k and top-p nucleus sampling must select the same token as the host
+    /// sampler for the same uniform draw.
+    #[test]
+    fn device_sample_matches_host_top_k_and_top_p() {
+        let logits = sample_logits();
+        let history = [7u32, 7, 12];
+        let spec = SampleSpec {
+            temperature: 0.9,
+            top_p: 0.7,
+            top_k: 5,
+            repetition_penalty: 1.2,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            logit_bias: Vec::new(),
+            top_n: 0,
+        };
+        let u = 0.61f64;
+        let got = sampler_runner(&logits)
+            .sample(&spec, &history, u as f32)
+            .unwrap();
+
+        let mut buf = Vec::new();
+        let p = crate::server::prepare_logits(&logits, &sample_params(&spec), &history, &mut buf);
+        let by_id: Vec<f64> = p.iter().map(|&l| (l / spec.temperature) as f64).collect();
+        let mut ranked: Vec<(usize, f64)> = by_id.iter().copied().enumerate().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        ranked.truncate(spec.top_k);
+        let max = ranked[0].1;
+        let w = |i: usize| (by_id[i] - max).exp();
+        let sum: f64 = ranked.iter().map(|&(i, _)| w(i)).sum();
+        let mass = sum * spec.top_p as f64;
+        // Nucleus: descending-score prefix until cum >= top_p.
+        let mut nucleus = std::collections::HashSet::new();
+        let mut cum = 0.0f64;
+        for &(i, _) in &ranked {
+            nucleus.insert(i);
+            cum += w(i);
+            if cum >= mass {
+                break;
+            }
+        }
+        // The device walks the selected set in token-id order (no sort).
+        // Inverse-CDF sampling is order-independent in distribution; with the
+        // same enumeration and uniform it must pick the same id.
+        let total: f64 = nucleus.iter().map(|&i| w(i)).sum();
+        let target = u * total;
+        let mut cum = 0.0f64;
+        let mut expect = *nucleus.iter().max().unwrap() as u32;
+        for i in 0..p.len() {
+            if !nucleus.contains(&i) {
+                continue;
+            }
+            cum += w(i);
+            if cum >= target {
+                expect = i as u32;
+                break;
+            }
+        }
+        assert_eq!(got.token, expect);
+    }
+
+    /// The compact logprobs returned from device must match the host's
+    /// `logprob_info` (same penalty-adjusted distribution, before sampling
+    /// transforms), both for the chosen token and the top alternatives.
+    #[test]
+    fn device_logprobs_match_host() {
+        let logits = sample_logits();
+        let history = [4u32, 4, 4, 20];
+        let spec = SampleSpec {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.3,
+            presence_penalty: 0.1,
+            frequency_penalty: 0.05,
+            logit_bias: vec![(6, 1.5)],
+            top_n: 4,
+        };
+        let got = sampler_runner(&logits)
+            .sample(&spec, &history, 0.5)
+            .unwrap();
+        let mut buf = Vec::new();
+        let p = crate::server::prepare_logits(&logits, &sample_params(&spec), &history, &mut buf);
+        let max = p.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let sum: f64 = p.iter().map(|&v| (v as f64 - max).exp()).sum();
+        let lp = |v: f32| (v as f64 - max - sum.ln()) as f32;
+        let mut top: Vec<(usize, f32)> = p.iter().copied().enumerate().collect();
+        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        top.truncate(spec.top_n);
+        assert_eq!(got.top.len(), top.len());
+        for ((id, value), (eid, evalue)) in got.top.iter().zip(&top) {
+            assert_eq!(*id, *eid as u32);
+            assert!(
+                (value - lp(*evalue)).abs() < 1e-3,
+                "{} vs {}",
+                value,
+                lp(*evalue)
+            );
+        }
+        assert!(
+            (got.logprob - lp(p[got.token as usize])).abs() < 1e-3,
+            "chosen logprob {} vs {}",
+            got.logprob,
+            lp(p[got.token as usize])
+        );
+    }
+
+    /// The post-prefill snapshot must carry device logits, otherwise `n > 1`
+    /// choices would sample from stale/absent logits after `restore`.
+    #[test]
+    fn snapshot_restores_device_logits() {
+        let logits = sample_logits();
+        let runner = sampler_runner(&logits);
+        let snap = runner.snapshot().unwrap();
+        let mut runner2 = sampler_runner(&vec![0.0; logits.len()]);
+        runner2.restore(&snap).unwrap();
+        let got = runner2
+            .state
+            .logits
+            .as_ref()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(got, logits);
+    }
+
+    /// Forward -> sample -> forward -> sample must work entirely on device.
+    #[test]
+    fn device_forward_then_sample_runs_end_to_end_on_cpu() {
+        let dev = Device::Cpu;
+        let cfg = GpuCfg {
+            num_layers: 1,
+            hidden_size: 4,
+            vocab_size: 8,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            layer_types: vec!["full_attention".into()],
+            full_attention_interval: 1,
+            linear_conv_kernel_dim: 2,
+            linear_key_head_dim: 1,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_value_head_dim: 1,
+            rms_norm_eps: 1e-6,
+            context_size: 8,
+            rope_half: 0,
+        };
+        let mut mats = HashMap::new();
+        for (name, r, c) in [
+            ("embed_tokens.weight", 8, 4),
+            ("lm_head.weight", 8, 4),
+            ("layers.0.self_attn.q_proj", 8, 4),
+            ("layers.0.self_attn.k_proj", 4, 4),
+            ("layers.0.self_attn.v_proj", 4, 4),
+            ("layers.0.self_attn.o_proj", 4, 4),
+            ("layers.0.mlp.gate_proj", 8, 4),
+            ("layers.0.mlp.up_proj", 8, 4),
+            ("layers.0.mlp.down_proj", 4, 8),
+        ] {
+            mats.insert(name.to_string(), tiny_mat(&dev, r, c));
+        }
+        let mut vecs = HashMap::new();
+        for name in [
+            "layers.0.input_layernorm.weight",
+            "layers.0.post_attention_layernorm.weight",
+            "norm.weight",
+            "layers.0.self_attn.q_norm.weight",
+            "layers.0.self_attn.k_norm.weight",
+        ] {
+            vecs.insert(name.to_string(), tiny_vec(&dev, 4));
+        }
+        let gw = Arc::new(GpuWeights {
+            device: dev.clone(),
+            prefix: String::new(),
+            cfg,
+            mats,
+            qhat: HashMap::new(),
+            vecs,
+            rope_cos: Tensor::zeros((8, 1), DType::F32, &dev).unwrap(),
+            rope_sin: Tensor::zeros((8, 1), DType::F32, &dev).unwrap(),
+            h128: Tensor::zeros((128, 128), DType::F32, &dev).unwrap(),
+        });
+        let mut runner = GpuRunner::new(gw).unwrap();
+        let spec = SampleSpec {
+            temperature: 0.8,
+            top_p: 0.9,
+            top_k: 0,
+            repetition_penalty: 1.2,
+            presence_penalty: 0.1,
+            frequency_penalty: 0.0,
+            logit_bias: vec![(1, 0.5)],
+            top_n: 2,
+        };
+        runner.forward_logits(&[0, 1, 2]).unwrap();
+        let history = Vec::new();
+        let first = runner.sample(&spec, &history, 0.5).unwrap();
+        assert!(first.token < 8 && first.logprob.is_finite());
+        assert_eq!(first.top.len(), 2);
+        runner.forward_logits(&[first.token]).unwrap();
+        let second = runner.sample(&spec, &[first.token], 0.25).unwrap();
+        assert!(second.token < 8 && second.logprob.is_finite());
     }
 
     #[test]

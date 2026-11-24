@@ -1,6 +1,8 @@
 //! OpenAI-compatible API handlers and the inference engine.
 
 use crate::chat::{apply_chat_template, parse_tool_calls, tools_system_prompt, Message, ToolCall};
+#[cfg(feature = "gpu")]
+use crate::gpu::SampleSpec;
 use crate::http::{respond, Request, Streamer};
 use crate::model::Model;
 use crate::tokenizer::Tokenizer;
@@ -493,9 +495,16 @@ impl Engine {
         const PROMPT_BATCH: usize = 32;
         let prompt_start = std::time::Instant::now();
         let mut logits = Vec::new();
+        let device = model.device_sampling_available();
         let mut processed = 0usize;
         for chunk in prompt_ids.chunks(PROMPT_BATCH) {
-            logits = model.forward(chunk)?;
+            // On the device path the logits stay on device for sampling; the
+            // post-prefill GpuSnapshot carries them into each `n` choice.
+            if device {
+                model.forward_device(chunk)?;
+            } else {
+                logits = model.forward(chunk)?;
+            }
             processed += chunk.len();
             let secs = prompt_start.elapsed().as_secs_f64().max(1e-6);
             eprintln!(
@@ -561,6 +570,7 @@ impl Engine {
         };
 
         let mut model = self.acquire_model();
+        let device_sampling = model.device_sampling_available();
         // A supplied PrefillState lets `n > 1` choices share one prompt pass:
         // restore the post-prefill KV/DeltaNet state and the final logits.
         // Track prefill and decode time separately so callers (and benchmarks)
@@ -582,7 +592,11 @@ impl Engine {
                 let mut logits = Vec::new();
                 let mut processed = 0usize;
                 for chunk in prompt_ids.chunks(PROMPT_BATCH) {
-                    logits = model.forward(chunk)?;
+                    if device_sampling {
+                        model.forward_device(chunk)?;
+                    } else {
+                        logits = model.forward(chunk)?;
+                    }
                     processed += chunk.len();
                     let secs = prompt_start.elapsed().as_secs_f64().max(1e-6);
                     eprintln!(
@@ -629,6 +643,21 @@ impl Engine {
             OutputRouter::new(split_reasoning, start_in_reasoning, params.stop.clone());
         let mut finish = String::from("length");
 
+        #[cfg(feature = "gpu")]
+        let device_spec = SampleSpec {
+            temperature: params.temperature,
+            top_p: params.top_p,
+            top_k: params.top_k,
+            repetition_penalty: params.repetition_penalty,
+            presence_penalty: params.presence_penalty,
+            frequency_penalty: params.frequency_penalty,
+            logit_bias: params.logit_bias.clone(),
+            top_n: if params.logprobs {
+                params.top_logprobs
+            } else {
+                0
+            },
+        };
         let debug = std::env::var("EXLLAMA_DEBUG").is_ok();
         const DECODE_BATCH: usize = 16;
         let decode_start = std::time::Instant::now();
@@ -640,7 +669,7 @@ impl Engine {
                 finish = "length".into();
                 break;
             }
-            if debug && step < 5 {
+            if debug && step < 5 && !device_sampling {
                 let mut stats = logits.iter().fold(
                     (f32::INFINITY, f32::NEG_INFINITY, 0usize, 0usize),
                     |(mn, mx, nan, inf), &v| {
@@ -669,7 +698,60 @@ impl Engine {
                     );
                 }
             }
-            let tok = sample(&logits, params, &mut rng, &completion);
+            // On the device path the logits never leave the GPU: sample there
+            // and receive only the token id (plus compact logprob info).
+            #[cfg(feature = "gpu")]
+            let (tok, lp_info) = if device_sampling {
+                let sampled =
+                    model.sample_device(&device_spec, &completion, rng.next_f64() as f32)?;
+                let info = params.logprobs.then(|| TokenLogprob {
+                    token: self.tokenizer.decode(&[sampled.token], false),
+                    token_id: sampled.token,
+                    logprob: sampled.logprob,
+                    top: sampled
+                        .top
+                        .into_iter()
+                        .map(|(id, lp)| Logprob {
+                            token: self.tokenizer.decode(&[id], false),
+                            token_id: id,
+                            logprob: lp,
+                        })
+                        .collect(),
+                });
+                (sampled.token, info)
+            } else {
+                let tok = sample(&logits, params, &mut rng, &completion);
+                (
+                    tok,
+                    params.logprobs.then(|| {
+                        logprob_info(
+                            &logits,
+                            params,
+                            &completion,
+                            tok,
+                            params.top_logprobs,
+                            &self.tokenizer,
+                        )
+                    }),
+                )
+            };
+            #[cfg(not(feature = "gpu"))]
+            let (tok, lp_info) = {
+                let tok = sample(&logits, params, &mut rng, &completion);
+                (
+                    tok,
+                    params.logprobs.then(|| {
+                        logprob_info(
+                            &logits,
+                            params,
+                            &completion,
+                            tok,
+                            params.top_logprobs,
+                            &self.tokenizer,
+                        )
+                    }),
+                )
+            };
             if is_stop_token(tok, &self.tokenizer) || params.stop_tokens.contains(&tok) {
                 finish = "stop".into();
                 break;
@@ -680,26 +762,17 @@ impl Engine {
             // forward() would desync the KV cache / recurrent state / position
             // from the token sequence the model itself generated.
             if router.is_delimiter(tok) {
-                logits = model.forward(&[tok])?;
+                if device_sampling {
+                    model.forward_device(&[tok])?;
+                } else {
+                    logits = model.forward(&[tok])?;
+                }
                 if router.toggle(tok, &mut on_token) {
                     finish = "stop".into();
                     break;
                 }
                 continue;
             }
-            // Compute logprobs from the same (penalty-adjusted) distribution
-            // that `sample` used, before sampling transforms (temperature,
-            // top-k, top-p) are applied — the vLLM/SGLang convention.
-            let lp_info = params.logprobs.then(|| {
-                logprob_info(
-                    &logits,
-                    params,
-                    &completion,
-                    tok,
-                    params.top_logprobs,
-                    &self.tokenizer,
-                )
-            });
             completion.push(tok);
             if let Some(info) = lp_info {
                 logprobs.push(info);
@@ -724,7 +797,11 @@ impl Engine {
                 finish = "stop".into();
                 break;
             }
-            logits = model.forward(&[tok])?;
+            if device_sampling {
+                model.forward_device(&[tok])?;
+            } else {
+                logits = model.forward(&[tok])?;
+            }
 
             // Report decode progress every DECODE_BATCH generated tokens.
             let generated = step + 1;
@@ -915,7 +992,7 @@ fn is_stop_token(tok: u32, tokz: &Tokenizer) -> bool {
 /// `history` is the tokens generated so far; each distinct token in it gets
 /// its logit divided by `repetition_penalty` (positive) or multiplied (negative),
 /// which breaks greedy repetition loops when the penalty is > 1.
-fn prepare_logits<'a>(
+pub(crate) fn prepare_logits<'a>(
     logits: &'a [f32],
     params: &Params,
     history: &[u32],
@@ -971,7 +1048,7 @@ fn prepare_logits<'a>(
 /// Sample after applying logit processors (penalties and bias), sharing that
 /// work with `logprob_info` so reported probabilities match the distribution
 /// the token was drawn from.
-fn sample(logits: &[f32], params: &Params, rng: &mut Rng, history: &[u32]) -> u32 {
+pub(crate) fn sample(logits: &[f32], params: &Params, rng: &mut Rng, history: &[u32]) -> u32 {
     let mut buf = Vec::new();
     let logits = prepare_logits(logits, params, history, &mut buf);
 

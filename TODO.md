@@ -13,13 +13,16 @@ checked off with a short note; open items are unchecked.
 
 ## Validation & Correctness
 
-- [ ] **(P1) Move sampling fully on device (GPU path).** REMINDER from the
-  device-resident GPU work: the forward pass now keeps weights, activations,
-  KV cache and DeltaNet state on device, but the final logits are still copied
-  to the host once per `Model::forward` and sampled with the existing host
-  sampler. Next step: implement temperature / top-k / top-p / greedy sampling
-  with candle tensor ops so only the chosen token id crosses back. See
-  `src/gpu.rs` and `IMPROVEMENT_PLAN.md` (GPU section).
+- [x] **(P1) Move sampling fully on device (GPU path).** Done: `GpuRunner::sample()`
+  applies repetition/presence/frequency penalties and logit bias on device,
+  then greedy/temperature/top-k/top-p sampling and logprob extraction; only a
+  token id, its logprob and optional top pairs cross back (one tiny tensor per
+  step) plus one f32 uniform uploaded from the request RNG. `n > 1` prefill
+  snapshots carry device logits. top-k uses repeated argmax and top-p a
+  32-step threshold search (candle 0.11 has no `topk`/`sort`); the CDF is walked
+  in token-id order, so a fixed uniform can pick a different token than the
+  host sampler but the distribution is the same. Equivalence is locked by
+  `device_sample_matches_host_*` and `device_logprobs_match_host`.
 
 - [x] **(P0) Fix GPU forward shape/indexing bugs.** The device path failed on a
   real model with `shape mismatch in mul, lhs: [16,128], rhs: [1,128]`. Fixed
@@ -47,6 +50,8 @@ checked off with a short note; open items are unchecked.
   so no error). Added per-head-norm and lm_head-resolution tests, head
   divisibility + projection-length + Hadamard-divisibility + context guards,
   and named diagnostics. `cargo test --features gpu`: 126 passed / 11 ignored.
+
+- [x] **(P1) Fix GPU decode being slower than CPU (batch the device hot path).** A real 0.8B client run gave ~6.9 tok/s on GPU vs ~11.9 tok/s on CPU, with GPU-Z showing ~20% GPU load / ~33 W — latency-bound, not compute-bound. The DeltaNet recurrence looped over 32 value heads with a `to_vec0()` host round-trip for `g`/`beta` on each (~576 device syncs and ~11k tiny kernels per token); full attention also looped per query head. `deltanet_step_all()` and `gqa_attention()` now advance/attend over all heads in batched device ops; the only host sync left is the final `logits.to_vec1()` per `forward()`. Numeric equivalence to the old per-head math is locked by `gpu::tests::deltanet_all_matches_per_head` and `gqa_batched_matches_per_head`. Both Hadamards are now also folded into each W_hat at load (`fold_hadamards()` in `src/gpu.rs`), making each `q_matmul` a single GEMV; `folded_q_matmul_matches_unfolded` checks it numerically. Still needs a real-GPU A/B (no GPU in CI) — remaining launch overhead is ~2k small ops/token.
 
 - [x] **(P0) End-to-end test with a real EXL3 model.** Done — validated on
   `UnstableLlama/Qwen3.5-0.8B-exl3-8.00bpw`. Chat completions produce coherent

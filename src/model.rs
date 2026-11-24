@@ -1050,6 +1050,55 @@ impl Model {
         }
         Ok(logits)
     }
+
+    /// When true, this instance runs the device-resident forward and can sample
+    /// on device (only a token id crosses back, instead of the full logits).
+    pub fn device_sampling_available(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        return self.gpu.is_some();
+        #[cfg(not(feature = "gpu"))]
+        return false;
+    }
+
+    /// Advance the device forward without copying logits to the host. The
+    /// resulting logits stay on device for `sample_device`.
+    pub fn forward_device(&mut self, input_ids: &[u32]) -> Result<(), String> {
+        #[cfg(not(feature = "gpu"))]
+        let _ = input_ids;
+        #[cfg(feature = "gpu")]
+        {
+            if input_ids.len() > self.core.context_size.saturating_sub(self.position) {
+                return Err(format!(
+                    "context size exceeded: position {} + {} input tokens > context {}",
+                    self.position,
+                    input_ids.len(),
+                    self.core.context_size
+                ));
+            }
+            if let Some(g) = &mut self.gpu {
+                g.forward_logits(input_ids)?;
+                self.position = g.position();
+                return Ok(());
+            }
+        }
+        Err("device forward requested but no GPU backend is active".into())
+    }
+
+    /// Sample from the most recent device forward. `history` is the generated
+    /// token ids (used by penalties); `u` is one uniform from the request RNG.
+    #[cfg(feature = "gpu")]
+    pub fn sample_device(
+        &self,
+        spec: &crate::gpu::SampleSpec,
+        history: &[u32],
+        u: f32,
+    ) -> Result<crate::gpu::DeviceSample, String> {
+        let g = self
+            .gpu
+            .as_ref()
+            .ok_or_else(|| "device sample requested but no GPU backend is active".to_string())?;
+        g.sample(spec, history, u)
+    }
 }
 
 #[cfg(test)]
