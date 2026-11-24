@@ -16,7 +16,7 @@ criteria.
 - At review: `cargo test` **84 passed, 4 ignored**. After Phase 0:
   **88 passed, 10 ignored**. After Phase 1: **99 passed, 10 ignored**. After
   Phase 2: **102 passed, 11 ignored**; after the deferred Phase 2 work:
-  **110 passed, 11 ignored** (6 real-model / `/tmp` fixtures explicitly ignored
+  **115 passed, 11 ignored** (6 real-model / `/tmp` fixtures explicitly ignored
   with reasons, 5 benchmarks). `cargo fmt --all -- --check` and
   `cargo clippy --all-targets -- -D warnings` remain clean; the GPU feature
   also compiles and its cache-key test passes.
@@ -138,6 +138,13 @@ tests silently return early when `/tmp` files are absent.
    emits a final `choices: []` usage chunk; `ToolCallStreamer` + `tool_call_delta`
    emit indexed name/argument deltas and keep XML out of content. Assertions
    cover chunk ordering, usage placement, streamer parsing and delta shape.
+   **Follow-up (real-client trace):** a client injecting an object-valued
+   `__labels__` pseudo-parameter into every tool schema made Qwen3.5 emit
+   `<parameter=__labels__\n{...}` without `>`; the old parser scanned to the
+   next `>` and merged both parameters into one garbage argument, so tools
+   received no `chat_id`. The parameter name now ends at `>` **or** a newline,
+   and `trailing_prefix_len()`/`finish()` drop unfinished blocks instead of
+   streaming raw XML. Regressions cover both streaming and non-streaming.
 
 8. **Tighten generation semantics.**
    - Reject `repetition_penalty <= 0` (currently `0` silently disables the
@@ -265,5 +272,24 @@ LUT instead of per-codeword arithmetic (it was ~10x slower than the f32 cache
 build), with a bit-identity test; the rerun confirmed f16 load dropped from
 54.6 s to 3.9 s for 159 linears. Real-model A/B on a 12th-gen host showed f32
 fastest (~11.9 / 8.6 / 1.6 tok/s for f32 / f16 / packed) — documented in
-`AGENTS.md` §8 and `README.md`. Verified: 110 passed / 11 ignored, fmt and
+`AGENTS.md` §8 and `README.md`. Verified: 115 passed / 11 ignored, fmt and
 clippy clean.
+
+## Post-v0.4.3 follow-up: tool-call robustness
+
+A real-client trace exposed two edge cases in tool-call handling, both fixed
+with regression tests based on the exact observed output:
+
+- A client that injects an object-valued `__labels__` pseudo-parameter into
+  every tool schema makes Qwen3.5 emit `<parameter=__labels__\n{...}` without
+  the closing `>`. The old parser scanned forward to the next `>`, merging
+  `__labels__` and `chat_id` into one garbage argument — tool execution then
+  failed with "missing required positional argument". Parameter names now
+  terminate at `>` **or** a line break, so each argument stays separate.
+- A generation that stops mid-call (`finish_reason=length`) left the unfinished
+  `<tool_call>` XML in `content`. `ToolCallStreamer::finish()` and
+  `parse_tool_calls()` now drop incomplete blocks (and partial opener
+  prefixes), in both streaming and non-streaming paths.
+
+Verification: **115 passed, 11 ignored**, `cargo fmt --all -- --check` and
+`cargo clippy --all-targets -- -D warnings` clean.

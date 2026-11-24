@@ -41,17 +41,37 @@ pub fn tools_system_prompt(tools: &Json) -> String {
     out
 }
 
+/// Length of the longest suffix of `s` that is also a prefix of `prefix`.
+/// Used to hold back markers split across token boundaries so they can be
+/// reassembled on the next chunk instead of leaking into content.
+pub(crate) fn trailing_prefix_len(s: &str, prefix: &str) -> usize {
+    let max = s.len().min(prefix.len().saturating_sub(1));
+    (1..=max)
+        .rev()
+        .find(|&n| {
+            let start = s.len() - n;
+            s.is_char_boundary(start) && prefix.starts_with(&s[start..])
+        })
+        .unwrap_or(0)
+}
+
 /// Split model-generated `<tool_call>` blocks out of `text`. Returns the text
-/// with those blocks removed plus one `ToolCall` per block.
+/// with those blocks removed plus one `ToolCall` per block. An unfinished
+/// block (generation stopped at `finish_reason=length`) is dropped rather
+/// than left in the content as raw XML.
 pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
     let mut clean = String::with_capacity(text.len());
     let mut calls = Vec::new();
     let mut rest = text;
-    while let Some(start) = rest.find("<tool_call>") {
-        let Some(end_rel) = rest[start..].find("</tool_call>") else {
+    while let Some(start) = rest.find(OPEN) {
+        let Some(end_rel) = rest[start..].find(CLOSE) else {
+            // Keep only the text before the incomplete block.
+            rest = &rest[..start];
             break;
         };
-        let block_end = start + end_rel + "</tool_call>".len();
+        let block_end = start + end_rel + CLOSE.len();
         clean.push_str(&rest[..start]);
         let block = &rest[start..block_end];
         if let Some(call) = parse_one_tool_call(block, calls.len()) {
@@ -59,7 +79,9 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
         }
         rest = &rest[block_end..];
     }
-    clean.push_str(rest);
+    // Also withhold a trailing partial `<tool_call` opener.
+    let keep = rest.len() - trailing_prefix_len(rest, OPEN);
+    clean.push_str(&rest[..keep]);
     (clean, calls)
 }
 
@@ -70,14 +92,28 @@ pub(crate) fn parse_one_tool_call(block: &str, index: usize) -> Option<ToolCall>
     let mut pairs: Vec<(String, Json)> = Vec::new();
     let mut rest = &block[name_end + 1..];
     while let Some(p_start) = rest.find("<parameter=") {
-        let p_start = p_start + "<parameter=".len();
-        let p_end = rest[p_start..].find('>')? + p_start;
-        let key = rest[p_start..p_end].trim().to_string();
-        let close = rest[p_end + 1..].find("</parameter>")? + p_end + 1;
-        let raw = rest[p_end + 1..close].trim();
-        let value = crate::json::parse(raw).unwrap_or_else(|_| Json::Str(raw.to_string()));
-        pairs.push((key, value));
-        rest = &rest[close + "</parameter>".len()..];
+        let after = p_start + "<parameter=".len();
+        let header = &rest[after..];
+        // Qwen3.5 emits `<parameter=name>`. Some clients inject object-valued
+        // pseudo-parameters (e.g. `__labels__`) that the model writes as
+        // `<parameter=name\n{...}` without the closing `>`. Ending the name at
+        // a line break too keeps the following parameter from being swallowed
+        // into this one's value.
+        let name_end = header.find(['>', '\n', '\r']).unwrap_or(header.len());
+        let key = header[..name_end].trim();
+        // Consume the `>` itself when present; for the newline form the
+        // value starts at the line break and `trim()` removes it.
+        let value_at = after + name_end + usize::from(header[name_end..].starts_with('>'));
+        let value_region = &rest[value_at..];
+        let Some(close) = value_region.find("</parameter>") else {
+            break;
+        };
+        let raw = value_region[..close].trim();
+        if !key.is_empty() && !key.contains('<') {
+            let value = crate::json::parse(raw).unwrap_or_else(|_| Json::Str(raw.to_string()));
+            pairs.push((key.to_string(), value));
+        }
+        rest = &value_region[close + "</parameter>".len()..];
     }
     Some(ToolCall {
         id: format!("call_{}", index),
@@ -361,6 +397,34 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "get_weather");
         assert_eq!(calls[0].arguments, r#"{"city":"Paris"}"#);
+    }
+
+    #[test]
+    fn malformed_parameter_header_does_not_swallow_next_argument() {
+        // Real-client trace: the client injects an object-valued `__labels__`
+        // pseudo-parameter into every tool schema, and Qwen3.5 emitted its
+        // opener without the closing `>` (`<parameter=__labels__\n{...}`).
+        let text = "<tool_call>\n<function=view_chat>\n<parameter=__labels__\n{\"running\": \"Searching for flights.\"\n\"completed\": \"Searched for flights.\"}\n</parameter>\n<parameter=chat_id>\nchat_001\n</parameter>\n</function>\n</tool_call>\n";
+        let (clean, calls) = parse_tool_calls(text);
+        assert_eq!(clean, "\n");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "view_chat");
+        let args = crate::json::parse(&calls[0].arguments).unwrap();
+        assert_eq!(args.get("chat_id").unwrap().as_str(), Some("chat_001"));
+        // The client's `__labels__` payload itself is not valid JSON (the
+        // model omits the comma), so it falls back to a string — but it must
+        // stay in its own argument instead of swallowing `chat_id`.
+        assert!(args.get("__labels__").is_some());
+        assert!(!calls[0].arguments.contains("</parameter"));
+        assert!(!calls[0].arguments.contains("<parameter="));
+    }
+
+    #[test]
+    fn incomplete_tool_call_is_not_left_in_content() {
+        let text = "Sure\n<tool_call>\n<function=view_chat>\n<parameter=chat_id>\nchat_001\n";
+        let (clean, calls) = parse_tool_calls(text);
+        assert_eq!(clean, "Sure\n");
+        assert!(calls.is_empty());
     }
 
     #[test]

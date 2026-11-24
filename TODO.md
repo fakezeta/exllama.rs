@@ -61,9 +61,9 @@ checked off with a short note; open items are unchecked.
   grouping/scale/gate and the DeltaNet recurrence (with decay). `model.rs`
   now has 7 unit tests.
 - [x] **(P1) Fix doc drift.** Done — `AGENTS.md` counts/line numbers, `TODO.md`
-  stale "next steps", and this plan's baseline are updated to 110 passed /
+  stale "next steps", and this plan's baseline are updated to 115 passed /
   11 ignored (88 after Phase 0, 99 after Phase 1, 102 after Phase 2, 110 after
-  the benchmark fixes).
+  the benchmark fixes, 115 after the tool-call parser fixes).
 - [x] **(P1) Bounded request-line reading.** Done — see plan Phase 1 #4:
   `read_request()` reads the request line and headers through
   `Read::take(MAX_HEADER_BYTES + 1)` and rejects overlong lines. `http::tests`
@@ -189,7 +189,7 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 
 ## Chat Template
 
-- [x] **(P1) Tool calling (streaming + non-streaming).** Done — OpenAI `tools` are rendered into the Qwen3.5 system preamble, assistant `tool_calls` into `<function=...>` XML, and generated `<tool_call>` blocks are parsed back into `tool_calls` with `finish_reason: "tool_calls"`. Streaming emits indexed `tool_calls` deltas (see plan Phase 1 #7).
+- [x] **(P1) Tool calling (streaming + non-streaming).** Done — OpenAI `tools` are rendered into the Qwen3.5 system preamble, assistant `tool_calls` into `<function=...>` XML, and generated `<tool_call>` blocks are parsed back into `tool_calls` with `finish_reason: "tool_calls"`. Streaming emits indexed `tool_calls` deltas (see plan Phase 1 #7). A real-client trace exposed two edge cases, both fixed with regressions: a `<parameter=name\n{...}` header without `>` used to swallow the following argument (breaking `chat_id`), and a call truncated at `finish_reason=length` leaked raw XML into `content`.
 - [x] **(P1) `enable_thinking` model-size defaults.** Done — see Model & Architecture Support above.
 - [ ] **(P2) Multi-modal content parts** (`content: [{type: "text", ...}]`) — currently only plain strings.
 - [x] **(P2) `reasoning_content` on responses.** Done (see API section); `Message` also accepts `reasoning_content` on input for multi-turn history.

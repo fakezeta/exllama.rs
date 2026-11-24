@@ -23,7 +23,7 @@ This document is a complete orienteering guide for AI agents (or humans) continu
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build                      # debug
 cargo build --release            # optimized binary at target/release/exllama-server
-cargo test                       # 110 unit tests (11 ignored: real-model / /tmp fixtures + benchmarks)
+cargo test                       # 115 unit tests (11 ignored: real-model / /tmp fixtures + benchmarks)
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings   # must pass (CI enforces)
 ```
@@ -128,7 +128,7 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
   - User: `<|im_start|>user\n{trim}<|im_end|>\n`
   - Assistant: prefers an explicit `reasoning_content`; otherwise splits reasoning from content if `</think>` present. If `idx > last_query_index` emits `<think>\n{reasoning}\n</think>\n\n{body}`. Assistant `tool_calls` render as Qwen3.5 XML (`<tool_call><function=...><parameter=...>...`).
   - Tool messages: grouped into one user turn with `<tool_response>` blocks.
-  - `tools_system_prompt()` builds the system preamble for OpenAI `tools`; `parse_tool_calls()` extracts generated `<tool_call>` blocks into response fields. Streaming uses `ToolCallStreamer` in `server.rs` to strip the XML from content and emit indexed `tool_calls` deltas instead.
+  - `tools_system_prompt()` builds the system preamble for OpenAI `tools`; `parse_tool_calls()` extracts generated `<tool_call>` blocks into response fields. Parameter names terminate at `>` **or** a line break — some clients inject object-valued pseudo-parameters (e.g. `__labels__`) that the model emits as `<parameter=name\n{...}` without `>`, which previously swallowed the next argument. Incomplete blocks are dropped, not left in content. Streaming uses `ToolCallStreamer` in `server.rs` to strip the XML from content and emit indexed `tool_calls` deltas instead.
   - Generation prompt: `<|im_start|>assistant\n` + `<think>\n` (thinking on) or `<think>\n\n</think>\n\n` (off).
 - `enable_thinking` default is model-size-aware: `hidden_size >= 2560` → true (9B/4B), otherwise false (0.8B/2B); an explicit config value wins. `Params` seeds its default from `Engine.default_enable_thinking`.
 
@@ -148,7 +148,7 @@ Defaults: context 4096, port 8080, host 0.0.0.0, max-tokens 512, threads = all C
 - `run_chat()` / `run_completion()` — render prompt, tokenize, call `generate()`. **Chat uses `add_generation_prompt=true`** (critical: model needs `<think>\n` to start) and `split_reasoning=true`; completions use `split_reasoning=false`.
 - `sample()` — repetition penalty (divides logits of already-generated tokens by `repetition_penalty` > 1, HashSet dedup), presence/frequency penalties, `logit_bias`, then temperature (≤0 = argmax), top-k, top-p nucleus sampling. The default path (no top-k, top_p=1) uses an allocation-free two-pass categorical draw; other paths use one candidate vector with partial selection. `generate()` passes completion history into `sample()`.
 - Progress logging to stderr: `[load]` per 16 linears + totals in `exl3.rs::load`; `[prompt] processed/total (tok/s)` per 32-token prefill batch; `[decode] N tokens generated (tok/s)` every 16 tokens; `[done]` final summary. Constants `PROMPT_BATCH=32`, `DECODE_BATCH=16` in `server.rs`.
-- `handle_chat()` / `handle_completions()` — parse JSON body, build SSE chunks or JSON responses. SSE uses `chat_chunk()` / completion chunk builders; terminates with `data: [DONE]`. With `stream_options.include_usage`, both endpoints emit a final `choices: []` chunk carrying aggregate usage. `ToolCallStreamer` incrementally strips `<tool_call>` XML from the answer stream and `tool_call_delta()` emits indexed OpenAI tool-call deltas (name + argument fragments).
+- `handle_chat()` / `handle_completions()` — parse JSON body, build SSE chunks or JSON responses. SSE uses `chat_chunk()` / completion chunk builders; terminates with `data: [DONE]`. With `stream_options.include_usage`, both endpoints emit a final `choices: []` chunk carrying aggregate usage. `ToolCallStreamer` incrementally strips `<tool_call>` XML from the answer stream and `tool_call_delta()` emits indexed OpenAI tool-call deltas (name + argument fragments). On a truncated generation (`finish_reason=length`) its `finish()` drops any unfinished block rather than leaking raw XML into `content`; `trailing_prefix_len()` (in `chat.rs`) is shared with the non-streaming `parse_tool_calls()` path.
 - `Params` includes `enable_thinking`, penalties, `logit_bias`, stop token ids and `include_usage`. `parse_params()` validates all fields and returns 400 on bad input.
 - `OutputRouter` owns UTF-8 assembly, stream toggling and stop-string tail buffering; `on_token` returns false to abort generation when the client disconnects. RoPE tables and DeltaNet head scratch are precomputed/reused for throughput.
 
@@ -373,7 +373,7 @@ it matters — use `EXLLAMA_BENCH_COMPUTE` to A/B it on a given host.
 - **Memory vs speed:** `--weight-mode` trades RAM for tokens/s, but the ranking is host-dependent. Measured on a 12th-gen x86 host (10 threads, 4 bpw 0.8B): `f32` (default) loads in ~10.6 s and decodes at **~11.9 tok/s** — the fastest decode mode there; `f16` (~2× on-disk) loads in ~10.3 s after the `decode_bits` LUT fix (54.6 s before it — its cache build used per-codeword arithmetic while f32 used a LUT) and decodes at ~8.6 tok/s; `packed` (~1× on-disk) loads in ~6.8 s but decodes at ~1.6 tok/s — not interactive. On CPU, SIMD on `dot()` would not help the packed path; its bottleneck is codebook decode, not the MACs. Tied-embedding models skip the lm_head decode (plain embedding matrix used directly). Peak RAM during load includes raw shard bytes plus decoded caches (in `f32` mode, several times on-disk); the old "≈ 2× on-disk" claim was inaccurate. Plain 2-D tensors are decoded once (previously stored in both `vectors` and `weights`), trellis byte ranges are compacted away after the linear pass, and untied embedding tables are stored as fp16 with per-row decode. Tied models no longer keep a ~1 GB f32 embedding: all plain embeddings are fp16 and tied `lm_head` uses the threaded `matmul_f16`. The full-attention KV cache is fp16 (2 bytes/value, LUT-decoded per step), halving context RAM. The packed decode hot path now uses `unpack_tile_f32()` (direct codebook f32 LUT) instead of per-codeword arithmetic + fp16 conversion; true SIMD gather remains unavailable on stable std-only Rust (no portable `simd` API), but the arithmetic bottleneck is gone.
 - **No GPU:** CPU only; large models are slow.
 - **Concurrency:** `n > 1` choices share one prefill via `PrefillState` (see §3). Independent requests can run in parallel with `--instances N` (default 1): N model instances share one Arc model core (weights/config) and only duplicate KV/recurrent state, so memory scales with instances' state rather than full weights. Bounded admission returns 429 past 16 queued requests. Matmuls are **not** batched across requests (that needs batch-aware attention/DeltaNet), and `threadpool::RUN_LOCK` still serializes matmul dispatch globally — instances overlap non-matmul work (tokenize, sampling, I/O, state handling) rather than two GEMVs at once.
-- **API fidelity limits:** `response_format: json_object` only adds a prompt hint — there is no grammar/constrained decoding or JSON validation. Streaming tool calls now produce indexed `tool_calls` deltas (name + argument fragments) with the XML withheld from content, but tool-call arguments are still assembled with the simple `<parameter=...>` parser, not full JSON streaming. Chat `top_logprobs` is capped at 20 (completions accept up to 20 as an extension; OpenAI allows 5). Logprobs exclude reasoning delimiters and stop tokens, so their count matches `completion_tokens`, not every token sampled internally; `<think>`/`</think>` also consume a forward step but are not counted in `completion_tokens`.
+- **API fidelity limits:** `response_format: json_object` only adds a prompt hint — there is no grammar/constrained decoding or JSON validation. Streaming tool calls now produce indexed `tool_calls` deltas (name + argument fragments) with the XML withheld from content, but tool-call arguments are still assembled with the simple `<parameter=...>` parser, not full JSON streaming. That parser tolerates a missing `>` in the parameter header (name ends at a newline) and drops incomplete blocks from content; deeply malformed values still fall back to strings. Chat `top_logprobs` is capped at 20 (completions accept up to 20 as an extension; OpenAI allows 5). Logprobs exclude reasoning delimiters and stop tokens, so their count matches `completion_tokens`, not every token sampled internally; `<think>`/`</think>` also consume a forward step but are not counted in `completion_tokens`.
 - **No full Jinja template engine:** chat template covers text-only common cases; tool-call arguments and advanced Jinja features (e.g. `tojson` of tool definitions) are not implemented.
 - **No Unicode NFC normalization:** tokenizer assumes input is already NFC (chat content typically is).
 - **No vision inference:** vision tensors are dequantized-skipped and ignored.
@@ -394,14 +394,14 @@ it matters — use `EXLLAMA_BENCH_COMPUTE` to A/B it on a given host.
 | `json::tests` | JSON parse/serialize (if present) |
 | `regex::tests::test_qwen_style` | Pre-tokenizer regex against ground-truth word lists |
 | `tokenizer::tests` | Encode + added-token protection vs real Qwen3.5 tokenizer |
-| `chat::tests` | Chat template rendering (4 cases) |
+| `chat::tests` | Chat template rendering (4 cases), tool-call parsing incl. malformed `<parameter=` headers and incomplete blocks |
 | `exl3::tests::codebook_decode_matches_reference` | All 3 codebooks vs numpy reference |
 | `exl3::tests::half_roundtrip` | fp16 conversion correctness |
 | `exl3::tests::tile_perm_matches_reference` | Tile permutation vs reference |
 | `exl3::synthetic_tests::matmul_matches_dequant_*` | Fresh-clone-safe equivalence of all three `--weight-mode` paths vs full dequant, for 3INST / MCG / MUL1 (integer + half-bitrate); no `/tmp` fixtures |
 | `exl3::real_model_tests` | Real layer-0 dequant + matmul checks; `#[ignore]`d (require `/tmp/unstable_*.bin`) |
 | `model::tests` | Golden tests for RMSNorm, per-head RMSNormGated, partial RoPE, q_proj interleaving, GQA grouping/gate, DeltaNet recurrence, plus fp16 embedding resolution |
-| `server::tests` | Sampling equivalence, logprobs vs log-softmax, parameter validation, `n` choices, SSE framing/usage/logprob ordering, tool-call streaming deltas, deadline, HTTP responses |
+| `server::tests` | Sampling equivalence, logprobs vs log-softmax, parameter validation, `n` choices, SSE framing/usage/logprob ordering, tool-call streaming deltas (incl. malformed headers and truncation), deadline, HTTP responses |
 | `http::tests` | Bounded request line and normal request parsing through the bounded reader |
 | `threadpool::tests` | Concurrent `run()` calls complete without deadlock |
 | `tensor::tests` | `dot()` rejects length mismatches |
@@ -417,7 +417,7 @@ it matters — use `EXLLAMA_BENCH_COMPUTE` to A/B it on a given host.
 | `tests::cli_parses_instance_count` | `--instances` parsing and bounds |
 | `fuzz::tests` | Seeded random inputs against JSON/HTTP/regex/chat/tokenizer/API parsers (no panics) |
 
-Run `cargo test` — 110 pass, 11 ignored on the current state. The ignored set
+Run `cargo test` — 115 pass, 11 ignored on the current state. The ignored set
 is 6 real-model / `/tmp`-fixture tests (now explicitly marked with reasons) plus
 5 benchmarks (including `bench_n_choices_prefill_reuse`). On a fresh clone the dequantization/matmul guarantee is still
 verified by the committed synthetic fixtures.

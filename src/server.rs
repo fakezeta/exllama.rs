@@ -1664,17 +1664,7 @@ impl ToolCallStreamer {
                 // Hold back the longest suffix that is also a prefix of the
                 // opening tag; it may complete in a later chunk. A fixed
                 // hold-back would leak earlier text into the content stream.
-                let max = self.pending.len().min(Self::OPEN.len() - 1);
-                let mut hold = 0;
-                for n in (1..=max).rev() {
-                    let start = self.pending.len() - n;
-                    if self.pending.is_char_boundary(start)
-                        && Self::OPEN.starts_with(&self.pending[start..])
-                    {
-                        hold = n;
-                        break;
-                    }
-                }
+                let hold = crate::chat::trailing_prefix_len(&self.pending, Self::OPEN);
                 let safe = self.pending.len() - hold;
                 if safe > 0 {
                     content.push_str(&self.pending[..safe]);
@@ -1699,9 +1689,16 @@ impl ToolCallStreamer {
         }
     }
 
-    /// Flush any trailing text that did not form a tool call.
+    /// Flush trailing text that did not form a tool call. An unfinished block
+    /// (e.g. `finish_reason=length` mid-call) is dropped rather than leaking
+    /// raw `<tool_call>` XML into the content stream.
     fn finish(&mut self) -> String {
-        std::mem::take(&mut self.pending)
+        let pending = std::mem::take(&mut self.pending);
+        let end = match pending.find(Self::OPEN) {
+            Some(open) => open,
+            None => pending.len() - crate::chat::trailing_prefix_len(&pending, Self::OPEN),
+        };
+        pending[..end].to_string()
     }
 
     fn any_calls(&self) -> bool {
@@ -3087,6 +3084,39 @@ mod tests {
         assert_eq!(calls2[0].1, "get_weather");
         assert_eq!(calls2[0].2, r#"{"city":"Paris"}"#);
         assert!(s.any_calls());
+        assert_eq!(s.finish(), "");
+    }
+
+    #[test]
+    fn tool_call_streamer_drops_incomplete_block_on_finish() {
+        let mut s = ToolCallStreamer::new();
+        let (content, calls) = s.push(
+            "Ah, here:\n\n<tool_call>\n<function=view_chat>\n<parameter=chat_id>\nchat_001\n",
+        );
+        assert_eq!(content, "Ah, here:\n\n");
+        assert!(calls.is_empty());
+        assert_eq!(s.finish(), "", "partial XML must not reach content");
+    }
+
+    #[test]
+    fn tool_call_streamer_holds_partial_opener_at_finish() {
+        let mut s = ToolCallStreamer::new();
+        let (content, calls) = s.push("text <tool_");
+        assert_eq!(content, "text ");
+        assert!(calls.is_empty());
+        assert_eq!(s.finish(), "");
+    }
+
+    #[test]
+    fn tool_call_streamer_parses_malformed_labels_parameter() {
+        let mut s = ToolCallStreamer::new();
+        let chunk = "<tool_call>\n<function=view_chat>\n<parameter=__labels__\n{\"running\": \"Searching for flights.\"}\n</parameter>\n<parameter=chat_id>\nchat_001\n</parameter>\n</function>\n</tool_call>\n";
+        let (_, calls) = s.push(chunk);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "view_chat");
+        let args = crate::json::parse(&calls[0].2).unwrap();
+        assert_eq!(args.get("chat_id").unwrap().as_str(), Some("chat_001"));
+        assert!(args.get("__labels__").is_some());
         assert_eq!(s.finish(), "");
     }
 
