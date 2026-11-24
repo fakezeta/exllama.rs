@@ -3339,10 +3339,17 @@ mod tests {
         std::env::var("EXLLAMA_BENCH_WEIGHT_MODE").unwrap_or_else(|_| "f32".into())
     }
 
+    /// Compute backend for the opt-in benchmarks (`--compute` equivalent).
+    /// Set to `scalar` or `blas` to A/B the CPU decode paths on a given host.
+    fn bench_compute() -> String {
+        std::env::var("EXLLAMA_BENCH_COMPUTE").unwrap_or_else(|_| "auto".into())
+    }
+
     /// Opt-in end-to-end throughput benchmark. Requires a real EXL3 model:
     ///   EXLLAMA_BENCH_MODEL=/path/to/model cargo test --release \
     ///       bench_generation_throughput -- --ignored --nocapture
     /// Optional: EXLLAMA_BENCH_THREADS=N EXLLAMA_BENCH_WEIGHT_MODE=f16|f32|packed
+    ///           EXLLAMA_BENCH_COMPUTE=auto|scalar|blas
     #[test]
     #[ignore]
     fn bench_generation_throughput() {
@@ -3352,15 +3359,17 @@ mod tests {
         };
         let threads = bench_threads();
         let weight_mode = bench_weight_mode();
+        let compute = bench_compute();
         // The server calls both at startup; benchmarks must do the same.
         // Without them matmuls run sequentially (no threadpool) and fall back
         // to single-threaded sgemm, making the numbers unrepresentative.
         crate::threadpool::init(threads);
-        let backend = crate::compute::init("auto", threads);
+        let backend = crate::compute::init(&compute, threads);
         eprintln!(
-            "BENCH config: threads={} weight_mode={} backend={}",
+            "BENCH config: threads={} weight_mode={} compute={} backend={}",
             threads,
             weight_mode,
+            compute,
             backend.name()
         );
         let model = crate::model::Model::load(&dir, 4096, threads, &weight_mode).unwrap();
@@ -3421,12 +3430,14 @@ mod tests {
         };
         let threads = bench_threads();
         let weight_mode = bench_weight_mode();
+        let compute = bench_compute();
         crate::threadpool::init(threads);
-        let backend = crate::compute::init("auto", threads);
+        let backend = crate::compute::init(&compute, threads);
         eprintln!(
-            "BENCH config: threads={} weight_mode={} backend={}",
+            "BENCH config: threads={} weight_mode={} compute={} backend={}",
             threads,
             weight_mode,
+            compute,
             backend.name()
         );
         let model = crate::model::Model::load(&dir, 4096, threads, &weight_mode).unwrap();

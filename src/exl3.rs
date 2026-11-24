@@ -188,6 +188,30 @@ fn build_decode_table(f: fn(u16) -> u16) -> Vec<f32> {
     (0..=u16::MAX).map(|i| half_to_f32(f(i))).collect()
 }
 
+/// Precomputed fp16-bit-pattern tables for the f16 cache build. Historically
+/// `build_decode_cache` called `decode()` per codeword (integer multiply +
+/// LOP3 emulation), making it ~10x slower than the f32 LUT path. Looking up
+/// the same bit patterns keeps the f16 cache lossless *and* fast.
+static DECODE_3_BITS: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+static DECODE_MCG_BITS: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+static DECODE_MUL1_BITS: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+
+#[inline]
+fn decode_bits(idx: u16, cb: Codebook) -> u16 {
+    let table = match cb {
+        Codebook::ThreeInst => {
+            DECODE_3_BITS.get_or_init(|| build_decode_bits_table(Codebook::ThreeInst))
+        }
+        Codebook::Mcg => DECODE_MCG_BITS.get_or_init(|| build_decode_bits_table(Codebook::Mcg)),
+        Codebook::Mul1 => DECODE_MUL1_BITS.get_or_init(|| build_decode_bits_table(Codebook::Mul1)),
+    };
+    table[idx as usize]
+}
+
+fn build_decode_bits_table(cb: Codebook) -> Vec<u16> {
+    (0..=u16::MAX).map(|i| decode(i, cb)).collect()
+}
+
 /// Fast fp16-bit-pattern -> f32 lookup (avoids powi in the matmul inner loop).
 static HALF_F32: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
 #[inline]
@@ -276,7 +300,7 @@ fn unpack_tile_bits(
         let k = k_bits_int;
         for i in 0..256 {
             let end = ((i + 1) * k) as i64;
-            out[perm[i]] = decode(window(&words, nw, end - 16), cb);
+            out[perm[i]] = decode_bits(window(&words, nw, end - 16), cb);
         }
     } else {
         // Half-integer K = KA + 0.5 with MASK = 0xAAAA.
@@ -288,7 +312,7 @@ fn unpack_tile_bits(
             let q = i & 15;
             // S(i) = g*bpb + sum_{j=0..=q} (ka + odd(j))
             let end = end_of_group(g) + (q * ka) as i64 + q.div_ceil(2) as i64;
-            out[perm[i]] = decode(window(&words, nw, end - 16), cb);
+            out[perm[i]] = decode_bits(window(&words, nw, end - 16), cb);
         }
     }
 }
@@ -1528,6 +1552,18 @@ mod tests {
             assert!((half_to_f32(decode_3inst(idx[i])) - expected_3[i]).abs() < 1e-3);
             assert!((half_to_f32(decode_mcg(idx[i])) - expected_mcg[i]).abs() < 1e-3);
             assert!((half_to_f32(decode_mul1(idx[i])) - expected_mul1[i]).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn decode_bits_lut_matches_codebooks() {
+        // The f16 cache build must stay bit-identical to the reference
+        // `decode()` now that it uses a LUT like the f32 path.
+        for cb in [Codebook::ThreeInst, Codebook::Mcg, Codebook::Mul1] {
+            for idx in [0u16, 1, 123, 0x7FFF, 0xFFFF] {
+                assert_eq!(decode_bits(idx, cb), decode(idx, cb), "idx {}", idx);
+                assert_eq!(half_f32(decode_bits(idx, cb)), decode_f32(idx, cb));
+            }
         }
     }
 

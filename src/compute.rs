@@ -91,6 +91,27 @@ pub fn backend() -> Backend {
     COMPUTE.get().map(|c| c.backend).unwrap_or(Backend::Blas)
 }
 
+/// Score the two CPU backends from the probe timings. Decode runs once per
+/// generated token while prefill runs once per request, so the GEMV timing is
+/// weighted 4x: a 4x GEMV win (observed on 12th-gen cores) must not be masked
+/// by a 2x prefill win, especially since f16/packed decode does not even use
+/// this backend — only f32 quantized linears and plain matrices do.
+fn pick_by_score(
+    gemv_scalar: f64,
+    gemv_blas: f64,
+    prefill_scalar: f64,
+    prefill_blas: f64,
+) -> Backend {
+    const DECODE_WEIGHT: f64 = 4.0;
+    let scalar = DECODE_WEIGHT * gemv_scalar + prefill_scalar;
+    let blas = DECODE_WEIGHT * gemv_blas + prefill_blas;
+    if blas < scalar {
+        Backend::Blas
+    } else {
+        Backend::Scalar
+    }
+}
+
 /// Micro-benchmark a decode GEMV and a prefill-shaped matrix-matrix multiply
 /// to pick the faster CPU path on this machine. `nthreads` comes from the CLI
 /// so the probe measures the same configuration used for inference.
@@ -138,14 +159,7 @@ fn pick_fastest_cpu(nthreads: usize) -> Backend {
     }
     let prefill_blas = t0.elapsed().as_secs_f64() / reps as f64;
 
-    // Decode dominates per-token latency, so weight its score higher.
-    let scalar_total = 2.0 * gemv_scalar + prefill_scalar;
-    let blas_total = 2.0 * gemv_blas + prefill_blas;
-    let chosen = if blas_total < scalar_total {
-        Backend::Blas
-    } else {
-        Backend::Scalar
-    };
+    let chosen = pick_by_score(gemv_scalar, gemv_blas, prefill_scalar, prefill_blas);
     eprintln!(
         "[compute] CPU probe ({} threads): GEMV scalar={:.2}ms blas={:.2}ms | prefill scalar={:.2}ms blas={:.2}ms -> using {}",
         n,
@@ -337,6 +351,22 @@ mod tests {
         b[512] += 1.0; // sampled position changed -> new cache key
         b[1023] = -7.0; // last element changed too
         assert_ne!(weight_fingerprint(&a), weight_fingerprint(&b));
+    }
+
+    #[test]
+    fn decode_is_weighted_more_than_prefill_when_picking_backend() {
+        // Measured on a 12th-gen Windows host (ms): scalar wins GEMV by ~4x,
+        // BLAS wins prefill by ~2.3x. Decode must win this trade-off.
+        assert_eq!(
+            pick_by_score(0.53e-3, 2.17e-3, 8.76e-3, 3.86e-3),
+            Backend::Scalar
+        );
+        // If one backend wins both shapes there is no trade-off.
+        assert_eq!(
+            pick_by_score(1.0e-3, 3.0e-3, 2.0e-3, 5.0e-3),
+            Backend::Scalar
+        );
+        assert_eq!(pick_by_score(3.0e-3, 1.0e-3, 9.0e-3, 2.0e-3), Backend::Blas);
     }
 
     #[test]

@@ -23,7 +23,7 @@ This document is a complete orienteering guide for AI agents (or humans) continu
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build                      # debug
 cargo build --release            # optimized binary at target/release/exllama-server
-cargo test                       # 108 unit tests (11 ignored: real-model / /tmp fixtures + benchmarks)
+cargo test                       # 110 unit tests (11 ignored: real-model / /tmp fixtures + benchmarks)
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings   # must pass (CI enforces)
 ```
@@ -163,8 +163,8 @@ See §5 for the full format. Key items:
 - `read_safetensors()`, `load_all_shards()` — safetensors header parsing, sharding via index JSON or glob. Header arithmetic is checked and malformed metadata (dtype/shape/data_offsets) is rejected; `validate_tile_width()` bounds trellis widths before unpacking. `Shards::compact_to()` drops trellis byte ranges after the linear pass.
 - `dequant_linear()` — reference full dequant pipeline for one quantized linear: unpack tiles → H_k → ×suh → H_n → ×svh → transpose to `(n, k)` → `Matrix`. **Used only by tests** as ground truth.
 - `QuantLinear` — a quantized linear (trellis + suh/svh) with three storage modes set by `--weight-mode`:
-  - `packed`: `matmul(x)` decodes one 16×16 tile at a time into a small scratch (1× on-disk RAM but ~10+ s/token — too slow for interactive use on CPU). O(1) `window()` (64-bit funnel shift), `DECODE_*` LUTs (65536 f32 entries per codebook, avoids log2/powi per codeword), `TILE_PERM` table, and stack buffers keep it from being worse.
-  - `f16`: `build_decode_cache()` decodes W_hat once into fp16 (2 bytes/weight, lossless) stored as `(n,k)`; `matmul` uses `half_f32` LUT for a fast dot.
+  - `packed`: `matmul(x)` decodes one 16×16 tile at a time into a small scratch (1× on-disk RAM; ~1.7 tok/s / 0.6 s per token on a 12th-gen x86 host — not interactive). O(1) `window()` (64-bit funnel shift), `DECODE_*` LUTs (65536 f32 entries per codebook, avoids log2/powi per codeword), `TILE_PERM` table, and stack buffers keep it from being worse.
+  - `f16`: `build_decode_cache()` decodes W_hat once into fp16 (2 bytes/weight, lossless) stored as `(n,k)`; `matmul` uses `half_f32` LUT for a fast dot. Its cache build now uses the `decode_bits` LUT too (bit-identical to `decode()`), so it is no longer ~10x slower to load than the f32 path.
   - `f32` (default): `build_decode_cache_f32()` decodes W_hat once into f32 `(n,k)`; `matmul` is a direct f32 dot. ~0.02 s for a 1024×6144 layer.
   - All modes use the derivation `y[j] = svh[j] * (H_n @ (W_hat^T @ (H_k @ (x ⊙ suh))))[j]` and split output rows across the persistent worker pool (`SharedPtr` newtype / `SendSlice`, ≥65536-element threshold). Verified equivalent to full dequant by the fresh-clone-safe `synthetic_tests::matmul_matches_dequant_*` tests (3INST, MCG, MUL1 integer + half-bitrate). The real-model `quantized_matmul_matches_f32_dequant` is `#[ignore]`d because it needs `/tmp/unstable_*.bin`.
   - `linear()` in model.rs prefers a plain `Matrix`, then `QuantLinear`, then (for tied `lm_head`) the fp16 embedding table via `matmul_f16`, skipping the largest decode and avoiding an f32 copy.
@@ -346,21 +346,31 @@ EXLLAMA_BENCH_MODEL=/path/to/model cargo test --release \
   bench_generation_throughput -- --ignored --nocapture
 # optional: EXLLAMA_BENCH_THREADS=N (default: all CPUs)
 #           EXLLAMA_BENCH_WEIGHT_MODE=f16|f32|packed (default: f32)
+#           EXLLAMA_BENCH_COMPUTE=auto|scalar|blas (default: auto)
 ```
 The opt-in benchmarks initialize the global threadpool and compute backend
 **exactly like `main()` does** — do not remove those calls. Without them,
 `threadpool::run()` executes jobs sequentially and `compute::backend()` falls
 back to single-threaded sgemm, so the reported tok/s is a single-core number
 that ignores `--threads`. The report splits prefill and decode time; use the
-`decode tok/s` figure, not completion-tokens-over-total-time. Load time and RSS
-are dominated by the f32 decode cache (8x on-disk at 4 bpw); `--weight-mode f16`
-roughly halves both at near-f32 speed.
+`decode tok/s` figure, not completion-tokens-over-total-time. Load time is
+dominated by decode-cache construction; the f32 cache build is LUT-backed and
+fast, and f16 now uses a matching `decode_bits` LUT. Measured on a 12th-gen x86
+host (10 threads, 4 bpw 0.8B, 159 linears): f32 loads in ~10.6 s and decodes at
+~11.9 tok/s; f16 ~10.3 s / ~8.6 tok/s *after* the `decode_bits` LUT fix (54.6 s
+before it); packed ~6.8 s / ~1.6 tok/s. So f32 is the fastest decode mode on
+modern CPUs — do not assume f16 is "near-f32". Note the auto backend picker weights the
+GEMV probe 4x over prefill (`compute::pick_by_score`): decode repeats per token
+and prefill runs once, so a large GEMV win must not be masked by a modest
+prefill win. With f16/packed weights the choice barely affects decode (those
+paths use hand-written threaded kernels, not `compute::matmul_t`), but with f32
+it matters — use `EXLLAMA_BENCH_COMPUTE` to A/B it on a given host.
 
 ---
 
 ## 8. Known Limitations & Gotchas
 
-- **Memory vs speed:** `--weight-mode` trades RAM for tokens/s. `f32` (default): quantized linears decoded to f32 at load (~4× on-disk, fast). `f16`: ~2× on-disk, near-f32 speed. `packed`: ~1× on-disk but ~10+ s/token on CPU — unusable interactively. On CPU, SIMD on `dot()` would not help the packed path; its bottleneck is codebook decode, not the MACs. Tied-embedding models skip the lm_head decode (plain embedding matrix used directly). Peak RAM during load includes raw shard bytes plus decoded caches (in `f32` mode, several times on-disk); the old "≈ 2× on-disk" claim was inaccurate. Plain 2-D tensors are decoded once (previously stored in both `vectors` and `weights`), trellis byte ranges are compacted away after the linear pass, and untied embedding tables are stored as fp16 with per-row decode. Tied models no longer keep a ~1 GB f32 embedding: all plain embeddings are fp16 and tied `lm_head` uses the threaded `matmul_f16`. The full-attention KV cache is fp16 (2 bytes/value, LUT-decoded per step), halving context RAM. The packed decode hot path now uses `unpack_tile_f32()` (direct codebook f32 LUT) instead of per-codeword arithmetic + fp16 conversion; true SIMD gather remains unavailable on stable std-only Rust (no portable `simd` API), but the arithmetic bottleneck is gone.
+- **Memory vs speed:** `--weight-mode` trades RAM for tokens/s, but the ranking is host-dependent. Measured on a 12th-gen x86 host (10 threads, 4 bpw 0.8B): `f32` (default) loads in ~10.6 s and decodes at **~11.9 tok/s** — the fastest decode mode there; `f16` (~2× on-disk) loads in ~10.3 s after the `decode_bits` LUT fix (54.6 s before it — its cache build used per-codeword arithmetic while f32 used a LUT) and decodes at ~8.6 tok/s; `packed` (~1× on-disk) loads in ~6.8 s but decodes at ~1.6 tok/s — not interactive. On CPU, SIMD on `dot()` would not help the packed path; its bottleneck is codebook decode, not the MACs. Tied-embedding models skip the lm_head decode (plain embedding matrix used directly). Peak RAM during load includes raw shard bytes plus decoded caches (in `f32` mode, several times on-disk); the old "≈ 2× on-disk" claim was inaccurate. Plain 2-D tensors are decoded once (previously stored in both `vectors` and `weights`), trellis byte ranges are compacted away after the linear pass, and untied embedding tables are stored as fp16 with per-row decode. Tied models no longer keep a ~1 GB f32 embedding: all plain embeddings are fp16 and tied `lm_head` uses the threaded `matmul_f16`. The full-attention KV cache is fp16 (2 bytes/value, LUT-decoded per step), halving context RAM. The packed decode hot path now uses `unpack_tile_f32()` (direct codebook f32 LUT) instead of per-codeword arithmetic + fp16 conversion; true SIMD gather remains unavailable on stable std-only Rust (no portable `simd` API), but the arithmetic bottleneck is gone.
 - **No GPU:** CPU only; large models are slow.
 - **Concurrency:** `n > 1` choices share one prefill via `PrefillState` (see §3). Independent requests can run in parallel with `--instances N` (default 1): N model instances share one Arc model core (weights/config) and only duplicate KV/recurrent state, so memory scales with instances' state rather than full weights. Bounded admission returns 429 past 16 queued requests. Matmuls are **not** batched across requests (that needs batch-aware attention/DeltaNet), and `threadpool::RUN_LOCK` still serializes matmul dispatch globally — instances overlap non-matmul work (tokenize, sampling, I/O, state handling) rather than two GEMVs at once.
 - **API fidelity limits:** `response_format: json_object` only adds a prompt hint — there is no grammar/constrained decoding or JSON validation. Streaming tool calls now produce indexed `tool_calls` deltas (name + argument fragments) with the XML withheld from content, but tool-call arguments are still assembled with the simple `<parameter=...>` parser, not full JSON streaming. Chat `top_logprobs` is capped at 20 (completions accept up to 20 as an extension; OpenAI allows 5). Logprobs exclude reasoning delimiters and stop tokens, so their count matches `completion_tokens`, not every token sampled internally; `<think>`/`</think>` also consume a forward step but are not counted in `completion_tokens`.
@@ -407,7 +417,7 @@ roughly halves both at near-f32 speed.
 | `tests::cli_parses_instance_count` | `--instances` parsing and bounds |
 | `fuzz::tests` | Seeded random inputs against JSON/HTTP/regex/chat/tokenizer/API parsers (no panics) |
 
-Run `cargo test` — 108 pass, 11 ignored on the current state. The ignored set
+Run `cargo test` — 110 pass, 11 ignored on the current state. The ignored set
 is 6 real-model / `/tmp`-fixture tests (now explicitly marked with reasons) plus
 5 benchmarks (including `bench_n_choices_prefill_reuse`). On a fresh clone the dequantization/matmul guarantee is still
 verified by the committed synthetic fixtures.

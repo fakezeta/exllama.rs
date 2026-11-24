@@ -61,8 +61,8 @@ checked off with a short note; open items are unchecked.
   grouping/scale/gate and the DeltaNet recurrence (with decay). `model.rs`
   now has 7 unit tests.
 - [x] **(P1) Fix doc drift.** Done — `AGENTS.md` counts/line numbers, `TODO.md`
-  stale "next steps", and this plan's baseline are updated to 108 passed /
-  11 ignored (88 after Phase 0, 99 after Phase 1, 102 after Phase 2, 108 after
+  stale "next steps", and this plan's baseline are updated to 110 passed /
+  11 ignored (88 after Phase 0, 99 after Phase 1, 102 after Phase 2, 110 after
   the benchmark fixes).
 - [x] **(P1) Bounded request-line reading.** Done — see plan Phase 1 #4:
   `read_request()` reads the request line and headers through
@@ -89,8 +89,9 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 
 - [x] **(P0) Compute directly with the quantized weights.** Done — `QuantLinear`
   applies H_k/H_n to the input/output vectors (not the weight matrix), with
-  `--weight-mode` choosing storage: `f32` (default, ~4× disk, fast), `f16`
-  (~2×, near-f32 speed), `packed` (~1× but ~10+ s/token — too slow on CPU).
+  `--weight-mode` choosing storage: `f32` (default, ~4× disk, fastest on a
+  12th-gen x86 host), `f16` (~2× disk, ~9 tok/s there), `packed` (~1× disk but
+  ~1.7 tok/s — not interactive). Ranking is host-dependent; see `AGENTS.md` §8.
   All paths verified equivalent by `quantized_matmul_matches_f32_dequant`.
   Tied-embedding models skip the lm_head decode (plain embedding used directly).
   All three modes validated on the real 0.8B EXL3 model: `f32` and `f16` gave
@@ -105,6 +106,14 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
   removing per-codeword arithmetic and the fp16 conversion (bit-identical to
   the reference path, asserted by a test). True SIMD gather has no portable
   stable API; `f16` remains the recommended low-RAM mode.
+- [x] **(P2) Speed up the `f16` cache build.** Done — `build_decode_cache()` used
+  the old per-codeword `decode()` arithmetic while the f32 path used a LUT,
+  making f16 load ~10x slower (54.6 s vs 10.8 s for 159 linears). It now uses a
+  `decode_bits` fp16-pattern LUT (bit-identical, asserted by a test); f16 load
+  dropped to ~3.9 s for the linears, on par with f32. Real-model A/B on a
+  12th-gen host: f32 ~11.9 tok/s, f16 ~8.6, packed ~1.6 — f32 is the
+  fastest mode there, so the old "f16 is near-f32 speed" claim is corrected in
+  `AGENTS.md` §8 and `README.md`.
 - [x] **(P1) Free shard bytes before allocating weights.** Done — quantized
   linears copy only their trellis; after the linear pass, `Shards::compact_to`
   drops all non-plain tensor byte ranges before plain tensors are decoded.
@@ -195,7 +204,7 @@ These were real bugs found by running the 0.8B EXL3 model, all fixed:
 - [ ] **(P2) Structured logging** with configurable verbosity (`RUST_LOG`-like env var). A temporary `EXLLAMA_DEBUG` logit dump exists but is ad-hoc.
 - [ ] **(P2) Docker image / Dockerfile** for easy deployment.
 - [x] **(P2) Example/test scripts.** Done — `tests/` contains smoke and diagnostic scripts with `tests/README.md`.
-- [x] **(P3) Benchmark suite (baseline).** Ignored tests `bench_generation_throughput` (requires `EXLLAMA_BENCH_MODEL`), `bench_blas_vs_scalar`, `bench_quant_matmul` and `profile_packed_decode_vs_dot` cover end-to-end, CPU and quantized paths. `bench_generation_throughput` and `bench_n_choices_prefill_reuse` now initialize the threadpool/compute backend like the server, take `EXLLAMA_BENCH_THREADS` / `EXLLAMA_BENCH_WEIGHT_MODE`, and report prefill vs decode time separately (the old "decode tok/s" divided by total time).
+- [x] **(P3) Benchmark suite (baseline).** Ignored tests `bench_generation_throughput` (requires `EXLLAMA_BENCH_MODEL`), `bench_blas_vs_scalar`, `bench_quant_matmul` and `profile_packed_decode_vs_dot` cover end-to-end, CPU and quantized paths. `bench_generation_throughput` and `bench_n_choices_prefill_reuse` now initialize the threadpool/compute backend like the server, take `EXLLAMA_BENCH_THREADS` / `EXLLAMA_BENCH_WEIGHT_MODE` / `EXLLAMA_BENCH_COMPUTE`, and report prefill vs decode time separately (the old "decode tok/s" divided by total time). The auto backend picker now weights the GEMV probe 4x over prefill so a large decode win is not masked (`compute::pick_by_score`, with a regression test).
 
 ---
 

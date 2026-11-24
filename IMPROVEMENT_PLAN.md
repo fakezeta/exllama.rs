@@ -16,7 +16,7 @@ criteria.
 - At review: `cargo test` **84 passed, 4 ignored**. After Phase 0:
   **88 passed, 10 ignored**. After Phase 1: **99 passed, 10 ignored**. After
   Phase 2: **102 passed, 11 ignored**; after the deferred Phase 2 work:
-  **108 passed, 11 ignored** (6 real-model / `/tmp` fixtures explicitly ignored
+  **110 passed, 11 ignored** (6 real-model / `/tmp` fixtures explicitly ignored
   with reasons, 5 benchmarks). `cargo fmt --all -- --check` and
   `cargo clippy --all-targets -- -D warnings` remain clean; the GPU feature
   also compiles and its cache-key test passes.
@@ -254,7 +254,16 @@ user explicitly approves.
 **Post-review benchmark fixes (not a new phase):** the opt-in benchmarks now
 initialize the threadpool and compute backend exactly like the server (before,
 matmuls ran single-threaded and the thread count was ignored), accept
-`EXLLAMA_BENCH_THREADS` / `EXLLAMA_BENCH_WEIGHT_MODE`, and report prefill and
-decode rates separately via new `GenResult` timing fields — the old
-"decode tok/s" was completion tokens divided by total request time (including
-the prompt pass). Verified: 108 passed / 11 ignored, fmt and clippy clean.
+`EXLLAMA_BENCH_THREADS` / `EXLLAMA_BENCH_WEIGHT_MODE` /
+`EXLLAMA_BENCH_COMPUTE`, and report prefill and decode rates separately via new
+`GenResult` timing fields — the old "decode tok/s" was completion tokens divided
+by total request time (including the prompt pass). The auto backend picker's
+GEMV-vs-prefill score now weights decode 4x (extracted as `pick_by_score` with a
+regression test), since decode repeats per token and a 4x GEMV win must not be
+masked by a 2x prefill win. The f16 decode-cache build now uses a `decode_bits`
+LUT instead of per-codeword arithmetic (it was ~10x slower than the f32 cache
+build), with a bit-identity test; the rerun confirmed f16 load dropped from
+54.6 s to 3.9 s for 159 linears. Real-model A/B on a 12th-gen host showed f32
+fastest (~11.9 / 8.6 / 1.6 tok/s for f32 / f16 / packed) — documented in
+`AGENTS.md` §8 and `README.md`. Verified: 110 passed / 11 ignored, fmt and
+clippy clean.
