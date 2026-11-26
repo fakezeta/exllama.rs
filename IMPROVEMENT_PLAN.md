@@ -358,8 +358,11 @@ guards with named diagnostics. Regression tests:
 `linear_prefers_quantized_lm_head_over_tied_embedding`. Verification:
 115 passed / 11 ignored, 126 with `--features gpu`; fmt and clippy clean.
 
-### REMINDER — future work: fully on-device sampling
-Sampling still runs on the host after the single logits copy. Implement
-temperature / top-k / top-p / greedy sampling with candle ops so only the
-sampled token id crosses back, eliminating the last per-token device→host
-transfer. Tracked in `TODO.md` as a P1 item.
+### Resolved — fully on-device sampling
+`GpuRunner::sample()` now applies penalties and temperature/top-k/top-p on
+device; only a token id, its logprob and optional top pairs cross back (plus
+one f32 RNG uniform per step). The inverse-CDF walk is on the host because
+candle 0.11's `Tensor::cumsum` materializes a `(vocab, vocab)` triangular
+matrix. `device_forward_matches_cpu_forward_on_same_weights` now compares the
+whole CPU and device forwards on identical tiny weights, closing the gap where
+earlier tests only compared GPU ops to other GPU ops.

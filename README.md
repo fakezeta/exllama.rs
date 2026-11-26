@@ -16,7 +16,7 @@ The JSON parser, HTTP server, tokenizer, regex engine, PRNG and EXL3 dequantizer
 
 ## Requirements
 
-- Rust 1.70+ (edition 2021). No external toolchain or Python runtime needed. Default build uses only pure-Rust crates (no system BLAS/GPU SDK). CI builds and tests on Linux (x86_64 + ARM64), macOS ARM64 and Windows x86_64 on every push/PR.
+- Rust 1.87+ (edition 2021; `rust-version` is declared in `Cargo.toml`). No external toolchain or Python runtime needed. Default build uses only pure-Rust crates (no system BLAS/GPU SDK). CI builds and tests on Linux (x86_64 + ARM64), macOS ARM64 and Windows x86_64 on every push/PR.
 - An EXL3-quantized Qwen3.5 model directory containing:
   - `config.json`
   - `model.safetensors` or sharded `model-*.safetensors` (+ `model.safetensors.index.json`)
@@ -64,12 +64,15 @@ prefill batches and GPU-backed runs benefit most from the BLAS/GPU paths.
 With `--compute gpu` (or `auto` on a GPU build), `Model::load` uploads every
 weight to the device **once** and runs the entire forward there — embeddings,
 all linears (including the EXL3 Hadamard/dequant math), KV cache and DeltaNet
-state. There is no per-layer host/device traffic: only the input token ids and
-the final logits cross the bus. `--weight-mode` is ignored in this mode (weights
-are fp16 on device); the host keeps only the small packed trellis as a fallback
-source. Sampling still happens on the host after the logits copy — moving it
-fully on device is tracked as future work. Outputs can differ slightly from
-the CPU path because the device GEMMs use fp16 activations.
+state. There is no per-layer host/device traffic: only the input token ids go
+to the device, and each decode step returns a token id, its logprob and any
+requested top-logprob pairs. Repetition/presence/frequency penalties and
+greedy/temperature/top-k/top-p sampling also run on device (one f32 RNG uniform
+per step is uploaded); the inverse-CDF draw runs on the host to avoid candle
+0.11's vocabulary-sized `cumsum` allocation. `--weight-mode` is ignored in this
+mode (weights are fp16 on device). Outputs can differ slightly from the CPU
+path because the device GEMMs use fp16 activations; a synthetic parity test
+compares both forwards on identical tiny weights.
 
 ## Usage
 
@@ -221,7 +224,7 @@ Supported request parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `m
 ## How it works
 
 1. **Model loading** — EXL3 files are standard safetensors. Each quantized linear stores a packed tail-biting trellis plus input/output sign vectors (`suh`/`svh`). Depending on `--weight-mode`, W_hat is decoded once at load into an f32/f16 cache (default f32) or kept packed.
-2. **Quantized matmul** — the normalized Sylvester-Hadamard transforms are applied to the *input* and *output* vectors (not the weight matrix), so a linear needs only its W_hat in the rotated basis. `--weight-mode` decides how W_hat is stored: decoded to f32/f16 at load (fast) or kept packed and decoded per matmul (slow, minimum RAM). All three paths are verified equivalent to full reconstruction by `quantized_matmul_matches_f32_dequant`. A few O(1) optimizations (codebook LUTs, precomputed tile permutation, stack buffers) keep the packed path from being unusable.
+2. **Quantized matmul** — the normalized Sylvester-Hadamard transforms are applied to the *input* and *output* vectors (not the weight matrix), so a linear needs only its W_hat in the rotated basis. `--weight-mode` decides how W_hat is stored: decoded to f32/f16 at load (fast) or kept packed and decoded per matmul (slow, minimum RAM). All three paths are verified equivalent to full reconstruction by the committed in-memory fixtures in `exl3::synthetic_tests`. A few O(1) optimizations (codebook LUTs, precomputed tile permutation, stack buffers) keep the packed path from being unusable.
 3. **Tokenizer** — byte-level BPE with the Qwen3.5 pre-tokenizer regex, added-token protection (so `<|im_start|>` and `<think>` remain single tokens), and byte fallback.
 4. **Inference** — one OS thread per HTTP connection; bounded admission returns 429 past 16 queued requests. `--instances N` runs N decoding instances that share the loaded weights (an Arc core) but keep independent KV/recurrent state, so concurrent requests need not serialize. Prefill runs once per request and its state is reused across `n` choices. Prefill processes the prompt one token at a time (logged in 32-token groups); decoding emits one token at a time with an fp16 KV cache (full attention, halved context RAM) and recurrent state (linear attention). Matmul work is split across a persistent pool of worker threads (sized by `--threads`) instead of spawning threads per call. The server prints progress to stderr: `[load]` during model load, `[prompt] X/N tokens (tok/s)` per prefill batch, and `[decode] N tokens generated (tok/s)` every 16 tokens, with a final `[done]` summary.
 
@@ -231,7 +234,7 @@ Supported request parameters: `temperature`, `top_p`, `top_k`, `max_tokens` / `m
 cargo test
 ```
 
-Tests cover JSON parsing, regex/pre-tokenizer behavior, chat-template rendering (including committed golden prompts in `tests/golden/`), tool-call parsing, EXL3 codebook/tile-layout correctness against the reference implementation, sampling, logprobs, `n`-choice handling, parameter validation, end-to-end HTTP/SSE behavior against a tiny synthetic model, and deterministic dependency-free fuzz smoke tests for the JSON/HTTP/regex/tokenizer/API parsers (`src/fuzz.rs`). Two suites need no model download and always run: `exl3::synthetic_tests` verifies all three `--weight-mode` paths against full dequantization for every EXL3 codebook using an in-memory fixture, and `model::tests` holds hand-computed golden tests for the decoder math (RMSNorm, RoPE, q_proj interleaving, GQA, DeltaNet). Tests that need `/tmp` reference files (real tokenizer / real EXL3 layer) are explicitly `#[ignore]`d with reasons — run them with `cargo test -- --ignored` when those files exist. Current totals: 115 passed, 11 ignored (126 with `--features gpu`, which adds device-op tests plus a full end-to-end forward on candle's CPU device). For throughput benchmarking with a real model, see `bench_generation_throughput` and `bench_n_choices_prefill_reuse` in `src/server.rs`; both initialize the threadpool and compute backend exactly like the server and honor `EXLLAMA_BENCH_MODEL`, `EXLLAMA_BENCH_THREADS` (default: all CPUs), `EXLLAMA_BENCH_WEIGHT_MODE` (`f32`/`f16`/`packed`; ignored on GPU) and `EXLLAMA_BENCH_COMPUTE` (`auto`/`scalar`/`blas`/`gpu`, for A/B comparisons). The throughput report splits prefill and decode time, so `decode tok/s` is not diluted by the prompt pass.
+Tests cover JSON parsing, regex/pre-tokenizer behavior, chat-template rendering (including committed golden prompts in `tests/golden/`), tool-call parsing, EXL3 codebook/tile-layout correctness against the reference implementation, sampling, logprobs, `n`-choice handling, parameter validation, end-to-end HTTP/SSE behavior against a tiny synthetic model, and deterministic dependency-free fuzz smoke tests for the JSON/HTTP/regex/tokenizer/API parsers (`src/fuzz.rs`). Two suites need no model download and always run: `exl3::synthetic_tests` verifies all three `--weight-mode` paths against full dequantization for every EXL3 codebook using an in-memory fixture, and `model::tests` holds hand-computed golden tests for the decoder math (RMSNorm, RoPE, q_proj interleaving, GQA, DeltaNet). Tests that need `/tmp` reference files (real tokenizer / real EXL3 layer) are explicitly `#[ignore]`d with reasons — run them with `cargo test -- --ignored` when those files exist. Current totals: 127 passed, 11 ignored (139 with `--features gpu`, which adds device-op tests plus full end-to-end and CPU↔GPU parity forwards on candle's CPU device). For throughput benchmarking with a real model, see `bench_generation_throughput` and `bench_n_choices_prefill_reuse` in `src/server.rs`; both initialize the threadpool and compute backend exactly like the server and honor `EXLLAMA_BENCH_MODEL`, `EXLLAMA_BENCH_THREADS` (default: all CPUs), `EXLLAMA_BENCH_WEIGHT_MODE` (`f32`/`f16`/`packed`; ignored on GPU) and `EXLLAMA_BENCH_COMPUTE` (`auto`/`scalar`/`blas`/`gpu`, for A/B comparisons). The throughput report splits prefill and decode time, so `decode tok/s` is not diluted by the prompt pass.
 
 For manual end-to-end checks against a **running server**, see [`tests/README.md`](tests/README.md). It contains smoke-test and diagnostic shell scripts (`test_api.sh`, `test_diag.sh`, `test_sample.sh`, `test_prompts.sh`) that exercise the OpenAI-compatible endpoints with curl.
 

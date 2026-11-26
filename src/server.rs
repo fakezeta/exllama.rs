@@ -7,7 +7,7 @@ use crate::http::{respond, Request, Streamer};
 use crate::model::Model;
 use crate::tokenizer::Tokenizer;
 use crate::{json::Json, rng::Rng};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::TcpStream;
 use std::ops::{Deref, DerefMut};
@@ -166,14 +166,21 @@ struct OutputRouter {
     max_stop_len: usize,
     /// Bytes of an incomplete UTF-8 character at the token boundary.
     bytes: Vec<u8>,
-    /// Complete answer characters withheld for stop-string detection.
+    /// Complete characters withheld for stop-string detection, and the stream
+    /// they belong to (a delimiter can switch streams while text is held).
     held: String,
+    held_reasoning: bool,
     content: String,
     reasoning: String,
 }
 
 impl OutputRouter {
     fn new(split_reasoning: bool, start_in_reasoning: bool, stops: Vec<String>) -> Self {
+        // Longest first: `stop: ["OP", "STOP"]` must strip the whole "STOP",
+        // not leave "ST" because the shorter suffix happened to be listed
+        // first. Tie order does not matter.
+        let mut stops: Vec<String> = stops.into_iter().filter(|s| !s.is_empty()).collect();
+        stops.sort_by_key(|s| std::cmp::Reverse(s.len()));
         let max_stop_len = stops.iter().map(|s| s.len()).max().unwrap_or(0);
         OutputRouter {
             split_reasoning,
@@ -182,6 +189,7 @@ impl OutputRouter {
             max_stop_len,
             bytes: Vec::new(),
             held: String::new(),
+            held_reasoning: false,
             content: String::new(),
             reasoning: String::new(),
         }
@@ -216,7 +224,8 @@ impl OutputRouter {
         }
         if !self.held.is_empty() {
             let rest = std::mem::take(&mut self.held);
-            if !emit(&rest, false) {
+            let held_reasoning = self.held_reasoning;
+            if !emit(&rest, held_reasoning) {
                 stopped = true;
             }
         }
@@ -246,33 +255,37 @@ impl OutputRouter {
     }
 
     /// Append a complete chunk to the active stream and stream it, withholding
-    /// a short tail from the answer stream for stop-string detection.
+    /// a short tail for stop-string detection. Stops apply to reasoning text
+    /// too: `<think>` output is still generated text, and a user-supplied stop
+    /// must terminate it rather than being streamed verbatim.
     fn emit_chunk(
         &mut self,
         chunk: &str,
         in_reasoning: bool,
         emit: &mut dyn FnMut(&str, bool) -> bool,
     ) -> bool {
-        if in_reasoning {
-            // `flush_utf8` already appended the chunk to `reasoning`.
-            return !emit(chunk, true);
-        }
-
         self.held.push_str(chunk);
+        self.held_reasoning = in_reasoning;
 
-        // Stop strings are matched against the full answer text, in order,
-        // exactly as before. The withheld tail is guaranteed to contain the
-        // suffix because it is at least as long as the longest stop string.
-        let before = self.content.len();
-        let mut matched = false;
-        for s in &self.stops {
-            if !s.is_empty() && self.content.ends_with(s.as_str()) {
-                self.content.truncate(self.content.len() - s.len());
-                matched = true;
+        // `flush_utf8` already appended `chunk` to the active stream, so it is
+        // the suffix we need to test. Stops are sorted longest-first.
+        let removed = {
+            let target = if in_reasoning {
+                &mut self.reasoning
+            } else {
+                &mut self.content
+            };
+            let before = target.len();
+            for s in &self.stops {
+                if target.ends_with(s.as_str()) {
+                    let stop_len = s.len();
+                    target.truncate(target.len() - stop_len);
+                    break;
+                }
             }
-        }
-        if matched {
-            let removed = before - self.content.len();
+            before - target.len()
+        };
+        if removed > 0 {
             if self.held.len() >= removed {
                 self.held.truncate(self.held.len() - removed);
             } else {
@@ -280,7 +293,7 @@ impl OutputRouter {
             }
             let rest = std::mem::take(&mut self.held);
             if !rest.is_empty() {
-                let _ = emit(&rest, false);
+                let _ = emit(&rest, in_reasoning);
             }
             return true;
         }
@@ -295,7 +308,7 @@ impl OutputRouter {
         if cut > 0 {
             let out = self.held[..cut].to_string();
             self.held = self.held[cut..].to_string();
-            if !emit(&out, false) {
+            if !emit(&out, in_reasoning) {
                 return true;
             }
         }
@@ -317,7 +330,8 @@ impl OutputRouter {
         }
         if !self.held.is_empty() {
             let rest = std::mem::take(&mut self.held);
-            let _ = emit(&rest, false);
+            let held_reasoning = self.held_reasoning;
+            let _ = emit(&rest, held_reasoning);
         }
     }
 }
@@ -333,11 +347,24 @@ struct Admission {
 
 impl Admission {
     fn try_acquire(&self) -> bool {
-        self.active
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < MAX_QUEUED_REQUESTS).then_some(n + 1)
-            })
-            .is_ok()
+        // `AtomicUsize::try_update` is still unstable on the minimum supported
+        // Rust version, so use a plain CAS loop. The counter only ever moves
+        // between 0 and MAX_QUEUED_REQUESTS, so it cannot overflow here.
+        let mut cur = self.active.load(Ordering::Acquire);
+        loop {
+            if cur >= MAX_QUEUED_REQUESTS {
+                return false;
+            }
+            match self.active.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     fn release(&self) {
@@ -486,7 +513,11 @@ impl Engine {
 
     /// Run the prompt forward pass once and capture the state needed to
     /// decode any number of choices from that same prefix.
-    pub fn prepare_prefill(&self, prompt_ids: &[u32]) -> Result<PrefillState, String> {
+    pub fn prepare_prefill(
+        &self,
+        prompt_ids: &[u32],
+        deadline: Option<Instant>,
+    ) -> Result<PrefillState, String> {
         if prompt_ids.is_empty() {
             return Err("empty prompt: no tokens to generate from".into());
         }
@@ -498,6 +529,11 @@ impl Engine {
         let device = model.device_sampling_available();
         let mut processed = 0usize;
         for chunk in prompt_ids.chunks(PROMPT_BATCH) {
+            // The decode-loop deadline starts at the request, not after the
+            // prompt pass: a huge prompt must not hold the model indefinitely.
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err("deadline exceeded during prefill".into());
+            }
             // On the device path the logits stay on device for sampling; the
             // post-prefill GpuSnapshot carries them into each `n` choice.
             if device {
@@ -568,6 +604,12 @@ impl Engine {
         } else {
             params.max_tokens
         };
+        // One deadline for the whole request. It must be created *before*
+        // prefill: for `n == 1` the prompt pass runs inline below, and a slow
+        // prompt must not hold the model mutex indefinitely.
+        let deadline = params
+            .deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(MAX_GENERATION_SECONDS));
 
         let mut model = self.acquire_model();
         let device_sampling = model.device_sampling_available();
@@ -592,6 +634,9 @@ impl Engine {
                 let mut logits = Vec::new();
                 let mut processed = 0usize;
                 for chunk in prompt_ids.chunks(PROMPT_BATCH) {
+                    if Instant::now() >= deadline {
+                        return Err("deadline exceeded during prefill".into());
+                    }
                     if device_sampling {
                         model.forward_device(chunk)?;
                     } else {
@@ -661,9 +706,6 @@ impl Engine {
         let debug = std::env::var("EXLLAMA_DEBUG").is_ok();
         const DECODE_BATCH: usize = 16;
         let decode_start = std::time::Instant::now();
-        let deadline = params
-            .deadline
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(MAX_GENERATION_SECONDS));
         for (step, _) in (0..max_tokens).enumerate() {
             if Instant::now() >= deadline {
                 finish = "length".into();
@@ -872,7 +914,7 @@ impl Engine {
     ) -> Result<PrefillState, String> {
         let prompt = self.render_chat_prompt(messages, params);
         let ids = self.tokenizer.encode(&prompt);
-        self.prepare_prefill(&ids)
+        self.prepare_prefill(&ids, params.deadline)
     }
 
     fn render_chat_prompt(&self, messages: &[Message], params: &Params) -> String {
@@ -961,7 +1003,7 @@ impl Engine {
     ) -> Result<PrefillState, String> {
         let prompt = apply_response_format_text(prompt, params.response_format);
         let ids = self.tokenizer.encode(&prompt);
-        self.prepare_prefill(&ids)
+        self.prepare_prefill(&ids, params.deadline)
     }
 
     pub fn run_completion_inner_with_prefill<F, G>(
@@ -1209,15 +1251,28 @@ fn logprob_info(
     };
     let lp = |v: f32| (v as f64 - max - sum.ln()) as f32;
 
-    let mut top: Vec<(usize, f32)> = p.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-    let k = top_n.min(top.len());
-    if k < top.len() {
-        top.select_nth_unstable_by(k, |a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+    // Bounded top-k: collecting and sorting the whole vocabulary allocated a
+    // ~4 MB Vec per token with logprobs enabled. Keep only `top_n` entries,
+    // in descending score order, while scanning once.
+    let k = top_n.min(p.len());
+    let mut top: Vec<(usize, f32)> = Vec::with_capacity(k);
+    for (i, &v) in p.iter().enumerate() {
+        if top.len() < k {
+            top.push((i, v));
+            if top.len() == k {
+                top.sort_unstable_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+        } else if k > 0 && v > top[k - 1].1 {
+            top[k - 1] = (i, v);
+            let mut j = k - 1;
+            while j > 0 && top[j].1 > top[j - 1].1 {
+                top.swap(j, j - 1);
+                j -= 1;
+            }
+        }
     }
-    top.truncate(k);
-    top.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let top = top
         .into_iter()
         .map(|(id, v)| Logprob {
@@ -1319,7 +1374,10 @@ fn json_int(body: &Json, key: &str) -> Result<Option<i64>, (u16, String)> {
 fn json_f32(body: &Json, key: &str) -> Result<Option<f32>, (u16, String)> {
     match body.get(key) {
         None | Some(Json::Null) => Ok(None),
-        Some(Json::Num(n)) if n.is_finite() => Ok(Some(*n as f32)),
+        // A finite f64 can still narrow to infinity (e.g. 1e300). Reject that
+        // here: otherwise `temperature: 1e300` silently becomes uniform
+        // sampling, and penalties bypass their own is_finite() re-checks.
+        Some(Json::Num(n)) if n.is_finite() && (*n as f32).is_finite() => Ok(Some(*n as f32)),
         Some(_) => Err(json_error(
             400,
             &format!("{} must be a finite number", key),
@@ -1429,17 +1487,31 @@ fn parse_params_inner(body: &Json, engine: &Engine, chat: bool) -> Result<Params
         p.top_k = v as usize;
     }
     // `max_completion_tokens` wins when both are present (OpenAI behavior).
-    let mut limit = json_int(body, "max_tokens")?;
-    if let Some(v) = json_int(body, "max_completion_tokens")? {
-        limit = Some(v);
-    }
-    if let Some(v) = limit {
-        if !(0..=MAX_TOKENS_LIMIT).contains(&v) {
+    // It is the authoritative limit, so a placeholder `max_tokens` (including
+    // 0) is ignored rather than validated. A bare `max_tokens: 0` is rejected:
+    // it used to silently generate the CLI default (512).
+    let raw_max = json_int(body, "max_tokens")?;
+    let raw_completion = json_int(body, "max_completion_tokens")?;
+    let limit = if let Some(v) = raw_completion {
+        if !(1..=MAX_TOKENS_LIMIT).contains(&v) {
             return Err(bad(&format!(
-                "max_tokens must be in [0, {}]",
+                "max_completion_tokens must be in [1, {}]",
                 MAX_TOKENS_LIMIT
             )));
         }
+        Some(v)
+    } else if let Some(v) = raw_max {
+        if !(1..=MAX_TOKENS_LIMIT).contains(&v) {
+            return Err(bad(&format!(
+                "max_tokens must be in [1, {}]",
+                MAX_TOKENS_LIMIT
+            )));
+        }
+        Some(v)
+    } else {
+        None
+    };
+    if let Some(v) = limit {
         p.max_tokens = v as usize;
     }
     if let Some(v) = json_int(body, "seed")? {
@@ -1626,9 +1698,10 @@ fn usage_json(r: &GenResult) -> Json {
     usage_from(std::slice::from_ref(r))
 }
 
-/// For `n > 1` OpenAI usage is the total across all choices.
+/// For `n > 1` the prompt is billed once; only completion tokens are summed
+/// across choices (the choices share a single prefill).
 fn usage_from(results: &[GenResult]) -> Json {
-    let prompt: usize = results.iter().map(|r| r.prompt_tokens).sum();
+    let prompt: usize = results.first().map(|r| r.prompt_tokens).unwrap_or(0);
     let completion: usize = results.iter().map(|r| r.completion_tokens).sum();
     Json::Obj(vec![
         ("prompt_tokens".into(), Json::Num(prompt as f64)),
@@ -1696,15 +1769,20 @@ fn completion_logprobs_json(tokens: &[TokenLogprob]) -> Json {
         } else {
             Json::Null
         });
+        // OpenAI's completions shape is an array of {token: logprob} maps,
+        // not an array of bare numbers.
         tops.push(Json::Arr(
             t.top
                 .iter()
                 .map(|x| {
-                    if x.logprob.is_finite() {
-                        Json::Num(x.logprob as f64)
-                    } else {
-                        Json::Null
-                    }
+                    Json::Obj(vec![(
+                        x.token.clone(),
+                        if x.logprob.is_finite() {
+                            Json::Num(x.logprob as f64)
+                        } else {
+                            Json::Null
+                        },
+                    )])
                 })
                 .collect(),
         ));
@@ -1994,6 +2072,60 @@ fn completion_usage_chunk(id: &str, model: &str, usage: Json) -> Json {
     ])
 }
 
+/// Minimal sink used by the SSE handlers. Keeping it behind a trait makes the
+/// "client disappeared" path testable without a real socket: a writer that
+/// returns false must make `alive()` false, which every `on_token` callback
+/// checks so generation stops at the next token instead of holding the model
+/// instance until `max_tokens`.
+trait ChunkWriter {
+    fn write_chunk(&mut self, data: &str) -> bool;
+}
+
+impl ChunkWriter for &mut Streamer {
+    fn write_chunk(&mut self, data: &str) -> bool {
+        Streamer::write_chunk(self, data)
+    }
+}
+
+struct SseOutput<W: ChunkWriter> {
+    writer: RefCell<W>,
+    failed: Cell<bool>,
+}
+
+impl<W: ChunkWriter> SseOutput<W> {
+    fn new(writer: W) -> Self {
+        SseOutput {
+            writer: RefCell::new(writer),
+            failed: Cell::new(false),
+        }
+    }
+
+    fn emit(&self, json: Json) -> bool {
+        self.raw(&format!("data: {}\n\n", json))
+    }
+
+    fn raw(&self, data: &str) -> bool {
+        if self.failed.get() {
+            return false;
+        }
+        let ok = self.writer.borrow_mut().write_chunk(data);
+        if !ok {
+            self.failed.set(true);
+        }
+        ok
+    }
+
+    /// False once any chunk write failed; generation callbacks return this so
+    /// the engine can abort promptly.
+    fn alive(&self) -> bool {
+        !self.failed.get()
+    }
+
+    fn into_inner(self) -> W {
+        self.writer.into_inner()
+    }
+}
+
 pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
     let _admit = match engine.try_admit() {
         Some(g) => g,
@@ -2024,7 +2156,7 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
             return;
         }
     };
-    let params = match parse_params(&body, engine) {
+    let mut params = match parse_params(&body, engine) {
         Ok(p) => p,
         Err(e) => {
             let (s, b) = e;
@@ -2032,6 +2164,10 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
             return;
         }
     };
+    // One wall-clock deadline for the whole request: prefill plus every
+    // choice. `generate_inner` reuses this value instead of starting a fresh
+    // 300 s budget for each of `n` choices.
+    params.deadline = Some(Instant::now() + Duration::from_secs(MAX_GENERATION_SECONDS));
     let stream_mode = want_stream(&body);
     let id = gen_id("chatcmpl");
     let model_name = engine.model_name.clone();
@@ -2054,44 +2190,47 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
     if stream_mode {
         let mut sse = Streamer::new(stream, 200, "text/event-stream");
         let mut results: Vec<GenResult> = Vec::with_capacity(params.n);
-        // Both callbacks need to write chunks; a RefCell shares the borrow.
-        let sse_cell = RefCell::new(&mut sse);
-        let emit = |json: Json| {
-            sse_cell
-                .borrow_mut()
-                .write_chunk(&format!("data: {}\n\n", json));
-        };
+        // Interior mutability lets the token and logprob callbacks share the
+        // writer; a failed write is latched so `on_token` can abort generation
+        // instead of holding the model instance for a disconnected client.
+        let out = SseOutput::new(&mut sse);
+        let emit = |json: Json| out.emit(json);
         let mut failed = false;
         for (i, seed) in seeds.iter().enumerate() {
+            // A disconnect during an earlier choice must not make the
+            // remaining choices restore state and burn a forward step.
+            if !out.alive() {
+                break;
+            }
             let mut p = params.clone();
             p.seed = *seed;
             let mut tool_stream = ToolCallStreamer::new();
             // OpenAI sends a separate role chunk for every choice.
-            sse_cell.borrow_mut().write_chunk(&format!(
-                "data: {}\n\n",
-                chat_chunk_json(
-                    &id,
-                    &model_name,
-                    i,
-                    Some("assistant"),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None
-                )
+            let _ = out.emit(chat_chunk_json(
+                &id,
+                &model_name,
+                i,
+                Some("assistant"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
             ));
             let res = engine.run_chat_inner_with_prefill(
                 &messages,
                 &p,
                 prefill.as_ref(),
                 |chunk, is_reasoning| {
+                    if !out.alive() {
+                        return false;
+                    }
                     if chunk.is_empty() {
                         return true;
                     }
                     if is_reasoning {
-                        emit(chat_chunk_json(
+                        return emit(chat_chunk_json(
                             &id,
                             &model_name,
                             i,
@@ -2103,13 +2242,13 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
                             None,
                             None,
                         ));
-                        return true;
                     }
                     // Strip `<tool_call>` XML from the content stream and
                     // report the parsed calls as OpenAI tool-call deltas.
                     let (content, calls) = tool_stream.push(chunk);
+                    let mut ok = true;
                     if !content.is_empty() {
-                        emit(chat_chunk_json(
+                        ok &= emit(chat_chunk_json(
                             &id,
                             &model_name,
                             i,
@@ -2124,7 +2263,7 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
                     }
                     for (tc_index, name, arguments) in calls {
                         let call_id = format!("call_{}", tc_index);
-                        emit(chat_chunk_json(
+                        ok &= emit(chat_chunk_json(
                             &id,
                             &model_name,
                             i,
@@ -2143,7 +2282,7 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
                             while end > 0 && !rest.is_char_boundary(end) {
                                 end -= 1;
                             }
-                            emit(chat_chunk_json(
+                            ok &= emit(chat_chunk_json(
                                 &id,
                                 &model_name,
                                 i,
@@ -2158,24 +2297,21 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
                             rest = &rest[end..];
                         }
                     }
-                    true
+                    ok && out.alive()
                 },
                 |lp| {
                     if p.logprobs {
-                        sse_cell.borrow_mut().write_chunk(&format!(
-                            "data: {}\n\n",
-                            chat_chunk_json(
-                                &id,
-                                &model_name,
-                                i,
-                                None,
-                                None,
-                                None,
-                                None,
-                                Some(chat_logprobs_json(std::slice::from_ref(lp))),
-                                None,
-                                None
-                            )
+                        emit(chat_chunk_json(
+                            &id,
+                            &model_name,
+                            i,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(chat_logprobs_json(std::slice::from_ref(lp))),
+                            None,
+                            None,
                         ));
                     }
                 },
@@ -2220,7 +2356,7 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
                     results.push(r);
                 }
                 Err(e) => {
-                    sse_cell.borrow_mut().write_chunk(&format!(
+                    out.raw(&format!(
                         "data: {}\n\n",
                         json_error(500, &e, "server_error").1
                     ));
@@ -2229,8 +2365,9 @@ pub fn handle_chat(mut stream: TcpStream, req: Request, engine: &Arc<Engine>) {
                 }
             }
         }
-        let sse = sse_cell.into_inner();
-        if failed {
+        let write_failed = !out.alive();
+        let sse = out.into_inner();
+        if failed || write_failed {
             sse.write_chunk("data: [DONE]\n\n");
             sse.end();
             return;
@@ -2327,7 +2464,7 @@ pub fn handle_completions(mut stream: TcpStream, req: Request, engine: &Arc<Engi
         respond(&mut stream, s, "application/json", &b);
         return;
     }
-    let params = match parse_completion_params(&body, engine) {
+    let mut params = match parse_completion_params(&body, engine) {
         Ok(p) => p,
         Err(e) => {
             let (s, b) = e;
@@ -2335,6 +2472,7 @@ pub fn handle_completions(mut stream: TcpStream, req: Request, engine: &Arc<Engi
             return;
         }
     };
+    params.deadline = Some(Instant::now() + Duration::from_secs(MAX_GENERATION_SECONDS));
     let stream_mode = want_stream(&body);
     let id = gen_id("cmpl");
     let model_name = engine.model_name.clone();
@@ -2358,6 +2496,9 @@ pub fn handle_completions(mut stream: TcpStream, req: Request, engine: &Arc<Engi
         let sse_cell = RefCell::new(&mut sse);
         let mut failed = false;
         for (i, seed) in seeds.iter().enumerate() {
+            if sse_cell.borrow().failed() {
+                break;
+            }
             let mut p = params.clone();
             p.seed = *seed;
             let res = engine.run_completion_inner_with_prefill(
@@ -2485,6 +2626,29 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
+
+    /// A sink whose writes always fail, standing in for a disconnected SSE
+    /// client. `SseOutput` must latch the failure so `on_token` can abort.
+    struct BrokenWriter(std::cell::Cell<usize>);
+    impl ChunkWriter for BrokenWriter {
+        fn write_chunk(&mut self, _data: &str) -> bool {
+            self.0.set(self.0.get() + 1);
+            false
+        }
+    }
+
+    #[test]
+    fn sse_write_failure_is_latched_for_generation_callbacks() {
+        let writer = BrokenWriter(std::cell::Cell::new(0));
+        let out = SseOutput::new(writer);
+        assert!(out.alive());
+        assert!(!out.emit(Json::Obj(vec![("x".into(), Json::Num(1.0))])));
+        assert!(!out.alive());
+        assert!(!out.raw("data: [DONE]\n\n"));
+        // Once latched, the writer is never asked again (no pointless work for
+        // a client that is gone).
+        assert_eq!(out.into_inner().0.get(), 1);
+    }
 
     fn tiny_engine() -> Engine {
         Engine::new(
@@ -2638,10 +2802,42 @@ mod tests {
             content: "hi".into(),
             ..Default::default()
         }];
-        let res = engine.run_chat(&messages, &params, |_, _| true).unwrap();
-        assert_eq!(res.completion_tokens, 0);
+        // An expired deadline is now rejected during prefill, before the
+        // first token is sampled (both for n == 1 and the shared-prefill path).
+        let err = engine
+            .run_chat(&messages, &params, |_, _| true)
+            .err()
+            .unwrap();
+        assert!(err.contains("deadline"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn generation_deadline_stops_during_decode() {
+        let engine = tiny_engine();
+        let params = Params {
+            temperature: 0.0,
+            max_tokens: 64,
+            enable_thinking: false,
+            // Enough time for the tiny prefill, not for a slow decode loop.
+            deadline: Some(Instant::now() + Duration::from_millis(100)),
+            ..Default::default()
+        };
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "hi".into(),
+            ..Default::default()
+        }];
+        let res = engine
+            .run_chat(&messages, &params, |_, _| {
+                std::thread::sleep(Duration::from_millis(120));
+                true
+            })
+            .unwrap();
+        assert!(
+            res.completion_tokens < 64,
+            "generation ran past the deadline"
+        );
         assert_eq!(res.finish_reason, "length");
-        assert!(res.logprobs.is_empty());
     }
 
     #[test]
@@ -2729,6 +2925,36 @@ mod tests {
             engine.try_admit().is_some(),
             "slots must be released on drop"
         );
+    }
+
+    #[test]
+    fn prefill_honours_request_deadline() {
+        let engine = tiny_engine();
+        let ids = engine.tokenizer.encode("hello");
+        let err = engine
+            .prepare_prefill(&ids, Some(Instant::now()))
+            .err()
+            .unwrap();
+        assert!(err.contains("deadline"), "unexpected error: {}", err);
+        assert!(engine.prepare_prefill(&ids, None).is_ok());
+
+        // The n == 1 path prefills inline in generate_inner, not through
+        // prepare_prefill: it must honour the same deadline.
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "hello".into(),
+            ..Default::default()
+        }];
+        let params = Params {
+            max_tokens: 4,
+            deadline: Some(Instant::now()),
+            ..Default::default()
+        };
+        let err = engine
+            .run_chat(&messages, &params, |_, _| true)
+            .err()
+            .unwrap();
+        assert!(err.contains("deadline"), "unexpected error: {}", err);
     }
 
     #[test]
@@ -2889,6 +3115,38 @@ mod tests {
     }
 
     #[test]
+    fn router_strips_longest_overlapping_stop_regardless_of_order() {
+        // The shorter suffix is listed first on purpose: matching in user
+        // order used to leave "ST" in the answer.
+        let mut r = OutputRouter::new(false, false, vec!["OP".into(), "STOP".into()]);
+        let mut emitted = String::new();
+        let mut emit = |s: &str, _: bool| {
+            emitted.push_str(s);
+            true
+        };
+        assert!(!r.push(b"answer ", &mut emit));
+        assert!(r.push(b"STOP", &mut emit));
+        assert_eq!(r.content, "answer ");
+        assert_eq!(emitted, "answer ");
+    }
+
+    #[test]
+    fn router_applies_stop_strings_inside_reasoning() {
+        let mut r = OutputRouter::new(true, true, vec!["HALT".into()]);
+        let mut emitted: Vec<(String, bool)> = Vec::new();
+        let mut emit = |s: &str, reasoning: bool| {
+            emitted.push((s.to_string(), reasoning));
+            true
+        };
+        assert!(!r.push(b"think ", &mut emit));
+        assert!(r.push(b"HALT", &mut emit));
+        assert_eq!(r.reasoning, "think ");
+        assert!(emitted.iter().all(|(_, is_reasoning)| *is_reasoning));
+        let text: String = emitted.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(!text.contains("HALT"), "streamed={:?}", text);
+    }
+
+    #[test]
     fn parse_params_rejects_invalid_values() {
         for body in [
             r#"{"max_tokens": -1}"#,
@@ -2897,7 +3155,10 @@ mod tests {
             r#"{"top_k": -1}"#,
             r#"{"top_k": 1.5}"#,
             r#"{"temperature": -0.5}"#,
+            r#"{"temperature": 1e300}"#, // finite f64, infinite f32
             r#"{"temperature": "hot"}"#,
+            r#"{"max_tokens": 0}"#,
+            r#"{"max_completion_tokens": 0}"#,
             r#"{"top_p": 1.5}"#,
             r#"{"top_p": 0}"#,
             r#"{"seed": -1}"#,
@@ -2913,7 +3174,7 @@ mod tests {
         assert_eq!(p.top_p, 0.9);
         assert_eq!(p.max_tokens, 128);
 
-        // max_completion_tokens overrides max_tokens.
+        // max_completion_tokens overrides max_tokens, even a placeholder 0.
         let j = crate::json::parse(r#"{"max_tokens":0,"max_completion_tokens":64}"#).unwrap();
         assert_eq!(parse_params(&j, &tiny_engine()).unwrap().max_tokens, 64);
     }
@@ -3026,6 +3287,24 @@ mod tests {
     }
 
     #[test]
+    fn usage_counts_prompt_once_for_multiple_choices() {
+        let gen = |prompt: usize, completion: usize| GenResult {
+            text: String::new(),
+            reasoning_content: String::new(),
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            finish_reason: "stop".into(),
+            logprobs: Vec::new(),
+            prefill_seconds: 0.0,
+            decode_seconds: 0.0,
+        };
+        let usage = usage_from(&[gen(10, 4), gen(10, 5)]);
+        assert_eq!(usage.get("prompt_tokens").unwrap().as_f64(), Some(10.0));
+        assert_eq!(usage.get("completion_tokens").unwrap().as_f64(), Some(9.0));
+        assert_eq!(usage.get("total_tokens").unwrap().as_f64(), Some(19.0));
+    }
+
+    #[test]
     fn http_chat_n_choices_and_logprobs() {
         let addr = start_server();
         let payload = r#"{"model":"tiny-model","messages":[{"role":"user","content":"hi"}],"max_tokens":4,"temperature":0,"enable_thinking":false,"n":2,"logprobs":true,"top_logprobs":1,"seed":7}"#;
@@ -3076,13 +3355,11 @@ mod tests {
         let offsets = lp.get("text_offset").unwrap().as_arr().unwrap();
         assert_eq!(texts.len(), values.len());
         assert_eq!(texts.len(), offsets.len());
-        assert_eq!(
-            lp.get("top_logprobs").unwrap().as_arr().unwrap()[0]
-                .as_arr()
-                .unwrap()
-                .len(),
-            2
-        );
+        let tops = lp.get("top_logprobs").unwrap().as_arr().unwrap();
+        let first = tops[0].as_arr().unwrap();
+        assert_eq!(first.len(), 2);
+        // OpenAI shape: an array of {token: logprob} maps, not bare numbers.
+        assert!(first[0].as_obj().is_some(), "entry={:?}", first[0]);
     }
 
     #[test]

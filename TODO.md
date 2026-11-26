@@ -11,6 +11,22 @@ checked off with a short note; open items are unchecked.
 
 ---
 
+## Implemented follow-up (post-v0.5.7, uncommitted)
+
+A code review pass fixed: the MSRV/build blocker (`AtomicUsize::try_update`
+replaced with a CAS loop; `rust-version = 1.87`); shared config validation so
+the CPU forward no longer divides by zero or indexes past a head on malformed
+configs; the fp16 subnormal→normal rounding carry; chat-SSE disconnect
+propagation (and an early break between `n > 1` choices after a disconnect); stop strings in
+reasoning and longest-first overlapping stops; a request-wide deadline covering
+prefill; rejection of `max_tokens: 0` and finite-f64→infinite-f32 parameters;
+`Transfer-Encoding` rejection; bounded top-logprob scratch; per-instance
+DeltaNet scratch; regex negated classes; and a CPU↔GPU whole-forward parity
+test. Baseline is now **127 passed / 11 ignored** (139 with `gpu`). Real-GPU
+A/B validation is still open — CI has no GPU.
+
+---
+
 ## Validation & Correctness
 
 - [x] **(P1) Move sampling fully on device (GPU path).** Done: `GpuRunner::sample()`
@@ -264,7 +280,10 @@ The authoritative phased plan (with acceptance criteria) is
 [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md). **Phases 0–2 are fully complete**;
 execute the remaining work in this order:
 
-1. **(GPU) Move sampling fully on device** — see reminder under Validation & Correctness; then validate real-GPU correctness/throughput with the A/B benchmark.
+1. **(GPU) Validate real-GPU correctness/throughput** with `EXLLAMA_BENCH_COMPUTE=gpu`
+   A/B runs. Sampling already runs on device (see Validation & Correctness); the
+   synthetic `device_forward_matches_cpu_forward_on_same_weights` test guards
+   CPU↔GPU parity on CI, but no real GPU is available there.
 2. **Phase 3 — exploration.** Vision, other architectures, NFC / `chat_template`
    loading, structured logging, Anthropic endpoint.
 3. **Manual validation still worth doing:** the end-to-end benchmark

@@ -86,7 +86,10 @@ pub(crate) fn f32_to_half(v: f32) -> u16 {
         if frac > 0.5 || (frac == 0.5 && (m & 1) != 0) {
             m += 1;
         }
-        return (if neg { 0x8000u16 } else { 0 }) | (m.min(0x3ff) as u16);
+        // Rounding the largest subnormal up carries into the smallest *normal*
+        // (0x0400). Clamping to 0x03ff made this one ULP too small.
+        let bits = if m >= 0x400 { 0x400 } else { m };
+        return (if neg { 0x8000u16 } else { 0 }) | (bits as u16);
     }
     // Normal: find exponent.
     let mut e = a.log2().floor() as i32;
@@ -1687,6 +1690,20 @@ mod tests {
         for &b in &cases {
             assert_eq!(f32_to_half(half_to_f32(b)), b, "roundtrip {:x}", b);
         }
+    }
+
+    #[test]
+    fn f32_to_half_carries_into_smallest_normal() {
+        // The f32 value immediately below 2^-14 rounds to the smallest *normal*
+        // fp16 (0x0400), not to the largest subnormal (0x03ff). The old
+        // `m.min(0x3ff)` clamp lost that carry by one ULP.
+        let just_below = f32::from_bits((6.103_515_6e-5f32).to_bits() - 1);
+        assert!(just_below < 6.103_515_6e-5);
+        assert_eq!(f32_to_half(just_below), 0x0400);
+        assert_eq!(f32_to_half(-just_below), 0x8400);
+        assert_eq!(f32_to_half(6.103_515_6e-5), 0x0400);
+        // Half of the smallest subnormal rounds to zero (ties to even).
+        assert_eq!(f32_to_half(2.0f32.powi(-25)), 0x0000);
     }
 
     #[test]

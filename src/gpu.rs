@@ -1895,10 +1895,9 @@ mod tests {
         Tensor::from_slice(&data, (len,), dev).unwrap()
     }
 
-    /// Runs the whole device forward on candle's CPU device with a tiny model.
-    /// This catches shape/broadcast bugs in every branch without needing a GPU.
-    #[test]
-    fn device_forward_runs_end_to_end_on_cpu() {
+    /// Device weights for the tiny two-layer (linear + full attention) model.
+    /// Shared by the end-to-end smoke test and the CPU↔GPU parity test.
+    fn tiny_forward_fixture() -> (GpuCfg, Arc<GpuWeights>) {
         let dev = Device::Cpu;
         let cfg = GpuCfg {
             num_layers: 2,
@@ -1976,6 +1975,14 @@ mod tests {
             rope_sin: tiny_f32_mat(&dev, 4, 1),
             h128: Tensor::zeros((128, 128), DType::F32, &dev).unwrap(),
         });
+        (gw.cfg.clone(), gw)
+    }
+
+    /// Runs the whole device forward on candle's CPU device with a tiny model.
+    /// This catches shape/broadcast bugs in every branch without needing a GPU.
+    #[test]
+    fn device_forward_runs_end_to_end_on_cpu() {
+        let (_cfg, gw) = tiny_forward_fixture();
         let mut runner = GpuRunner::new(gw).unwrap();
         // Prefill three tokens (exercises full attention with tlen > 1).
         let logits = runner.forward(&[0, 1, 2]).unwrap();
@@ -1985,6 +1992,98 @@ mod tests {
         let logits = runner.forward(&[3]).unwrap();
         assert_eq!(logits.len(), 4);
         assert!(logits.iter().all(|x| x.is_finite()), "non-finite logits");
+    }
+
+    /// Cross-implementation guard: the device tests above compare GPU ops to
+    /// other GPU ops, so a wrong-but-finite forward could pass. Run the CPU
+    /// decoder on the *same* tiny weights and compare the final logits.
+    #[test]
+    fn device_forward_matches_cpu_forward_on_same_weights() {
+        let (cfg, gw) = tiny_forward_fixture();
+        let mut weights = HashMap::new();
+        for (name, t) in &gw.mats {
+            let dims = t.dims();
+            let (rows, cols) = (dims[0], dims[1]);
+            let bits: Vec<f16> = t.to_vec2::<f16>().unwrap().into_iter().flatten().collect();
+            let data: Vec<f32> = bits
+                .into_iter()
+                .map(|v| crate::exl3::half_to_f32(v.to_bits()))
+                .collect();
+            weights.insert(
+                name.clone(),
+                crate::tensor::Matrix::from_vec(rows, cols, data),
+            );
+        }
+        let mut vectors = HashMap::new();
+        for (name, t) in &gw.vecs {
+            vectors.insert(name.clone(), t.to_vec1::<f32>().unwrap());
+        }
+        let cos: Vec<f32> = gw
+            .rope_cos
+            .to_vec2::<f32>()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        let sin: Vec<f32> = gw
+            .rope_sin
+            .to_vec2::<f32>()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        let factor = (2 * cfg.rope_half) as f32 / cfg.head_dim as f32;
+        let model_cfg = crate::model::ModelConfig {
+            architecture: "Qwen3_5ForCausalLM".into(),
+            num_layers: cfg.num_layers,
+            hidden_size: cfg.hidden_size,
+            vocab_size: cfg.vocab_size,
+            num_attention_heads: cfg.num_attention_heads,
+            num_key_value_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            intermediate_size: cfg.hidden_size * 2,
+            layer_types: cfg.layer_types.clone(),
+            full_attention_interval: cfg.full_attention_interval,
+            linear_conv_kernel_dim: cfg.linear_conv_kernel_dim,
+            linear_key_head_dim: cfg.linear_key_head_dim,
+            linear_num_key_heads: cfg.linear_num_key_heads,
+            linear_num_value_heads: cfg.linear_num_value_heads,
+            linear_value_head_dim: cfg.linear_value_head_dim,
+            rms_norm_eps: cfg.rms_norm_eps,
+            rope_theta: 1e4,
+            partial_rotary_factor: factor,
+            tie_word_embeddings: false,
+            eos_token_id: None,
+            enable_thinking: None,
+        };
+        let mut cpu = crate::model::Model::from_plain_parts(
+            model_cfg,
+            weights,
+            vectors,
+            cfg.context_size,
+            1,
+            cos,
+            sin,
+            cfg.rope_half,
+        );
+        let mut device = GpuRunner::new(gw).unwrap();
+        let ids = [0u32, 1, 2];
+        let a = cpu.forward(&ids).unwrap();
+        let b = device.forward(&ids).unwrap();
+        assert_eq!(a.len(), b.len());
+        let argmax = |v: &[f32]| -> usize {
+            v.iter()
+                .enumerate()
+                .max_by(|(_, x), (_, y)| x.partial_cmp(y).unwrap())
+                .unwrap()
+                .0
+        };
+        // fp16 device GEMMs permit small numeric drift; a wrong forward would
+        // miss this tolerance (or flip the greedy token) either way.
+        assert_eq!(argmax(&a), argmax(&b), "cpu={:?} device={:?}", a, b);
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!((x - y).abs() < 0.2, "logit {}: cpu={} device={}", i, x, y);
+        }
     }
 
     #[test]

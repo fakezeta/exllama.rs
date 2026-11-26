@@ -24,9 +24,9 @@ fixtures are present.
   ./<script>.sh [PORT] [MODEL_NAME]
   ```
 
-  `MODEL_NAME` must match the `--name` passed to the server, or the `model`
-  field in request bodies will be ignored by some clients (this server
-  accepts any value, but keeping them consistent avoids confusion).
+  `MODEL_NAME` must match the `--name` passed to the server: a non-empty
+  `model` field that differs from `--name` is rejected with HTTP 400. Keeping
+  them consistent avoids confusion with other clients.
 - The server's `--weight-mode` affects speed, not output: `f32` (default) and
   `f16` are fast and produce identical answers; `packed` uses the least RAM but
   runs at ~3.5 s/token on CPU, so long requests exceed these scripts' timeouts.

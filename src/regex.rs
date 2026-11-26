@@ -52,6 +52,8 @@ enum ClassMember {
     Char(char),
     Range(char, char),
     Prop(UProp),
+    NotProp(UProp),
+    NotWord,
 }
 
 #[derive(Debug, Clone)]
@@ -61,12 +63,18 @@ struct Class {
 }
 
 impl Class {
-    fn matches(&self, c: char) -> bool {
-        let m = self.members.iter().any(|mem| match mem {
+    fn member_matches(mem: &ClassMember, c: char) -> bool {
+        match mem {
             ClassMember::Char(x) => c == *x,
             ClassMember::Range(lo, hi) => c >= *lo && c <= *hi,
             ClassMember::Prop(p) => char_prop(c, *p),
-        });
+            ClassMember::NotProp(p) => !char_prop(c, *p),
+            ClassMember::NotWord => !(char_prop(c, UProp::L) || char_prop(c, UProp::N) || c == '_'),
+        }
+    }
+
+    fn matches(&self, c: char) -> bool {
+        let m = self.members.iter().any(|mem| Self::member_matches(mem, c));
         if self.negated {
             !m
         } else {
@@ -593,9 +601,19 @@ impl Parser {
                                 members.push(ClassMember::Prop(UProp::N));
                                 members.push(ClassMember::Char('_'));
                             }
+                            // Negated shorthands inside a class were silently
+                            // treated as literals (or as their positive form
+                            // for `\P`), which changed pre-tokenization.
+                            'S' => members.push(ClassMember::NotProp(UProp::Z)),
+                            'D' => members.push(ClassMember::NotProp(UProp::N)),
+                            'W' => members.push(ClassMember::NotWord),
                             'p' | 'P' => {
                                 let prop = self.parse_prop()?;
-                                members.push(ClassMember::Prop(prop));
+                                members.push(if ec == 'P' {
+                                    ClassMember::NotProp(prop)
+                                } else {
+                                    ClassMember::Prop(prop)
+                                });
                             }
                             other => members.push(ClassMember::Char(other)),
                         }
@@ -752,6 +770,27 @@ mod tests {
         assert!(
             start.elapsed().as_secs() < 5,
             "nested quantifier did not terminate promptly"
+        );
+    }
+
+    #[test]
+    fn negated_shorthands_inside_character_classes() {
+        // `[\D]` must match non-digits, not a literal 'D'.
+        assert_eq!(
+            Regex::compile(r"[\D]+").unwrap().pre_tokenize("a1b"),
+            vec!["a", "b"]
+        );
+        assert_eq!(
+            Regex::compile(r"[\P{L}]+").unwrap().pre_tokenize("a1b"),
+            vec!["1"]
+        );
+        assert_eq!(
+            Regex::compile(r"[\W]+").unwrap().pre_tokenize("a_b!"),
+            vec!["!"]
+        );
+        assert_eq!(
+            Regex::compile(r"[\S]+").unwrap().pre_tokenize("a b"),
+            vec!["a", "b"]
         );
     }
 

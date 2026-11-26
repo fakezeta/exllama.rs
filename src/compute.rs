@@ -250,6 +250,21 @@ fn blas_matmul(x: &[f32], x_rows: usize, x_cols: usize, w: &[f32], w_rows: usize
     if x_rows == 0 || w_rows == 0 || x_cols == 0 {
         return;
     }
+    // `sgemm` takes raw pointers and cannot check slice lengths for us. A
+    // mismatch here used to be an out-of-bounds read/write instead of a clear
+    // error; the higher-level `tensor::matmul_t` has always asserted this.
+    let w_needed = w_rows
+        .checked_mul(x_cols)
+        .expect("matmul weight size overflow");
+    let y_needed = x_rows
+        .checked_mul(w_rows)
+        .expect("matmul output size overflow");
+    let x_needed = x_rows
+        .checked_mul(x_cols)
+        .expect("matmul input size overflow");
+    assert!(x.len() >= x_needed, "matmul input buffer too small");
+    assert!(w.len() >= w_needed, "matmul weight buffer too small");
+    assert!(y.len() >= y_needed, "matmul output buffer too small");
     unsafe {
         matrixmultiply::sgemm(
             x_rows,          // m
@@ -378,6 +393,17 @@ mod tests {
             Backend::Scalar
         );
         assert_eq!(pick_by_score(3.0e-3, 1.0e-3, 9.0e-3, 2.0e-3), Backend::Blas);
+    }
+
+    #[test]
+    fn blas_rejects_undersized_buffers() {
+        let w = vec![1.0f32; 12]; // (3, 4)
+        let x = vec![1.0f32; 4];
+        let mut short = vec![0.0f32; 2];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            blas_matmul(&x, 1, 4, &w, 3, &mut short);
+        }));
+        assert!(result.is_err(), "undersized output must not reach sgemm");
     }
 
     #[test]

@@ -59,6 +59,7 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
 
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut content_length: Option<usize> = None;
+    let mut transfer_encoding: Option<String> = None;
     let mut header_bytes = request_line.len();
     loop {
         let mut line = String::new();
@@ -85,9 +86,23 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
                     return Err("request body too large".into());
                 }
                 content_length = Some(n);
+            } else if k.eq_ignore_ascii_case("transfer-encoding") {
+                if transfer_encoding.is_some() || content_length.is_some() {
+                    return Err("ambiguous message framing".into());
+                }
+                transfer_encoding = Some(v.to_ascii_lowercase());
             }
             headers.push((k, v));
         }
+    }
+    // Chunked bodies are not supported. Rejecting them (especially together
+    // with Content-Length) avoids a request-smuggling ambiguity if a reverse
+    // proxy sits in front of this server.
+    if let Some(te) = transfer_encoding {
+        if content_length.is_some() {
+            return Err("both Content-Length and Transfer-Encoding".into());
+        }
+        return Err(format!("unsupported Transfer-Encoding: {}", te));
     }
     // `limited` is no longer used; NLL releases the header borrow here so the
     // body can be read from the underlying reader below.
@@ -146,10 +161,13 @@ pub struct Streamer {
 
 impl Streamer {
     pub fn new(stream: TcpStream, status: u16, content_type: &str) -> Self {
-        let reason = if status == 200 {
-            "OK"
-        } else {
-            "Internal Server Error"
+        let reason = match status {
+            200 => "OK",
+            400 => "Bad Request",
+            404 => "Not Found",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            _ => "OK",
         };
         let head = format!(
             "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
@@ -277,6 +295,26 @@ mod tests {
         assert!(
             err.contains("too large"),
             "expected the header cap to reject the line, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn transfer_encoding_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream)
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .unwrap();
+        let err = server.join().unwrap().err().unwrap();
+        assert!(
+            err.contains("Transfer-Encoding"),
+            "unexpected error: {}",
             err
         );
     }

@@ -23,8 +23,8 @@ This document is a complete orienteering guide for AI agents (or humans) continu
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build                      # debug
 cargo build --release            # optimized binary at target/release/exllama-server
-cargo test                       # 115 unit tests (11 ignored: real-model / /tmp fixtures + benchmarks)
-cargo test --features gpu        # 121 tests (adds device-op tests on candle's CPU device)
+cargo test                       # 127 unit tests (11 ignored: real-model / /tmp fixtures + benchmarks)
+cargo test --features gpu        # 139 tests (adds device-op tests on candle's CPU device)
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings   # must pass (CI enforces)
 ```
@@ -435,8 +435,16 @@ it matters — use `EXLLAMA_BENCH_COMPUTE` to A/B it on a given host.
 | `exl3::tests` unpack-tile equivalence | `unpack_tile_f32` is bit-identical to unpack + fp16 convert |
 | `tests::cli_parses_instance_count` | `--instances` parsing and bounds |
 | `fuzz::tests` | Seeded random inputs against JSON/HTTP/regex/chat/tokenizer/API parsers (no panics) |
+| `model::tests::config_validation_rejects_shapes_that_crash_the_cpu_forward` | Shared head-divisibility / RoPE-range validation (CPU no longer panics where GPU rejects) |
+| `exl3::tests::f32_to_half_carries_into_smallest_normal` | fp16 subnormal→normal rounding boundary |
+| `server::tests::sse_write_failure_is_latched_for_generation_callbacks` | Chat SSE disconnect propagation to `on_token` |
+| `server::tests::router_applies_stop_strings_inside_reasoning` / `router_strips_longest_overlapping_stop_regardless_of_order` | Stop-string semantics in reasoning and with overlapping stops |
+| `server::tests::prefill_honours_request_deadline` / `generation_deadline_stops_before_first_token` / `generation_deadline_stops_during_decode` | One request-wide deadline covers prefill (n=1 and shared) and decode |
+| `http::tests::transfer_encoding_is_rejected` | Ambiguous/unsupported request framing |
+| `tokenizer::tests::bpe_uses_merge_rank_lookup` | BPE merge lookup with a reusable key buffer (no per-pair allocations) |
+| `gpu::tests::device_forward_matches_cpu_forward_on_same_weights` | Whole-forward CPU↔GPU logit parity (feature `gpu`) |
 
-Run `cargo test` — 115 pass, 11 ignored (126 with `--features gpu`). The ignored set
+Run `cargo test` — 127 pass, 11 ignored (139 with `--features gpu`). The ignored set
 is 6 real-model / `/tmp`-fixture tests (now explicitly marked with reasons) plus
 5 benchmarks (including `bench_n_choices_prefill_reuse`). On a fresh clone the dequantization/matmul guarantee is still
 verified by the committed synthetic fixtures.

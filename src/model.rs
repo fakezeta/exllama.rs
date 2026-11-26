@@ -43,6 +43,64 @@ impl ModelConfig {
     }
 }
 
+/// Validate shape assumptions shared by **both** forward paths. The GPU
+/// builder used to be the only place that checked head divisibility; the CPU
+/// path then divided by zero (or silently grouped the wrong KV heads) on the
+/// same malformed config. RoPE indexes `2 * rope_half` elements per head, so
+/// `partial_rotary_factor > 1` has to be rejected here too, not discovered as
+/// an out-of-bounds panic several tokens into generation.
+fn validate_model_config(c: &ModelConfig) -> Result<(), String> {
+    if c.num_layers == 0 || c.hidden_size == 0 || c.vocab_size == 0 {
+        return Err("num_layers, hidden_size and vocab_size must be > 0".into());
+    }
+    if c.num_attention_heads == 0
+        || c.num_key_value_heads == 0
+        || !c.num_attention_heads.is_multiple_of(c.num_key_value_heads)
+    {
+        return Err(format!(
+            "num_attention_heads ({}) must be a positive multiple of num_key_value_heads ({})",
+            c.num_attention_heads, c.num_key_value_heads
+        ));
+    }
+    if c.head_dim == 0 || c.full_attention_interval == 0 {
+        return Err("head_dim and full_attention_interval must be > 0".into());
+    }
+    if c.linear_conv_kernel_dim < 2 {
+        return Err(format!(
+            "invalid linear_conv_kernel_dim={} (must be >= 2)",
+            c.linear_conv_kernel_dim
+        ));
+    }
+    if c.linear_key_head_dim == 0
+        || c.linear_value_head_dim == 0
+        || c.linear_num_key_heads == 0
+        || c.linear_num_value_heads == 0
+        || !c
+            .linear_num_value_heads
+            .is_multiple_of(c.linear_num_key_heads)
+    {
+        return Err(format!(
+            "linear_num_value_heads ({}) must be a positive multiple of linear_num_key_heads ({})",
+            c.linear_num_value_heads, c.linear_num_key_heads
+        ));
+    }
+    if !c.partial_rotary_factor.is_finite() || !(0.0..=1.0).contains(&c.partial_rotary_factor) {
+        return Err(format!(
+            "partial_rotary_factor ({}) must be in [0, 1]",
+            c.partial_rotary_factor
+        ));
+    }
+    // `partial_rotary_factor <= 1` above already guarantees that
+    // `2 * rope_half <= head_dim`, so apply_rope cannot index past a head.
+    if !c.rms_norm_eps.is_finite() || c.rms_norm_eps < 0.0 {
+        return Err(format!("rms_norm_eps ({}) must be >= 0", c.rms_norm_eps));
+    }
+    if !c.rope_theta.is_finite() || c.rope_theta <= 0.0 {
+        return Err(format!("rope_theta ({}) must be > 0", c.rope_theta));
+    }
+    Ok(())
+}
+
 /// State for one full-attention layer: fp16 KV cache. Storing the code bits
 /// directly halves context RAM; each step decodes the used prefix into f32
 /// through a lookup table before computing attention.
@@ -60,6 +118,8 @@ struct LinearAttnState {
     conv_pos: usize,
     /// Recurrent state S, one (value_dim x key_dim) matrix per value head.
     state: Vec<f32>, // (num_value_heads, value_dim, key_dim)
+    /// Per-token scratch for the head recurrence; allocated once per instance.
+    scratch: DeltaNetScratch,
 }
 
 /// Snapshot of the per-sequence state after prefill. Only the *used* prefix
@@ -84,6 +144,7 @@ struct AttnShape {
 
 /// Scratch buffers reused across heads and tokens by the DeltaNet step, so
 /// the recurrent path stays allocation-free per head.
+#[derive(Clone)]
 struct DeltaNetScratch {
     kd: usize,
     vd: usize,
@@ -116,6 +177,72 @@ struct ModelCore {
     /// Zeroed templates used to allocate fresh instance state.
     full_template: Vec<FullAttnState>,
     linear_template: Vec<LinearAttnState>,
+}
+
+/// Precomputed RoPE tables and zeroed per-instance state templates. Shared by
+/// `Model::load` and the test-only constructor used for CPU↔GPU parity checks.
+fn build_tables_and_states(
+    config: &ModelConfig,
+    context_size: usize,
+) -> (
+    Vec<f32>,
+    Vec<f32>,
+    usize,
+    Vec<FullAttnState>,
+    Vec<LinearAttnState>,
+) {
+    // RoPE phases depend only on (position, rotary dimension), so compute
+    // them once instead of doing powf/sin_cos per head per token.
+    let rotary = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+    let rope_half = rotary / 2;
+    let mut rope_cos = vec![0.0f32; context_size * rope_half];
+    let mut rope_sin = vec![0.0f32; context_size * rope_half];
+    for pos in 0..context_size {
+        for d in 0..rope_half {
+            let freq = 1.0 / config.rope_theta.powf(2.0 * d as f32 / rotary as f32);
+            let (s, c) = (pos as f32 * freq).sin_cos();
+            rope_cos[pos * rope_half + d] = c;
+            rope_sin[pos * rope_half + d] = s;
+        }
+    }
+
+    let mut full_states = Vec::new();
+    let mut linear_states = Vec::new();
+    for i in 0..config.num_layers {
+        let is_full = if i < config.layer_types.len() {
+            config.layer_types[i] == "full_attention"
+        } else {
+            (i + 1) % config.full_attention_interval == 0
+        };
+        if is_full {
+            let kv = config.num_key_value_heads * config.head_dim;
+            full_states.push(FullAttnState {
+                k: vec![0u16; context_size * kv],
+                v: vec![0u16; context_size * kv],
+            });
+        } else {
+            let conv_dim = config.linear_num_value_heads * config.linear_value_head_dim
+                + 2 * config.linear_num_key_heads * config.linear_key_head_dim;
+            let (kd, vd) = (config.linear_key_head_dim, config.linear_value_head_dim);
+            linear_states.push(LinearAttnState {
+                // The conv state stores the last (kernel - 1) qkv vectors;
+                // the current token supplies the kernel-th value at runtime.
+                conv: vec![0.0; (config.linear_conv_kernel_dim - 1) * conv_dim],
+                conv_pos: 0,
+                state: vec![0.0; config.linear_num_value_heads * vd * kd],
+                scratch: DeltaNetScratch {
+                    kd,
+                    vd,
+                    qh: vec![0.0; kd],
+                    kh: vec![0.0; kd],
+                    mem: vec![0.0; vd],
+                    delta: vec![0.0; vd],
+                    o: vec![0.0; vd],
+                },
+            });
+        }
+    }
+    (rope_cos, rope_sin, rope_half, full_states, linear_states)
 }
 
 /// One inference instance: shared immutable core + mutable per-sequence state.
@@ -230,63 +357,10 @@ impl Model {
                 .or_else(|| cfg.get("enable_thinking"))
                 .and_then(|v| v.as_bool()),
         };
-        if config.linear_conv_kernel_dim < 2 {
-            return Err(format!(
-                "invalid linear_conv_kernel_dim={} (must be >= 2)",
-                config.linear_conv_kernel_dim
-            ));
-        }
-        if config.num_key_value_heads == 0 || config.num_attention_heads == 0 {
-            return Err("attention head counts must be > 0".into());
-        }
+        validate_model_config(&config)?;
 
-        // RoPE phases depend only on (position, rotary dimension), so compute
-        // them once instead of doing powf/sin_cos per head per token.
-        let rotary = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-        let rope_half = rotary / 2;
-        let mut rope_cos = vec![0.0f32; context_size * rope_half];
-        let mut rope_sin = vec![0.0f32; context_size * rope_half];
-        for pos in 0..context_size {
-            for d in 0..rope_half {
-                let freq = 1.0 / config.rope_theta.powf(2.0 * d as f32 / rotary as f32);
-                let (s, c) = (pos as f32 * freq).sin_cos();
-                rope_cos[pos * rope_half + d] = c;
-                rope_sin[pos * rope_half + d] = s;
-            }
-        }
-
-        // Allocate per-sequence state.
-        let mut full_states = Vec::new();
-        let mut linear_states = Vec::new();
-        for i in 0..config.num_layers {
-            let is_full = if i < config.layer_types.len() {
-                config.layer_types[i] == "full_attention"
-            } else {
-                (i + 1) % config.full_attention_interval == 0
-            };
-            if is_full {
-                let kv = config.num_key_value_heads * config.head_dim;
-                full_states.push(FullAttnState {
-                    k: vec![0u16; context_size * kv],
-                    v: vec![0u16; context_size * kv],
-                });
-            } else {
-                let conv_dim = config.linear_num_value_heads * config.linear_value_head_dim
-                    + 2 * config.linear_num_key_heads * config.linear_key_head_dim;
-                linear_states.push(LinearAttnState {
-                    // The conv state stores the last (kernel - 1) qkv vectors;
-                    // the current token supplies the kernel-th value at runtime.
-                    conv: vec![0.0; (config.linear_conv_kernel_dim - 1) * conv_dim],
-                    conv_pos: 0,
-                    state: vec![
-                        0.0;
-                        config.linear_num_value_heads
-                            * config.linear_value_head_dim
-                            * config.linear_key_head_dim
-                    ],
-                });
-            }
-        }
+        let (rope_cos, rope_sin, rope_half, full_states, linear_states) =
+            build_tables_and_states(&config, context_size);
 
         #[cfg(feature = "gpu")]
         let gpu = if use_gpu {
@@ -883,18 +957,11 @@ impl Model {
             beta[h] = 1.0 / (1.0 + (-bb).exp());
         }
 
-        // Recurrent state update (fp32), per value head. Scratch buffers are
-        // allocated once per layer and reused for every head/token.
+        // Recurrent state update (fp32), per value head. Scratch lives in the
+        // instance state and is reused for every head/token.
         let st = &mut self.linear_states[state_idx];
-        let mut scratch = DeltaNetScratch {
-            kd,
-            vd,
-            qh: vec![0.0f32; kd],
-            kh: vec![0.0f32; kd],
-            mem: vec![0.0f32; vd],
-            delta: vec![0.0f32; vd],
-            o: vec![0.0f32; vd],
-        };
+        let state = &mut st.state;
+        let scratch = &mut st.scratch;
         let mut o = vec![0.0f32; val_dim];
         for vh in 0..nvh {
             let kh = vh / rep; // key heads are repeated to match value heads
@@ -903,13 +970,13 @@ impl Model {
             let vbase = vh * vd;
             let sbase = vh * kd * vd;
             Self::deltanet_step(
-                &mut st.state[sbase..sbase + kd * vd],
+                &mut state[sbase..sbase + kd * vd],
                 &q[qbase..qbase + kd],
                 &k[kbase..kbase + kd],
                 &v[vbase..vbase + vd],
                 g[vh],
                 beta[vh],
-                &mut scratch,
+                scratch,
             );
             o[vbase..vbase + vd].copy_from_slice(&scratch.o[..vd]);
         }
@@ -964,8 +1031,18 @@ impl Model {
         let hs = self.core.config.hidden_size;
         let vocab = self.core.config.vocab_size;
         let eps = self.core.config.rms_norm_eps;
-        let layer_types = self.core.config.layer_types.clone();
+        let layer_types = &self.core.config.layer_types;
         let intv = self.core.config.full_attention_interval;
+        // Resolve layer kinds once into cheap bools. Cloning the Vec<String>
+        // here allocated 32 Strings on *every* generated token.
+        let mut is_full_layers = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            is_full_layers.push(if i < layer_types.len() {
+                layer_types[i] == "full_attention"
+            } else {
+                (i + 1) % intv == 0
+            });
+        }
 
         let mut x = self.embedding_row(token)?;
 
@@ -973,11 +1050,7 @@ impl Model {
         let mut full_idx = 0usize;
         let mut linear_idx = 0usize;
         for i in 0..num_layers {
-            let is_full = if i < layer_types.len() {
-                layer_types[i] == "full_attention"
-            } else {
-                (i + 1) % intv == 0
-            };
+            let is_full = is_full_layers[i];
             let attn = if is_full {
                 let y = self.forward_full_attn(i, &x, full_idx, pos)?;
                 full_idx += 1;
@@ -1044,7 +1117,12 @@ impl Model {
             self.position = g.position();
             return Ok(logits);
         }
-        let mut logits = vec![0.0f32; self.core.config.vocab_size];
+        if input_ids.is_empty() {
+            return Ok(vec![0.0f32; self.core.config.vocab_size]);
+        }
+        // `forward_token` returns a fresh vocab-sized vector; pre-filling one
+        // here would allocate (and zero) a second one per decode step.
+        let mut logits = Vec::with_capacity(self.core.config.vocab_size);
         for &t in input_ids {
             logits = self.forward_token(t)?;
         }
@@ -1103,6 +1181,45 @@ impl Model {
 
 #[cfg(test)]
 impl Model {
+    /// Build a CPU-forward model from the same plain tensors as the device
+    /// fixture in `gpu.rs`, so the two forwards can be compared numerically.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn from_plain_parts(
+        config: ModelConfig,
+        weights: HashMap<String, Matrix>,
+        vectors: HashMap<String, Vec<f32>>,
+        context_size: usize,
+        threads: usize,
+        rope_cos: Vec<f32>,
+        rope_sin: Vec<f32>,
+        rope_half: usize,
+    ) -> Model {
+        validate_model_config(&config).expect("parity test config must be valid");
+        let (_, _, _, full_states, linear_states) = build_tables_and_states(&config, context_size);
+        let core = Arc::new(ModelCore {
+            config,
+            prefix: String::new(),
+            weights,
+            embeddings_f16: HashMap::new(),
+            linears: HashMap::new(),
+            vectors,
+            threads,
+            context_size,
+            rope_cos,
+            rope_sin,
+            rope_half,
+            full_template: full_states.clone(),
+            linear_template: linear_states.clone(),
+        });
+        Model {
+            core,
+            position: 0,
+            full_states,
+            linear_states,
+            gpu: None,
+        }
+    }
+
     /// Deterministic tiny full-attention model used by HTTP/engine tests.
     /// It needs no EXL3 files: all weights are small synthetic matrices.
     pub(crate) fn tiny() -> Model {
@@ -1206,6 +1323,63 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_config() -> ModelConfig {
+        ModelConfig {
+            architecture: "Qwen3_5ForCausalLM".into(),
+            num_layers: 1,
+            hidden_size: 4,
+            vocab_size: 261,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            intermediate_size: 4,
+            layer_types: Vec::new(),
+            full_attention_interval: 4,
+            linear_conv_kernel_dim: 4,
+            linear_key_head_dim: 4,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 2,
+            linear_value_head_dim: 4,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1e4,
+            partial_rotary_factor: 0.5,
+            tie_word_embeddings: false,
+            eos_token_id: None,
+            enable_thinking: None,
+        }
+    }
+
+    #[test]
+    fn config_validation_rejects_shapes_that_crash_the_cpu_forward() {
+        assert!(validate_model_config(&valid_config()).is_ok());
+
+        let mut c = valid_config();
+        c.num_key_value_heads = 3; // > nh: `groups = nh / nkv` would be zero
+        assert!(validate_model_config(&c).is_err());
+
+        let mut c = valid_config();
+        c.num_attention_heads = 3;
+        c.num_key_value_heads = 2; // non-divisible: wrong KV head grouping
+        assert!(validate_model_config(&c).is_err());
+
+        let mut c = valid_config();
+        c.linear_num_key_heads = 2;
+        c.linear_num_value_heads = 3; // non-divisible: wrong DeltaNet head mapping
+        assert!(validate_model_config(&c).is_err());
+
+        let mut c = valid_config();
+        c.partial_rotary_factor = 1.5; // 2*rope_half > head_dim: OOB in apply_rope
+        assert!(validate_model_config(&c).is_err());
+
+        let mut c = valid_config();
+        c.partial_rotary_factor = f32::NAN;
+        assert!(validate_model_config(&c).is_err());
+
+        let mut c = valid_config();
+        c.linear_conv_kernel_dim = 1;
+        assert!(validate_model_config(&c).is_err());
+    }
 
     #[test]
     fn embedding_row_resolves_multimodal_fp16_embedding() {

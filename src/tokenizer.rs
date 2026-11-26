@@ -113,8 +113,10 @@ pub struct Tokenizer {
     vocab: HashMap<String, u32>,
     /// id -> token string.
     id_to_token: HashMap<u32, String>,
-    /// (token_a, token_b) -> merge rank.
-    merge_rank: HashMap<(String, String), usize>,
+    /// Merge rank by `"left right"` key (a literal space cannot occur in a byte-level
+    /// token). A `String` key lets the BPE hot loop look up with a reusable
+    /// `&str` buffer instead of allocating two Strings per adjacent pair.
+    merge_rank: HashMap<String, usize>,
     /// byte value -> byte token char.
     byte_encoder: HashMap<u8, char>,
     /// byte token char -> byte value (inverse of byte_encoder).
@@ -152,7 +154,7 @@ impl Tokenizer {
         // space-separated string ("Ġ Ġ"); older ones use a two-element array
         // (["Ġ", "Ġ"]). Handle both. Byte-level tokens never contain a literal
         // ASCII space (byte 0x20 maps to U+0120), so split_once is unambiguous.
-        let mut merge_rank: HashMap<(String, String), usize> = HashMap::new();
+        let mut merge_rank: HashMap<String, usize> = HashMap::new();
         if let Some(m) = model.get("merges").and_then(|v| v.as_arr()) {
             for (rank, pair) in m.iter().enumerate() {
                 let parsed = if let Some(arr) = pair.as_arr() {
@@ -170,7 +172,7 @@ impl Tokenizer {
                     None
                 };
                 if let Some((a, b)) = parsed {
-                    merge_rank.insert((a, b), rank);
+                    merge_rank.insert(format!("{} {}", a, b), rank);
                 }
             }
         }
@@ -433,15 +435,18 @@ impl Tokenizer {
         }
 
         // 2. Apply BPE merges (find the lowest-rank adjacent pair, merge, repeat).
+        // A single reusable key buffer avoids two heap allocations per pair on
+        // every merge — with an 8 MiB request body this loop was a CPU DoS.
+        let mut key = String::new();
         loop {
             let mut best_i: Option<usize> = None;
             let mut best_rank = usize::MAX;
             for i in 0..tokens.len().saturating_sub(1) {
-                let pair = (tokens[i].as_str(), tokens[i + 1].as_str());
-                if let Some(&rank) = self
-                    .merge_rank
-                    .get(&(pair.0.to_string(), pair.1.to_string()))
-                {
+                key.clear();
+                key.push_str(&tokens[i]);
+                key.push(' ');
+                key.push_str(&tokens[i + 1]);
+                if let Some(&rank) = self.merge_rank.get(key.as_str()) {
                     if rank < best_rank {
                         best_rank = rank;
                         best_i = Some(i);
@@ -519,6 +524,18 @@ impl Tokenizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bpe_uses_merge_rank_lookup() {
+        // `Tokenizer::tiny()` has no merge rules; add one to exercise the
+        // allocation-free lookup used by the BPE hot loop.
+        let mut t = Tokenizer::tiny();
+        t.vocab.insert("ab".into(), 1000);
+        t.id_to_token.insert(1000, "ab".into());
+        t.merge_rank.insert("a b".into(), 0);
+        assert_eq!(t.encode("ab"), vec![1000]);
+        assert_eq!(t.decode(&[1000], false), "ab");
+    }
 
     fn load() -> Option<Tokenizer> {
         Tokenizer::load("/tmp/qwen35/tokenizer.json").ok()
