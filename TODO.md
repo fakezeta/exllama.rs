@@ -11,7 +11,7 @@ checked off with a short note; open items are unchecked.
 
 ---
 
-## Implemented follow-up (post-v0.5.7, uncommitted)
+## Implemented follow-up (released in v0.5.8)
 
 A code review pass fixed: the MSRV/build blocker (`AtomicUsize::try_update`
 replaced with a CAS loop; `rust-version = 1.87`, since raised to 1.88 for
