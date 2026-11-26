@@ -1,7 +1,7 @@
 //! Qwen3.5 text decoder: config, weights, KV cache, and forward pass.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::exl3::{f32_to_half, half_f32, matmul_f16, Exl3Model, QuantLinear};
 #[cfg(feature = "gpu")]
@@ -251,6 +251,9 @@ pub struct Model {
     position: usize,
     full_states: Vec<FullAttnState>,
     linear_states: Vec<LinearAttnState>,
+    /// Reusable input-side scratch for quantized matmuls (sized to the largest
+    /// in_features). Per-instance, so independent instances never contend.
+    mat_scratch: Mutex<Vec<f32>>,
     /// Device-resident forward path; `None` on CPU builds/backends.
     #[cfg(feature = "gpu")]
     gpu: Option<GpuRunner>,
@@ -404,6 +407,7 @@ impl Model {
             position: 0,
             full_states,
             linear_states,
+            mat_scratch: Mutex::new(Vec::new()),
             #[cfg(feature = "gpu")]
             gpu,
         })
@@ -422,6 +426,7 @@ impl Model {
             position: 0,
             full_states: self.core.full_template.clone(),
             linear_states: self.core.linear_template.clone(),
+            mat_scratch: Mutex::new(Vec::new()),
             #[cfg(feature = "gpu")]
             gpu,
         }
@@ -737,7 +742,26 @@ impl Model {
             return Ok(y);
         }
         if let Some(ql) = self.ql(name) {
-            return Ok(ql.matmul(x, self.core.threads));
+            let k = ql.in_features();
+            if x.len() != k {
+                return Err(format!(
+                    "linear {}: input length {} != in_features {}",
+                    name,
+                    x.len(),
+                    k
+                ));
+            }
+            // Reuse this instance's scratch across every quantized linear in
+            // the layer (and across tokens); growing it happens at most once
+            // per distinct in_features width.
+            let mut scratch = self
+                .mat_scratch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if scratch.len() < k {
+                scratch.resize(k, 0.0);
+            }
+            return Ok(ql.matmul_with_scratch(x, &mut scratch, self.core.threads));
         }
         // Tied checkpoints keep the embedding table as fp16 only; the same
         // table is the lm_head. Decode it on the fly via the threaded f16
@@ -1215,6 +1239,7 @@ impl Model {
             position: 0,
             full_states,
             linear_states,
+            mat_scratch: Mutex::new(Vec::new()),
             gpu: None,
         }
     }
@@ -1313,6 +1338,7 @@ impl Model {
             position: 0,
             full_states,
             linear_states: Vec::new(),
+            mat_scratch: Mutex::new(Vec::new()),
             #[cfg(feature = "gpu")]
             gpu: None,
         }

@@ -382,9 +382,10 @@ fn unpack_tile_f32(
 /// Apply a normalized 128-point Sylvester Hadamard transform to the strided
 /// vector `data[base + i*stride]`, `i = 0..128`.
 ///
-/// Production callers use `stride = 1`; the strided form is exercised by
-/// `hadamard_rows_blocking_matches_strided_reference` as an independent
-/// reference for the buffered `hadamard_rows` implementation.
+/// Production uses `stride = 1` (matmul) and `stride = 16` (the columns of a
+/// 128x16 stack-resident tile in `hadamard_rows`); the large-stride form is
+/// also exercised by `hadamard_rows_blocking_matches_strided_reference` as an
+/// independent reference.
 #[inline]
 pub(crate) fn hadamard128(data: &mut [f32], base: usize, stride: usize, scale: f32) {
     for step in [1usize, 2, 4, 8, 16, 32, 64] {
@@ -414,18 +415,26 @@ pub(crate) fn hadamard_rows(w: &mut [f32], rows: usize, cols: usize) {
         rows
     );
     let scale = 1.0 / (128.0f32).sqrt();
-    // Read a 128-element column slice into a stack buffer, transform it
-    // contiguously, then write it back. The old strided butterfly touched 128
-    // cache lines per element and was much slower on large matrices.
-    let mut buf = [0.0f32; 128];
+    // Transform 128x16 column tiles: 16 contiguous floats per row means one
+    // cache line per row instead of one per column per row for the old
+    // single-column buffer (16x fewer cache-line fetches on load and store).
+    // The butterfly runs on the stack-resident tile with stride 16, so its
+    // strided accesses stay in L1.
+    const TILE_COLS: usize = 16;
+    let mut buf = [0.0f32; 128 * TILE_COLS];
     for rb in 0..(rows / 128) {
-        for j in 0..cols {
+        for cb in (0..cols).step_by(TILE_COLS) {
+            let width = (cols - cb).min(TILE_COLS);
             for i in 0..128 {
-                buf[i] = w[(rb * 128 + i) * cols + j];
+                let src = (rb * 128 + i) * cols + cb;
+                buf[i * TILE_COLS..i * TILE_COLS + width].copy_from_slice(&w[src..src + width]);
             }
-            hadamard128(&mut buf, 0, 1, scale);
+            for j in 0..width {
+                hadamard128(&mut buf, j, TILE_COLS, scale);
+            }
             for i in 0..128 {
-                w[(rb * 128 + i) * cols + j] = buf[i];
+                let dst = (rb * 128 + i) * cols + cb;
+                w[dst..dst + width].copy_from_slice(&buf[i * TILE_COLS..i * TILE_COLS + width]);
             }
         }
     }
@@ -982,6 +991,14 @@ impl SharedPtr {
     }
 }
 
+/// Rows `r0..r1` of an fp16 matrix into disjoint output slots. Shared by the
+/// inline single-thread path and the threaded job closures.
+fn f16_matrix_rows(base: SharedPtr, x: &[f32], data: &[u16], cols: usize, r0: usize, r1: usize) {
+    for j in r0..r1 {
+        base.write_at(j, dot_f16(x, &data[j * cols..(j + 1) * cols]));
+    }
+}
+
 /// Threaded `y = W @ x` for an fp16 weight matrix (e.g. a tied embedding used
 /// as `lm_head`). Weights stay as fp16 bits in RAM and are decoded through the
 /// LUT inside `dot_f16`; only one output slice is written by each worker.
@@ -996,6 +1013,11 @@ pub(crate) fn matmul_f16(x: &[f32], w: &F16Matrix, y: &mut [f32], threads: usize
     } else {
         threads.max(1).min(rows)
     };
+    if n_threads == 1 {
+        // Small matrices: no job vector and no threadpool barrier.
+        f16_matrix_rows(base, x, &w.data, cols, 0, rows);
+        return;
+    }
     let chunk = rows.div_ceil(n_threads);
     let x_p = SendSlice::new(x);
     let w_p = SendSlice::new(&w.data);
@@ -1008,14 +1030,65 @@ pub(crate) fn matmul_f16(x: &[f32], w: &F16Matrix, y: &mut [f32], threads: usize
         let r1 = (r0 + chunk).min(rows);
         let (base, x_p, w_p) = (base, x_p, w_p);
         jobs.push(Box::new(move || unsafe {
-            let x = x_p.get(cols);
-            let data = w_p.get(rows * cols);
-            for j in r0..r1 {
-                base.write_at(j, dot_f16(x, &data[j * cols..(j + 1) * cols]));
-            }
+            f16_matrix_rows(base, x_p.get(cols), w_p.get(rows * cols), cols, r0, r1);
         }));
     }
     crate::threadpool::run(jobs);
+}
+
+/// Rows `j0..j1` of an (n, k) fp16 W_hat cache into disjoint output slots.
+/// Shared by the inline single-thread path and the threaded job closures.
+fn f16_cache_rows(base: SharedPtr, what: &[u16], xr: &[f32], j0: usize, j1: usize, k: usize) {
+    for j in j0..j1 {
+        base.write_at(j, dot_f16(xr, &what[j * k..(j + 1) * k]));
+    }
+}
+
+/// Tile geometry captured by the packed matmul workers.
+#[derive(Clone, Copy)]
+struct PackedShape {
+    tiles_k: usize,
+    tiles_n: usize,
+    wpb: usize,
+    kbi: usize,
+    kh: bool,
+    cb: Codebook,
+}
+
+/// Output tile columns `tn0..tn1` of the packed matmul into disjoint output
+/// slots. Shared by the inline single-thread path and the job closures.
+fn packed_cols(
+    base: SharedPtr,
+    trellis: &[u16],
+    xr: &[f32],
+    tn0: usize,
+    tn1: usize,
+    shape: PackedShape,
+) {
+    let PackedShape {
+        tiles_k,
+        tiles_n,
+        wpb,
+        kbi,
+        kh,
+        cb,
+    } = shape;
+    let mut tile = [0.0f32; 256];
+    for tn in tn0..tn1 {
+        for tk in 0..tiles_k {
+            let off = (tk * tiles_n + tn) * wpb;
+            unpack_tile_f32(&trellis[off..off + wpb], kbi, kh, cb, &mut tile);
+            let xbase = tk * 16;
+            let ybase = tn * 16;
+            for c in 0..16 {
+                let mut acc = 0.0f32;
+                for r in 0..16 {
+                    acc += tile[r * 16 + c] * xr[xbase + r];
+                }
+                base.add_at(ybase + c, acc);
+            }
+        }
+    }
 }
 
 /// An EXL3 linear layer kept in packed form. Inference multiplies directly
@@ -1049,6 +1122,11 @@ pub struct QuantLinear {
 }
 
 impl QuantLinear {
+    /// Input width, used by callers to validate activations and size scratch.
+    pub(crate) fn in_features(&self) -> usize {
+        self.k
+    }
+
     /// Load a quantized linear from shards, keeping the trellis packed.
     fn from_shards(shards: &Shards, prefix: &str) -> Result<Self, String> {
         let trellis_name = format!("{}.trellis", prefix);
@@ -1254,6 +1332,19 @@ impl QuantLinear {
     ///   W[j,i] = svh[j] * (H_n @ (H_k @ W_hat ⊙ suh))[i,j]
     ///   y[j] = svh[j] * (H_n @ (W_hat^T @ (H_k @ (x ⊙ suh))))[j]
     pub fn matmul(&self, x: &[f32], threads: usize) -> Vec<f32> {
+        let mut xr = vec![0.0f32; self.k];
+        self.matmul_with_scratch(x, &mut xr, threads)
+    }
+
+    /// Same as `matmul`, but reuses `xr` (at least `k` elements) for the
+    /// input-side Hadamard scratch. Per-token callers keep one buffer and
+    /// avoid a k-float allocation for every quantized linear.
+    pub(crate) fn matmul_with_scratch(
+        &self,
+        x: &[f32],
+        xr: &mut [f32],
+        threads: usize,
+    ) -> Vec<f32> {
         let k = self.k;
         let n = self.n;
         debug_assert!(
@@ -1262,16 +1353,17 @@ impl QuantLinear {
             k,
             n
         );
+        debug_assert!(xr.len() >= k, "matmul scratch shorter than k");
+        debug_assert_eq!(x.len(), k, "matmul input length mismatch");
         let scale = 1.0 / (128.0f32).sqrt();
 
         // 1. xr = H_k @ (x ⊙ suh), per 128-row block.
-        let mut xr = vec![0.0f32; k];
-        debug_assert!(x.len() >= k, "matmul input shorter than in_features");
-        for i in 0..k {
-            xr[i] = x.get(i).copied().unwrap_or(0.0) * self.suh[i];
+        let xrw = &mut xr[..k];
+        for (i, (&xi, &s)) in x.iter().zip(self.suh.iter()).enumerate() {
+            xrw[i] = xi * s;
         }
         for blk in 0..(k / 128) {
-            hadamard128(&mut xr, blk * 128, 1, scale);
+            hadamard128(xrw, blk * 128, 1, scale);
         }
 
         // 2. t = W_hat^T @ xr.
@@ -1279,32 +1371,33 @@ impl QuantLinear {
         if let Some(what) = &self.what_f32 {
             // Fastest: direct f32 matmul against the W_hat cache via the
             // selected compute backend (BLAS/GPU). what is (n, k) row-major.
-            crate::compute::matmul_t(&xr, 1, k, what, n, &mut t, threads);
+            crate::compute::matmul_t(&xr[..k], 1, k, what, n, &mut t, threads);
         } else if let Some(what) = &self.what_f16 {
             // fp16 cache: decode each weight on the fly (2 bytes/weight) and
             // split output rows across threads. No full f32 scratch is built.
             let base = SharedPtr(t.as_mut_ptr());
             let n_threads = if n < 256 { 1 } else { threads.max(1).min(n) };
-            let chunk = n.div_ceil(n_threads);
-            let xr_p = SendSlice::new(&xr);
-            let what_p = SendSlice::new(what);
-            let mut jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::new();
-            for t_idx in 0..n_threads {
-                let j0 = t_idx * chunk;
-                if j0 >= n {
-                    break;
-                }
-                let j1 = (j0 + chunk).min(n);
-                let (base, xr_p, what_p) = (base, xr_p, what_p);
-                jobs.push(Box::new(move || unsafe {
-                    let xr = xr_p.get(k);
-                    let what = what_p.get(n * k);
-                    for j in j0..j1 {
-                        base.write_at(j, dot_f16(xr, &what[j * k..(j + 1) * k]));
+            if n_threads == 1 {
+                // No job vector / threadpool barrier for small linears.
+                f16_cache_rows(base, what, &xr[..k], 0, n, k);
+            } else {
+                let chunk = n.div_ceil(n_threads);
+                let xr_p = SendSlice::new(&xr[..k]);
+                let what_p = SendSlice::new(what);
+                let mut jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::new();
+                for t_idx in 0..n_threads {
+                    let j0 = t_idx * chunk;
+                    if j0 >= n {
+                        break;
                     }
-                }));
+                    let j1 = (j0 + chunk).min(n);
+                    let (base, xr_p, what_p) = (base, xr_p, what_p);
+                    jobs.push(Box::new(move || unsafe {
+                        f16_cache_rows(base, what_p.get(n * k), xr_p.get(k), j0, j1, k);
+                    }));
+                }
+                crate::threadpool::run(jobs);
             }
-            crate::threadpool::run(jobs);
         } else {
             // Packed path: decode tiles on demand (low memory, slow). Split over
             // tn so each worker writes a disjoint slice of `t`.
@@ -1321,41 +1414,41 @@ impl QuantLinear {
             } else {
                 threads.max(1).min(self.tiles_n)
             };
-            let chunk = self.tiles_n.div_ceil(n_threads);
-            let trellis_p = SendSlice::new(trellis);
-            let xr_p = SendSlice::new(&xr);
-            let (tiles_k, tiles_n, wpb) = (self.tiles_k, self.tiles_n, self.words_per_tile);
-            let (kbi, kh, cb) = (self.k_bits_int, self.k_half, self.cb);
-            let mut jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::new();
-            for t_idx in 0..n_threads {
-                let tn0 = t_idx * chunk;
-                if tn0 >= tiles_n {
-                    break;
-                }
-                let tn1 = (tn0 + chunk).min(tiles_n);
-                let (base, trellis_p, xr_p) = (base, trellis_p, xr_p);
-                jobs.push(Box::new(move || unsafe {
-                    let trellis = trellis_p.get(tiles_k * tiles_n * wpb);
-                    let xr = xr_p.get(k);
-                    let mut tile = [0.0f32; 256];
-                    for tn in tn0..tn1 {
-                        for tk in 0..tiles_k {
-                            let off = (tk * tiles_n + tn) * wpb;
-                            unpack_tile_f32(&trellis[off..off + wpb], kbi, kh, cb, &mut tile);
-                            let xbase = tk * 16;
-                            let ybase = tn * 16;
-                            for c in 0..16 {
-                                let mut acc = 0.0f32;
-                                for r in 0..16 {
-                                    acc += tile[r * 16 + c] * xr[xbase + r];
-                                }
-                                base.add_at(ybase + c, acc);
-                            }
-                        }
+            let shape = PackedShape {
+                tiles_k: self.tiles_k,
+                tiles_n: self.tiles_n,
+                wpb: self.words_per_tile,
+                kbi: self.k_bits_int,
+                kh: self.k_half,
+                cb: self.cb,
+            };
+            if n_threads == 1 {
+                packed_cols(base, trellis, &xr[..k], 0, shape.tiles_n, shape);
+            } else {
+                let chunk = shape.tiles_n.div_ceil(n_threads);
+                let trellis_p = SendSlice::new(trellis);
+                let xr_p = SendSlice::new(&xr[..k]);
+                let mut jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::new();
+                for t_idx in 0..n_threads {
+                    let tn0 = t_idx * chunk;
+                    if tn0 >= shape.tiles_n {
+                        break;
                     }
-                }));
+                    let tn1 = (tn0 + chunk).min(shape.tiles_n);
+                    let (base, trellis_p, xr_p) = (base, trellis_p, xr_p);
+                    jobs.push(Box::new(move || unsafe {
+                        packed_cols(
+                            base,
+                            trellis_p.get(shape.tiles_k * shape.tiles_n * shape.wpb),
+                            xr_p.get(k),
+                            tn0,
+                            tn1,
+                            shape,
+                        );
+                    }));
+                }
+                crate::threadpool::run(jobs);
             }
-            crate::threadpool::run(jobs);
         } // end packed path
 
         // 3. t = H_n @ t, per 128-col block.
@@ -1499,12 +1592,15 @@ impl Exl3Model {
         let mut linears: HashMap<String, QuantLinear> = HashMap::new();
         let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
 
-        // Collect all distinct base names from the shards.
+        // Collect all distinct base names from the shards. The Vec keeps the
+        // load order stable while the HashSet makes dedupe linear.
         let mut base_names: Vec<String> = Vec::new();
+        let mut seen_bases: HashSet<String> = HashSet::new();
         for name in shards.map.keys() {
             if let Some(base) = name.strip_suffix(".trellis") {
-                if !base_names.iter().any(|b| b == base) {
-                    base_names.push(base.to_string());
+                let base = base.to_string();
+                if seen_bases.insert(base.clone()) {
+                    base_names.push(base);
                 }
             }
         }
@@ -1531,10 +1627,8 @@ impl Exl3Model {
                 "packed" => {} // decode on every matmul
                 other => return Err(format!("unknown weight mode '{}'", other)),
             }
-            // Keep any bias in vectors (forward currently ignores biases).
-            if let Some(b) = shards.f32(&format!("{}.bias", base)) {
-                vectors.insert(format!("{}.bias", base), b);
-            }
+            // Quantized biases are read once by the plain-tensor loop below
+            // (forward currently ignores them).
             linears.insert(base.clone(), ql);
             n_linears += 1;
             if n_linears.is_multiple_of(16) || n_linears == total_linears {
@@ -1554,6 +1648,9 @@ impl Exl3Model {
 
         // The quantized trellises have been copied into `QuantLinear`s now;
         // release their raw file bytes before decoding plain tensors.
+        // Snapshot the names before compaction: the `keep` filter below drops
+        // exactly the suffixes excluded by the plain-tensor loop, so this list
+        // stays valid even though `shards.map` is rebuilt without them.
         let all_names: Vec<String> = shards.map.keys().cloned().collect();
         let keep: HashSet<String> = all_names
             .iter()
@@ -1860,27 +1957,31 @@ mod tests {
 
     #[test]
     fn hadamard_rows_blocking_matches_strided_reference() {
-        let (rows, cols) = (256usize, 192usize);
-        let original: Vec<f32> = (0..rows * cols)
-            .map(|i| ((i % 37) as f32) * 0.1 - 1.0)
-            .collect();
-        let mut blocked = original.clone();
-        let mut strided = original.clone();
-        hadamard_rows(&mut blocked, rows, cols);
         let scale = 1.0 / (128.0f32).sqrt();
-        for rb in 0..(rows / 128) {
-            for j in 0..cols {
-                hadamard128(&mut strided, rb * 128 * cols + j, cols, scale);
+        // 200 leaves a partial 8-column tile after 12 full 16-column tiles.
+        for (rows, cols) in [(256usize, 192usize), (256, 200)] {
+            let original: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i % 37) as f32) * 0.1 - 1.0)
+                .collect();
+            let mut blocked = original.clone();
+            let mut strided = original.clone();
+            hadamard_rows(&mut blocked, rows, cols);
+            for rb in 0..(rows / 128) {
+                for j in 0..cols {
+                    hadamard128(&mut strided, rb * 128 * cols + j, cols, scale);
+                }
             }
-        }
-        for i in 0..blocked.len() {
-            assert!(
-                (blocked[i] - strided[i]).abs() < 1e-4,
-                "element {}: {} vs {}",
-                i,
-                blocked[i],
-                strided[i]
-            );
+            for i in 0..blocked.len() {
+                assert!(
+                    (blocked[i] - strided[i]).abs() < 1e-4,
+                    "{}x{} element {}: {} vs {}",
+                    rows,
+                    cols,
+                    i,
+                    blocked[i],
+                    strided[i]
+                );
+            }
         }
     }
 
@@ -2295,6 +2396,21 @@ mod synthetic_tests {
         let mut qh = QuantLinear::from_shards(&shards, "synthetic").unwrap();
         qh.build_decode_cache().unwrap();
         assert_close("f16 cache", &qh.matmul(&x, 1), &expect);
+    }
+
+    /// A dirty, oversized reusable scratch buffer must produce exactly the
+    /// same result as the fresh-allocation wrapper.
+    #[test]
+    fn matmul_with_scratch_matches_fresh_allocation() {
+        let shards = synthetic_shards(Codebook::Mcg, false);
+        let ql = QuantLinear::from_shards(&shards, "synthetic").unwrap();
+        let x: Vec<f32> = (0..ql.in_features())
+            .map(|i| ((i % 13) as f32) * 0.07 - 0.4)
+            .collect();
+        let expect = ql.matmul(&x, 1);
+        let mut scratch = vec![1234.5f32; ql.in_features() + 16];
+        let got = ql.matmul_with_scratch(&x, &mut scratch, 1);
+        assert_eq!(got, expect);
     }
 
     #[test]
