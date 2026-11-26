@@ -14,7 +14,8 @@ checked off with a short note; open items are unchecked.
 ## Implemented follow-up (post-v0.5.7, uncommitted)
 
 A code review pass fixed: the MSRV/build blocker (`AtomicUsize::try_update`
-replaced with a CAS loop; `rust-version = 1.87`); shared config validation so
+replaced with a CAS loop; `rust-version = 1.87`, since raised to 1.88 for
+`slice::as_chunks`); shared config validation so
 the CPU forward no longer divides by zero or indexes past a head on malformed
 configs; the fp16 subnormal→normal rounding carry; chat-SSE disconnect
 propagation (and an early break between `n > 1` choices after a disconnect); stop strings in

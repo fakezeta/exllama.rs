@@ -277,18 +277,26 @@ fn tile_perm_table() -> &'static [usize; 256] {
     })
 }
 
-/// Unpack one tile of 256 decoded fp16 weights.
+/// Unpack one tile of 256 codewords. This owns the only copy of the packed
+/// word-building and bit-position math; callers choose how to decode and store
+/// each codeword through `decode` / `emit` (monomorphized, so no per-weight
+/// callback cost).
 ///
 /// `packed` points at the tile's packed uint16 data (length `16*K` for integer
 /// K, or `16*KA + 8` for half-integer K). `k_half` is true for the MUL1
-/// half-integer rates.
-fn unpack_tile_bits(
+/// half-integer rates. `emit` receives the tile destination index and the
+/// decoded value.
+fn unpack_tile_impl<T, D, F>(
     packed: &[u16],
     k_bits_int: usize,
     k_half: bool,
     cb: Codebook,
-    out: &mut [u16; 256],
-) {
+    decode: D,
+    mut emit: F,
+) where
+    D: Fn(u16, Codebook) -> T,
+    F: FnMut(usize, T),
+{
     let nw = packed.len() / 2; // number of u32 words
                                // Stack buffer avoids a heap allocation per tile. Max supported width
                                // is 144 u16 words = 72 u32 words (K=8 -> 64; half KA=7 -> 60).
@@ -301,23 +309,36 @@ fn unpack_tile_bits(
     if !k_half {
         // Integer K: S(i) = (i+1)*K; window ends at S(i).
         let k = k_bits_int;
-        for i in 0..256 {
+        for (i, &dst) in perm.iter().enumerate() {
             let end = ((i + 1) * k) as i64;
-            out[perm[i]] = decode_bits(window(&words, nw, end - 16), cb);
+            emit(dst, decode(window(&words, nw, end - 16), cb));
         }
     } else {
         // Half-integer K = KA + 0.5 with MASK = 0xAAAA.
         let ka = k_bits_int;
         let bpb = 16 * ka + 8; // bits per tile (16*K)
-        let end_of_group = |g: usize| (g * bpb) as i64;
-        for i in 0..256 {
+        for (i, &dst) in perm.iter().enumerate() {
             let g = i >> 4;
             let q = i & 15;
-            // S(i) = g*bpb + sum_{j=0..=q} (ka + odd(j))
-            let end = end_of_group(g) + (q * ka) as i64 + q.div_ceil(2) as i64;
-            out[perm[i]] = decode_bits(window(&words, nw, end - 16), cb);
+            // S(i) = g*bpb + sum_{j<q} (ka + odd(j))
+            //      = g*bpb + q*ka + q.div_ceil(2).
+            let end = (g * bpb) as i64 + (q * ka) as i64 + q.div_ceil(2) as i64;
+            emit(dst, decode(window(&words, nw, end - 16), cb));
         }
     }
+}
+
+/// Unpack one tile into 256 raw fp16 bit patterns (integer or half-integer K).
+fn unpack_tile_bits(
+    packed: &[u16],
+    k_bits_int: usize,
+    k_half: bool,
+    cb: Codebook,
+    out: &mut [u16; 256],
+) {
+    unpack_tile_impl(packed, k_bits_int, k_half, cb, decode_bits, |dst, bits| {
+        out[dst] = bits;
+    });
 }
 
 /// Unpack one tile into 256 decoded f32 weights (integer or half-integer K).
@@ -328,11 +349,14 @@ fn unpack_tile(
     cb: Codebook,
     out: &mut [f32; 256],
 ) {
-    let mut bits = [0u16; 256];
-    unpack_tile_bits(packed, k_bits_int, k_half, cb, &mut bits);
-    for i in 0..256 {
-        out[i] = half_f32(bits[i]);
-    }
+    unpack_tile_impl(
+        packed,
+        k_bits_int,
+        k_half,
+        cb,
+        |idx, cb| half_f32(decode_bits(idx, cb)),
+        |dst, v| out[dst] = v,
+    );
 }
 
 /// Fast f32 unpack for the decode hot path: look the codebook value up
@@ -346,28 +370,9 @@ fn unpack_tile_f32(
     cb: Codebook,
     out: &mut [f32; 256],
 ) {
-    let nw = packed.len() / 2;
-    let mut words = [0u32; 72];
-    for w in 0..nw {
-        words[w] = ((packed[2 * w + 1] as u32) << 16) | (packed[2 * w] as u32);
-    }
-    let perm = tile_perm_table();
-    if !k_half {
-        let k = k_bits_int;
-        for i in 0..256 {
-            let end = ((i + 1) * k) as i64;
-            out[perm[i]] = decode_f32(window(&words, nw, end - 16), cb);
-        }
-    } else {
-        let ka = k_bits_int;
-        let bpb = 16 * ka + 8;
-        for i in 0..256 {
-            let g = i >> 4;
-            let q = i & 15;
-            let end = (g * bpb) as i64 + (q * ka) as i64 + q.div_ceil(2) as i64;
-            out[perm[i]] = decode_f32(window(&words, nw, end - 16), cb);
-        }
-    }
+    unpack_tile_impl(packed, k_bits_int, k_half, cb, decode_f32, |dst, v| {
+        out[dst] = v;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +381,10 @@ fn unpack_tile_f32(
 
 /// Apply a normalized 128-point Sylvester Hadamard transform to the strided
 /// vector `data[base + i*stride]`, `i = 0..128`.
+///
+/// Production callers use `stride = 1`; the strided form is exercised by
+/// `hadamard_rows_blocking_matches_strided_reference` as an independent
+/// reference for the buffered `hadamard_rows` implementation.
 #[inline]
 pub(crate) fn hadamard128(data: &mut [f32], base: usize, stride: usize, scale: f32) {
     for step in [1usize, 2, 4, 8, 16, 32, 64] {
@@ -396,7 +405,14 @@ pub(crate) fn hadamard128(data: &mut [f32], base: usize, stride: usize, scale: f
 }
 
 /// Apply H_k (transform each 128-row block, for every column): `W = H_k @ W`.
+/// Requires `rows` to be a multiple of 128; any tail block would be left
+/// untransformed. Load-time validation enforces this for quantized linears.
 pub(crate) fn hadamard_rows(w: &mut [f32], rows: usize, cols: usize) {
+    debug_assert!(
+        rows.is_multiple_of(128),
+        "hadamard_rows: rows={} is not a multiple of 128",
+        rows
+    );
     let scale = 1.0 / (128.0f32).sqrt();
     // Read a 128-element column slice into a stack buffer, transform it
     // contiguously, then write it back. The old strided butterfly touched 128
@@ -416,7 +432,14 @@ pub(crate) fn hadamard_rows(w: &mut [f32], rows: usize, cols: usize) {
 }
 
 /// Apply H_n (transform each 128-column block, for every row): `W = W @ H_n`.
+/// Requires `cols` to be a multiple of 128; any tail block would be left
+/// untransformed. Load-time validation enforces this for quantized linears.
 pub(crate) fn hadamard_cols(w: &mut [f32], rows: usize, cols: usize) {
+    debug_assert!(
+        cols.is_multiple_of(128),
+        "hadamard_cols: cols={} is not a multiple of 128",
+        cols
+    );
     let scale = 1.0 / (128.0f32).sqrt();
     for cb in 0..(cols / 128) {
         for i in 0..rows {
@@ -782,9 +805,22 @@ fn validate_tile_width(words_per_tile: usize) -> Result<(usize, bool), String> {
     Ok(bitrate_from_tile_width(words_per_tile))
 }
 
-/// Dequantize one EXL3 linear layer into a weight matrix of shape
-/// `(out_features, in_features)` — ready for `matmul_t` (`y = x @ W^T`).
-fn dequant_linear(shards: &Shards, prefix: &str) -> Result<(Matrix, Option<Vec<f32>>), String> {
+/// Layout and codebook metadata shared by every quantized-linear path.
+/// Parsed once at load time so malformed checkpoints are rejected identically
+/// by the full-dequant reference and by `QuantLinear::from_shards`.
+struct LinearLayout {
+    k: usize,
+    n: usize,
+    tiles_k: usize,
+    tiles_n: usize,
+    words_per_tile: usize,
+    k_bits_int: usize,
+    k_half: bool,
+    cb: Codebook,
+    expected_len: usize,
+}
+
+fn parse_linear_layout(shards: &Shards, prefix: &str) -> Result<LinearLayout, String> {
     let trellis_name = format!("{}.trellis", prefix);
     let shape = shards
         .shape(&trellis_name)
@@ -792,15 +828,19 @@ fn dequant_linear(shards: &Shards, prefix: &str) -> Result<(Matrix, Option<Vec<f
     if shape.len() != 3 {
         return Err(format!("{}: expected 3D shape", trellis_name));
     }
-    let tiles_k = shape[0];
-    let tiles_n = shape[1];
-    let words_per_tile = shape[2];
-    let k = tiles_k * 16;
-    let n = tiles_n * 16;
-
+    let (tiles_k, tiles_n, words_per_tile) = (shape[0], shape[1], shape[2]);
+    let k = tiles_k
+        .checked_mul(16)
+        .ok_or_else(|| format!("{}: trellis shape overflow", trellis_name))?;
+    let n = tiles_n
+        .checked_mul(16)
+        .ok_or_else(|| format!("{}: trellis shape overflow", trellis_name))?;
+    let expected_len = tiles_k
+        .checked_mul(tiles_n)
+        .and_then(|v| v.checked_mul(words_per_tile))
+        .ok_or_else(|| format!("{}: trellis shape overflow", trellis_name))?;
     // Bitrate from tile width (integer math only), with bounds validation.
     let (k_bits_int, k_half) = validate_tile_width(words_per_tile)?;
-
     // Codebook from marker presence.
     let cb = if shards.has(&format!("{}.mcg", prefix)) {
         Codebook::Mcg
@@ -812,46 +852,55 @@ fn dequant_linear(shards: &Shards, prefix: &str) -> Result<(Matrix, Option<Vec<f
     if k_half && cb != Codebook::Mul1 {
         return Err(format!("{}: half bitrate requires mul1 codebook", prefix));
     }
+    // The Hadamard transforms operate on whole 128-element blocks; a tail
+    // block would be silently left untransformed. The GPU fold checks this
+    // too, so enforce it at load time for the CPU path as well.
+    if k == 0 || n == 0 || !k.is_multiple_of(128) || !n.is_multiple_of(128) {
+        return Err(format!(
+            "{}: k={} and n={} must both be non-zero multiples of 128 (Hadamard blocks)",
+            prefix, k, n
+        ));
+    }
+    Ok(LinearLayout {
+        k,
+        n,
+        tiles_k,
+        tiles_n,
+        words_per_tile,
+        k_bits_int,
+        k_half,
+        cb,
+        expected_len,
+    })
+}
 
+/// Dequantize one EXL3 linear layer into a weight matrix of shape
+/// `(out_features, in_features)` — ready for `matmul_t` (`y = x @ W^T`).
+/// Ground-truth reference used only by unit tests; production multiplies
+/// directly against the packed trellis (or folds it on the GPU at load).
+#[cfg(test)]
+fn dequant_linear(shards: &Shards, prefix: &str) -> Result<(Matrix, Option<Vec<f32>>), String> {
+    let trellis_name = format!("{}.trellis", prefix);
+    let LinearLayout {
+        k,
+        n,
+        tiles_k,
+        tiles_n,
+        words_per_tile,
+        k_bits_int,
+        k_half,
+        cb,
+        expected_len,
+    } = parse_linear_layout(shards, prefix)?;
     let packed = shards
         .u16(&trellis_name)
         .ok_or_else(|| format!("{}: cannot read trellis", trellis_name))?;
-    let expected = tiles_k * tiles_n * words_per_tile;
-    if packed.len() < expected {
+    if packed.len() < expected_len {
         return Err(format!("{}: trellis too short", trellis_name));
     }
-
     // Sign vectors (suh / svh), with legacy packed su / sv fallback.
-    let suh = match shards.f32(&format!("{}.suh", prefix)) {
-        Some(v) => v,
-        None => {
-            let packed_su = shards
-                .u16(&format!("{}.su", prefix))
-                .ok_or_else(|| format!("{}: missing suh and su", prefix))?;
-            let mut v = Vec::with_capacity(packed_su.len() * 16);
-            for &w in &packed_su {
-                for j in 0..16 {
-                    v.push(if (w >> j) & 1 != 0 { -1.0 } else { 1.0 });
-                }
-            }
-            v
-        }
-    };
-    let svh = match shards.f32(&format!("{}.svh", prefix)) {
-        Some(v) => v,
-        None => {
-            let packed_sv = shards
-                .u16(&format!("{}.sv", prefix))
-                .ok_or_else(|| format!("{}: missing svh and sv", prefix))?;
-            let mut v = Vec::with_capacity(packed_sv.len() * 16);
-            for &w in &packed_sv {
-                for j in 0..16 {
-                    v.push(if (w >> j) & 1 != 0 { -1.0 } else { 1.0 });
-                }
-            }
-            v
-        }
-    };
+    let suh = read_signs(shards, prefix, "suh", "su", k)?;
+    let svh = read_signs(shards, prefix, "svh", "sv", n)?;
 
     // 1. Unpack tiles into W_hat (k, n) in the rotated basis.
     let mut wh = vec![0.0f32; k * n];
@@ -877,18 +926,8 @@ fn dequant_linear(shards: &Shards, prefix: &str) -> Result<(Matrix, Option<Vec<f
     // 2. H_k on rows: W1 = H_k @ W_hat.
     hadamard_rows(&mut wh, k, n);
 
-    if suh.len() < k || svh.len() < n {
-        return Err(format!(
-            "{}: sign vectors too short (suh={} need {}, svh={} need {})",
-            prefix,
-            suh.len(),
-            k,
-            svh.len(),
-            n
-        ));
-    }
-
     // 3. Input sign vector: W2[i,j] = W1[i,j] * suh[i].
+    // `read_signs` already guarantees len == k / len == n.
     for i in 0..k {
         let s = suh[i];
         for j in 0..n {
@@ -997,13 +1036,15 @@ pub struct QuantLinear {
     trellis: Option<Vec<u16>>,
     suh: Vec<f32>, // (k,)
     svh: Vec<f32>, // (n,)
-    /// Optional fp16 decode cache of W_hat in (k, n) row-major layout.
-    /// Codebook outputs are natively fp16, so this is lossless and costs
-    /// 2 bytes/weight (vs 4 for f32, 1 for packed). When present, matmul uses
-    /// a plain dot instead of decoding tiles on every token.
+    /// Optional fp16 decode cache of W_hat in (n, k) row-major layout (the
+    /// transpose of the unpacked (k, n) tile layout). Codebook outputs are
+    /// natively fp16, so this is lossless and costs 2 bytes/weight (vs 4 for
+    /// f32, 1 for packed). When present, matmul uses a plain dot instead of
+    /// decoding tiles on every token.
     what_f16: Option<Vec<u16>>,
-    /// Optional f32 decode cache of W_hat (k, n). 4 bytes/weight but enables a
-    /// direct f32 dot — fastest inference, matching the old full-dequant path.
+    /// Optional f32 decode cache of W_hat in (n, k) row-major layout.
+    /// 4 bytes/weight but enables a direct f32 dot — fastest inference,
+    /// matching the old full-dequant path.
     what_f32: Option<Vec<f32>>,
 }
 
@@ -1011,50 +1052,27 @@ impl QuantLinear {
     /// Load a quantized linear from shards, keeping the trellis packed.
     fn from_shards(shards: &Shards, prefix: &str) -> Result<Self, String> {
         let trellis_name = format!("{}.trellis", prefix);
-        let shape = shards
-            .shape(&trellis_name)
-            .ok_or_else(|| format!("missing {}", trellis_name))?;
-        if shape.len() != 3 {
-            return Err(format!("{}: expected 3D shape", trellis_name));
-        }
-        let (tiles_k, tiles_n, words_per_tile) = (shape[0], shape[1], shape[2]);
-        let (k_bits_int, k_half) = validate_tile_width(words_per_tile)?;
-        let cb = if shards.has(&format!("{}.mcg", prefix)) {
-            Codebook::Mcg
-        } else if shards.has(&format!("{}.mul1", prefix)) {
-            Codebook::Mul1
-        } else {
-            Codebook::ThreeInst
-        };
-        if k_half && cb != Codebook::Mul1 {
-            return Err(format!("{}: half bitrate requires mul1 codebook", prefix));
-        }
+        let LinearLayout {
+            k,
+            n,
+            tiles_k,
+            tiles_n,
+            words_per_tile,
+            k_bits_int,
+            k_half,
+            cb,
+            expected_len,
+        } = parse_linear_layout(shards, prefix)?;
         let mut trellis = shards
             .u16(&trellis_name)
             .ok_or_else(|| format!("{}: cannot read trellis", trellis_name))?;
-        let expected = tiles_k
-            .checked_mul(tiles_n)
-            .and_then(|v| v.checked_mul(words_per_tile))
-            .ok_or_else(|| format!("{}: trellis shape overflow", trellis_name))?;
-        if trellis.len() < expected {
+        if trellis.len() < expected_len {
             return Err(format!("{}: trellis too short", trellis_name));
         }
-        let suh = read_signs(shards, prefix, "suh", "su")?;
-        let svh = read_signs(shards, prefix, "svh", "sv")?;
-        let k = tiles_k * 16;
-        let n = tiles_n * 16;
-        if suh.len() < k || svh.len() < n {
-            return Err(format!(
-                "{}: sign vectors too short (suh={} need {}, svh={} need {})",
-                prefix,
-                suh.len(),
-                k,
-                svh.len(),
-                n
-            ));
-        }
+        let suh = read_signs(shards, prefix, "suh", "su", k)?;
+        let svh = read_signs(shards, prefix, "svh", "sv", n)?;
         // `shards.u16` already returned an owned buffer; avoid a full copy.
-        trellis.truncate(expected);
+        trellis.truncate(expected_len);
         Ok(QuantLinear {
             name: prefix.to_string(),
             k,
@@ -1073,7 +1091,7 @@ impl QuantLinear {
         })
     }
 
-    /// Decode all tiles once into an fp16 W_hat cache in (k, n) row-major
+    /// Decode all tiles once into an fp16 W_hat cache in (n, k) row-major
     /// layout. Lossless (codebook outputs are fp16) and 2 bytes/weight.
     /// The packed trellis is dropped afterwards to keep peak RAM low.
     pub fn build_decode_cache(&mut self) -> Result<(), String> {
@@ -1110,7 +1128,7 @@ impl QuantLinear {
         Ok(())
     }
 
-    /// Decode all tiles into an f32 W_hat cache (k, n) for the fastest matmul.
+    /// Decode all tiles into an f32 W_hat cache (n, k) for the fastest matmul.
     /// As above, the packed trellis is released once decoding is complete.
     pub fn build_decode_cache_f32(&mut self) -> Result<(), String> {
         if self.what_f32.is_some() {
@@ -1238,6 +1256,12 @@ impl QuantLinear {
     pub fn matmul(&self, x: &[f32], threads: usize) -> Vec<f32> {
         let k = self.k;
         let n = self.n;
+        debug_assert!(
+            k.is_multiple_of(128) && n.is_multiple_of(128),
+            "matmul: k={} n={} must be multiples of 128",
+            k,
+            n
+        );
         let scale = 1.0 / (128.0f32).sqrt();
 
         // 1. xr = H_k @ (x ⊙ suh), per 128-row block.
@@ -1347,10 +1371,19 @@ impl QuantLinear {
     }
 }
 
-/// Read a sign/scale vector, with legacy packed fallback.
-fn read_signs(shards: &Shards, prefix: &str, f16: &str, legacy: &str) -> Result<Vec<f32>, String> {
-    match shards.f32(&format!("{}.{}", prefix, f16)) {
-        Some(v) => Ok(v),
+/// Read a sign/scale vector, with legacy packed fallback. Both storage forms
+/// must yield exactly `expected_len` entries (k for suh, n for svh); padded or
+/// short vectors are malformed and are rejected here so CPU and GPU paths
+/// agree on one policy.
+fn read_signs(
+    shards: &Shards,
+    prefix: &str,
+    f16: &str,
+    legacy: &str,
+    expected_len: usize,
+) -> Result<Vec<f32>, String> {
+    let v = match shards.f32(&format!("{}.{}", prefix, f16)) {
+        Some(v) => v,
         None => {
             let packed = shards
                 .u16(&format!("{}.{}", prefix, legacy))
@@ -1361,9 +1394,19 @@ fn read_signs(shards: &Shards, prefix: &str, f16: &str, legacy: &str) -> Result<
                     v.push(if (w >> j) & 1 != 0 { -1.0 } else { 1.0 });
                 }
             }
-            Ok(v)
+            v
         }
+    };
+    if v.len() != expected_len {
+        return Err(format!(
+            "{}: {} has {} values, expected {}",
+            prefix,
+            f16,
+            v.len(),
+            expected_len
+        ));
     }
+    Ok(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,7 +1450,9 @@ pub struct Exl3Model {
     /// Plain (unquantized) 2-D tensors in `(out_features, in_features)` layout.
     pub weights: HashMap<String, Matrix>,
     /// Embedding tables stored as fp16 (2 bytes/weight), decoded per row on
-    /// lookup. Used only for untied models; tied lm_heads need f32 weights.
+    /// lookup. All plain embeddings live here (tied and untied); for tied
+    /// checkpoints the same table is the lm_head and `Model::linear` uses the
+    /// threaded `matmul_f16` on it instead of allocating an f32 matrix.
     pub embeddings_f16: HashMap<String, F16Matrix>,
     /// Quantized linears, kept packed. Matmul dequantizes on the fly.
     pub linears: HashMap<String, QuantLinear>,
@@ -1548,9 +1593,6 @@ impl Exl3Model {
             })
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // Kept for config diagnostics; embeddings are always fp16 now, and
-        // tied models use `matmul_f16` for lm_head instead of an f32 matrix.
-        let _tie_embeddings = tie_embeddings;
 
         // Plain (unquantized) tensors: embeddings, lm_head, 1-D vectors.
         for name in &all_names {
@@ -1620,11 +1662,12 @@ impl Exl3Model {
         }
 
         eprintln!(
-            "[load] Model loaded in {:.1}s ({} linears, {} matrices, {} vectors{})",
+            "[load] Model loaded in {:.1}s ({} linears, {} matrices, {} vectors, tie_word_embeddings={}{})",
             load_start.elapsed().as_secs_f64(),
             linears.len(),
             weights.len(),
             vectors.len(),
+            tie_embeddings,
             rss_mib()
                 .map(|m| format!(", rss={:.0} MiB", m))
                 .unwrap_or_default()
@@ -2273,6 +2316,69 @@ mod synthetic_tests {
     fn matmul_matches_dequant_mul1_half_bitrate() {
         // Half-integer K = 3.5 exercises the 0xAAAA mask ring layout.
         check(Codebook::Mul1, true);
+    }
+
+    /// A tail block smaller than 128 used to be silently left untransformed
+    /// by both Hadamard passes. Both load paths must reject it with the same
+    /// shared validation error instead of producing wrong logits.
+    #[test]
+    fn non_128_multiple_dims_are_rejected_on_every_path() {
+        for (tiles_k, tiles_n, bad_dim) in [(1usize, 8usize, 16usize), (8, 1, 16)] {
+            let mut shards = synthetic_shards(Codebook::Mcg, false);
+            shards.files[0]
+                .tensors
+                .get_mut("synthetic.trellis")
+                .unwrap()
+                .shape = vec![tiles_k, tiles_n, 128];
+            let err = QuantLinear::from_shards(&shards, "synthetic")
+                .err()
+                .expect("non-128-multiple dims must be rejected");
+            assert!(
+                err.contains("multiples of 128") && err.contains(&bad_dim.to_string()),
+                "unexpected error: {err}"
+            );
+            let err = dequant_linear(&shards, "synthetic")
+                .err()
+                .expect("dequant must share the same validation");
+            assert!(err.contains("multiples of 128"), "unexpected error: {err}");
+        }
+    }
+
+    /// Replace a sign vector with one of a different length (appended at the
+    /// end of the byte buffer so all other tensors keep their offsets).
+    fn with_sign_len(shards: &mut Shards, name: &str, len: usize) {
+        let sf = &mut shards.files[0];
+        let offset = sf.bytes.len();
+        sf.bytes.resize(offset + len * 2, 0);
+        let t = sf.tensors.get_mut(name).unwrap();
+        t.offset = offset;
+        t.len = len * 2;
+        t.shape = vec![len];
+    }
+
+    /// CPU load and GPU upload must agree: sign vectors are exactly k / n,
+    /// never padded and never short.
+    #[test]
+    fn sign_vectors_must_have_exact_length() {
+        let mut short = synthetic_shards(Codebook::Mcg, false);
+        with_sign_len(&mut short, "synthetic.suh", 127);
+        let err = QuantLinear::from_shards(&short, "synthetic")
+            .err()
+            .expect("short suh must be rejected");
+        assert!(
+            err.contains("suh has 127 values, expected 128"),
+            "unexpected error: {err}"
+        );
+
+        let mut padded = synthetic_shards(Codebook::Mcg, false);
+        with_sign_len(&mut padded, "synthetic.svh", 129);
+        let err = dequant_linear(&padded, "synthetic")
+            .err()
+            .expect("padded svh must be rejected");
+        assert!(
+            err.contains("svh has 129 values, expected 128"),
+            "unexpected error: {err}"
+        );
     }
 }
 

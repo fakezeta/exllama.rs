@@ -1049,8 +1049,7 @@ impl Model {
         let pos = self.position;
         let mut full_idx = 0usize;
         let mut linear_idx = 0usize;
-        for i in 0..num_layers {
-            let is_full = is_full_layers[i];
+        for (i, &is_full) in is_full_layers.iter().enumerate() {
             let attn = if is_full {
                 let y = self.forward_full_attn(i, &x, full_idx, pos)?;
                 full_idx += 1;

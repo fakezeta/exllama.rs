@@ -16,7 +16,7 @@ The JSON parser, HTTP server, tokenizer, regex engine, PRNG and EXL3 dequantizer
 
 ## Requirements
 
-- Rust 1.87+ (edition 2021; `rust-version` is declared in `Cargo.toml`). No external toolchain or Python runtime needed. Default build uses only pure-Rust crates (no system BLAS/GPU SDK). CI builds and tests on Linux (x86_64 + ARM64), macOS ARM64 and Windows x86_64 on every push/PR.
+- Rust 1.88+ (edition 2021; `rust-version` is declared in `Cargo.toml`). No external toolchain or Python runtime needed. Default build uses only pure-Rust crates (no system BLAS/GPU SDK). CI builds and tests on Linux (x86_64 + ARM64), macOS ARM64 and Windows x86_64 on every push/PR.
 - An EXL3-quantized Qwen3.5 model directory containing:
   - `config.json`
   - `model.safetensors` or sharded `model-*.safetensors` (+ `model.safetensors.index.json`)
