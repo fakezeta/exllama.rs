@@ -65,12 +65,16 @@ pub(crate) struct GpuWeights {
     cfg: GpuCfg,
     /// Plain matrices and fp16 embedding tables, both (out, in) F16.
     mats: HashMap<String, Tensor>,
-    /// Quantized linears: (folded `B = (H_n @ W_hat^T @ H_k)^T` (n,k) F16,
-    /// suh (k,) F32, svh (n,) F32). Both Hadamards are baked into `B` at load,
-    /// so a decode step is one GEMV instead of three.
-    qhat: HashMap<String, (Tensor, Tensor, Tensor)>,
+    /// Quantized linears: folded `B[i, j] = svh[i] * (H_n @ W_hat @ H_k)[i, j]
+    /// * suh[j]` (n,k) F16. Both Hadamards *and* both sign vectors are baked
+    /// into `B` at load, so a decode step is one GEMV with no pointwise scales.
+    qhat: HashMap<String, Tensor>,
     /// 1-D tensors (norms, conv weights, A_log, dt_bias), F32.
     vecs: HashMap<String, Tensor>,
+    /// `1 + w` for every `*norm.weight` vector, precomputed at load. RMSNorm
+    /// applies `(1 + w)` on every call, so baking it once removes a full
+    /// vocabulary/hidden-sized pointwise kernel per norm invocation.
+    norm1: HashMap<String, Tensor>,
     /// RoPE tables, (context, rope_half) F32.
     rope_cos: Tensor,
     rope_sin: Tensor,
@@ -164,14 +168,22 @@ impl GpuWeights {
         let mut qhat = HashMap::new();
         let mut qhat_bytes = 0usize;
         for (name, ql) in &ex.linears {
-            let (w, suh, svh) = ql.upload_device(device)?;
-            qhat_bytes += w.elem_count() * 2 + suh.elem_count() * 4 + svh.elem_count() * 4;
-            qhat.insert(name.clone(), (w, suh, svh));
+            let w = ql.upload_device(device)?;
+            qhat_bytes += w.elem_count() * 2;
+            qhat.insert(name.clone(), w);
         }
         let mut vecs = HashMap::new();
         for (name, v) in &ex.vectors {
             let t = Tensor::from_slice(v, (v.len(),), device).ce()?;
             vecs.insert(name.clone(), t);
+        }
+        // RMSNorm always multiplies by (1 + w); bake that once so the hot
+        // path does not launch a full-size affine kernel per call.
+        let mut norm1 = HashMap::new();
+        for (name, t) in &vecs {
+            if name.ends_with("norm.weight") {
+                norm1.insert(name.clone(), t.affine(1.0, 1.0).ce()?);
+            }
         }
         let rope_cos_t = Tensor::from_slice(rope_cos, (context_size, rope_half), device).ce()?;
         let rope_sin_t = Tensor::from_slice(rope_sin, (context_size, rope_half), device).ce()?;
@@ -215,6 +227,7 @@ impl GpuWeights {
             mats,
             qhat,
             vecs,
+            norm1,
             rope_cos: rope_cos_t,
             rope_sin: rope_sin_t,
             h128,
@@ -242,7 +255,7 @@ impl GpuWeights {
         self.candidates(name).iter().find_map(|k| self.mats.get(k))
     }
 
-    fn q(&self, name: &str) -> Option<&(Tensor, Tensor, Tensor)> {
+    fn q(&self, name: &str) -> Option<&Tensor> {
         self.candidates(name).iter().find_map(|k| self.qhat.get(k))
     }
 
@@ -252,6 +265,16 @@ impl GpuWeights {
             .get(&prefixed)
             .or_else(|| self.vecs.get(name))
             .ok_or_else(|| format!("missing vector tensor `{}`", name))
+    }
+
+    /// Precomputed `(1 + w)` for a norm vector. Falls back to computing it on
+    /// the fly if called with a name that was not loaded as a norm vector.
+    fn norm1(&self, name: &str) -> Result<Tensor, String> {
+        let prefixed = format!("{}{}", self.prefix, name);
+        if let Some(t) = self.norm1.get(&prefixed).or_else(|| self.norm1.get(name)) {
+            return Ok(t.clone());
+        }
+        self.vec(name)?.affine(1.0, 1.0).ce()
     }
 
     /// hadamard H128 applied independently to each 128-element block.
@@ -283,21 +306,11 @@ impl GpuWeights {
         y.to_dtype(DType::F32).ce()?.flatten_all().ce()
     }
 
-    /// One EXL3 quantized linear, entirely on device. Both Hadamards are
-    /// already folded into `w` at load time, so this is
-    /// `y = svh * (B @ (x * suh))` — a single GEMV.
-    fn q_matmul(&self, parts: &(Tensor, Tensor, Tensor), x: &Tensor) -> Result<Tensor, String> {
-        let (w, suh, svh) = parts;
-        if x.elem_count() != suh.elem_count() {
-            return Err(format!(
-                "quantized linear input has {} elements but suh has {}",
-                x.elem_count(),
-                suh.elem_count()
-            ));
-        }
-        let xr = x.mul(suh).ce()?;
-        let t = Self::matmul_w(w, &xr)?;
-        t.mul(svh).ce()
+    /// One EXL3 quantized linear, entirely on device. Both Hadamards and both
+    /// sign vectors are baked into `w` at load time, so this is a single GEMV
+    /// (`y = B @ x`) with no pointwise scaling kernels.
+    fn q_matmul(&self, w: &Tensor, x: &Tensor) -> Result<Tensor, String> {
+        Self::matmul_w(w, x)
     }
 
     /// Resolve the embedding table (shared by the token lookup and the tied
@@ -314,7 +327,7 @@ impl GpuWeights {
             return Self::matmul_w(w, x);
         }
         if let Some(q) = self.q(name) {
-            return self.q_matmul(q, x);
+            return Self::matmul_w(q, x);
         }
         // Tied checkpoints have no separate lm_head: the embedding table is
         // the output projection. Only try it after the plain and quantized
@@ -335,7 +348,16 @@ impl GpuWeights {
         row.to_dtype(DType::F32).ce()
     }
 
+    /// RMSNorm with a raw norm weight. Used by tests and non-standard callers;
+    /// the forward path calls `rms_norm_with` with a precomputed `(1 + w)`.
     fn rms_norm(&self, x: &Tensor, w: &Tensor) -> Result<Tensor, String> {
+        let w1 = w.affine(1.0, 1.0).ce()?;
+        self.rms_norm_with(x, &w1)
+    }
+
+    /// RMSNorm with `w1 = 1 + w` already computed (at load time in the forward
+    /// path). Saves a full-size affine kernel on every invocation.
+    fn rms_norm_with(&self, x: &Tensor, w1: &Tensor) -> Result<Tensor, String> {
         // Reduce over the *last* dim. For a 1-D `(hidden,)` vector that is the
         // whole vector; for the 2-D `(heads, head_dim)` q/k norms it must be
         // one scale *per head* — reducing over dim 0 instead would share a
@@ -347,27 +369,17 @@ impl GpuWeights {
         } else {
             x.elem_count()
         };
-        if w.elem_count() != expected_w {
+        if w1.elem_count() != expected_w {
             return Err(format!(
                 "RMSNorm weight has {} elements, expected {} (input rank {})",
-                w.elem_count(),
+                w1.elem_count(),
                 expected_w,
                 rank
             ));
         }
-        let ss = x.sqr().ce()?.mean_keepdim(rank - 1).ce()?;
-        let scale = ss
-            .affine(1.0, self.cfg.rms_norm_eps as f64)
-            .ce()?
-            .sqrt()
-            .ce()?
-            .recip()
-            .ce()?;
-        let w1 = w.affine(1.0, 1.0).ce()?;
-        // `w` is 1-D (head_dim,). `x` can be 1-D (hidden,) or 2-D
-        // (heads, head_dim) for q/k norms — candle's `.mul()` needs *exact*
-        // shapes, so use `.broadcast_mul()`.
-        x.broadcast_mul(&scale).ce()?.broadcast_mul(&w1).ce()
+        // Fused into one kernel on CUDA; the CPU implementation is numerically
+        // identical and doubles as the fallback if a kernel cannot be loaded.
+        crate::fused::rms_norm(x, w1, self.cfg.rms_norm_eps)
     }
 
     fn rope(
@@ -381,19 +393,20 @@ impl GpuWeights {
         if half == 0 || pos >= self.cfg.context_size {
             return Ok(x.clone());
         }
-        let x2 = x.reshape((heads, head_len)).ce()?;
-        let rotary = half * 2;
-        if head_len < rotary {
+        if head_len < half * 2 {
             return Err(format!(
                 "partial rotary dim {} exceeds head_dim {}",
-                rotary, head_len
+                half * 2,
+                head_len
             ));
         }
-        // Only the first `rotary` dims are rotated — the rest of each head is
-        // passed through unchanged (CPU `Model::apply_rope`). Dropping the tail
-        // silently would shrink q/k and break the KV cache write.
-        let a = x2.narrow(1, 0, half).ce()?;
-        let b = x2.narrow(1, half, half).ce()?;
+        if x.elem_count() != heads * head_len {
+            return Err(format!(
+                "RoPE input has {} elements, expected heads*head_dim={}",
+                x.elem_count(),
+                heads * head_len
+            ));
+        }
         // Tables are (context, rope_half) row-major: one *row* per position.
         let c = self
             .rope_cos
@@ -407,24 +420,9 @@ impl GpuWeights {
             .ce()?
             .reshape((1, half))
             .ce()?;
-        let na = a
-            .broadcast_mul(&c)
-            .ce()?
-            .sub(&b.broadcast_mul(&s).ce()?)
-            .ce()?;
-        let nb = b
-            .broadcast_mul(&c)
-            .ce()?
-            .add(&a.broadcast_mul(&s).ce()?)
-            .ce()?;
-        let rotated = Tensor::cat(&[na, nb], 1).ce()?;
-        let out = if head_len > rotary {
-            let tail = x2.narrow(1, rotary, head_len - rotary).ce()?;
-            Tensor::cat(&[rotated, tail], 1).ce()?
-        } else {
-            rotated
-        };
-        out.flatten_all().ce()
+        // Only the first `2*half` dims rotate; the tail passes through. Both
+        // paths are numerically identical, including that unrotated tail.
+        crate::fused::rope(x, &c, &s, heads, head_len, half)
     }
 
     fn is_full(&self, layer: usize) -> bool {
@@ -661,8 +659,10 @@ impl GpuRunner {
         let hd = cfg.head_dim;
         let nh = cfg.num_attention_heads;
         let nkv = cfg.num_key_value_heads;
-        let norm_w = w.vec(&format!("layers.{}.input_layernorm.weight", layer))?;
-        let xn = w.rms_norm(x, norm_w)?;
+        let xn = w.rms_norm_with(
+            x,
+            &w.norm1(&format!("layers.{}.input_layernorm.weight", layer))?,
+        )?;
         let qp = w.linear(&format!("layers.{}.self_attn.q_proj", layer), &xn)?;
         let kp = w.linear(&format!("layers.{}.self_attn.k_proj", layer), &xn)?;
         let vp = w.linear(&format!("layers.{}.self_attn.v_proj", layer), &xn)?;
@@ -697,14 +697,14 @@ impl GpuRunner {
             ));
         }
 
-        let qn_w = w.vec(&format!("layers.{}.self_attn.q_norm.weight", layer))?;
-        let kn_w = w.vec(&format!("layers.{}.self_attn.k_norm.weight", layer))?;
+        let qn_w = w.norm1(&format!("layers.{}.self_attn.q_norm.weight", layer))?;
+        let kn_w = w.norm1(&format!("layers.{}.self_attn.k_norm.weight", layer))?;
         let qn = w
-            .rms_norm(&q.reshape((nh, hd)).ce()?, qn_w)?
+            .rms_norm_with(&q.reshape((nh, hd)).ce()?, &qn_w)?
             .flatten_all()
             .ce()?;
         let kn = w
-            .rms_norm(&kp.reshape((nkv, hd)).ce()?, kn_w)?
+            .rms_norm_with(&kp.reshape((nkv, hd)).ce()?, &kn_w)?
             .flatten_all()
             .ce()?;
         let pos = self.state.position;
@@ -750,8 +750,10 @@ impl GpuRunner {
         let w = &self.weights;
         let cfg = &w.cfg;
         let eps = cfg.rms_norm_eps;
-        let norm_w = w.vec(&format!("layers.{}.input_layernorm.weight", layer))?;
-        let xn = w.rms_norm(x, norm_w)?;
+        let xn = w.rms_norm_with(
+            x,
+            &w.norm1(&format!("layers.{}.input_layernorm.weight", layer))?,
+        )?;
         let qkv = w.linear(&format!("layers.{}.linear_attn.in_proj_qkv", layer), &xn)?;
         let z = w.linear(&format!("layers.{}.linear_attn.in_proj_z", layer), &xn)?;
         let b = w.linear(&format!("layers.{}.linear_attn.in_proj_b", layer), &xn)?;
@@ -827,30 +829,12 @@ impl GpuRunner {
             ));
         }
         let ab = a.add(dtbias).ce()?;
-        // Stable softplus: max(x,0) + log(1 + exp(-|x|)).
-        let softplus = ab
-            .abs()
-            .ce()?
-            .neg()
-            .ce()?
-            .exp()
-            .ce()?
-            .affine(1.0, 1.0)
-            .ce()?
-            .log()
-            .ce()?
-            .add(&ab.clamp(0.0, f64::INFINITY).ce()?)
-            .ce()?;
-        let g = alog.exp().ce()?.neg().ce()?.mul(&softplus).ce()?;
-        let beta = b
-            .neg()
-            .ce()?
-            .exp()
-            .ce()?
-            .affine(1.0, 1.0)
-            .ce()?
-            .recip()
-            .ce()?;
+        // Stable softplus, `-exp(A_log)`, and the write-gate sigmoid are
+        // fused into one kernel that returns (g, beta) as rows of a 2 x nvh
+        // tensor; the narrows below are metadata-only.
+        let gates = crate::fused::deltanet_gates(&ab, &b, alog)?;
+        let g = gates.narrow(0, 0, 1).ce()?.reshape((nvh,)).ce()?;
+        let beta = gates.narrow(0, 1, 1).ce()?.reshape((nvh,)).ce()?;
 
         // Recurrent update for *all* value heads in one batched device op.
         // The old loop pulled `g[vh]`/`beta[vh]` to the host with `to_vec0()`
@@ -861,6 +845,8 @@ impl GpuRunner {
             deltanet_step_all(sstate, &q, &k, &v, &g, &beta, nkh, nvh, kd, vd)?;
         *sstate = new_state;
 
+        // Unlike the input/post/q/k norms, Qwen3's gated norm multiplies by
+        // the raw weight (`norm(o) * w * silu(z)`, w init ones) — not `(1 + w)`.
         let norm_w2 = w.vec(&format!("layers.{}.linear_attn.norm.weight", layer))?;
         if norm_w2.elem_count() != vd || z.elem_count() != nvh * vd {
             return Err(format!(
@@ -873,27 +859,10 @@ impl GpuRunner {
             ));
         }
         let o2 = o_all.reshape((nvh, vd)).ce()?;
-        let ss = o2.sqr().ce()?.sum_keepdim(1).ce()?;
-        let scale = ss
-            .affine(1.0 / vd as f64, 0.0)
-            .ce()?
-            .affine(1.0, eps as f64)
-            .ce()?
-            .sqrt()
-            .ce()?
-            .recip()
-            .ce()?;
         let nw = norm_w2.reshape((1, vd)).ce()?;
         let z2 = z.reshape((nvh, vd)).ce()?;
-        let o_norm = o2
-            .broadcast_mul(&scale)
-            .ce()?
-            // `nw` is (1, vd) and `z2` is (nvh, vd); `.mul()` requires exact
-            // shapes in candle, so broadcast both against (nvh, vd).
-            .broadcast_mul(&nw)
-            .ce()?
-            .broadcast_mul(&z2.silu().ce()?)
-            .ce()?
+        // One fused kernel: per-head RMS scale * nw * silu(z).
+        let o_norm = crate::fused::gated_norm(&o2, &nw, &z2, eps)?
             .flatten_all()
             .ce()?;
         let y = w.linear(&format!("layers.{}.linear_attn.out_proj", layer), &o_norm)?;
@@ -921,8 +890,10 @@ impl GpuRunner {
             };
             full_idx = next_full;
             x = x.add(&attn).ce()?;
-            let norm_w = w.vec(&format!("layers.{}.post_attention_layernorm.weight", i))?;
-            let xn = w.rms_norm(&x, norm_w)?;
+            let xn = w.rms_norm_with(
+                &x,
+                &w.norm1(&format!("layers.{}.post_attention_layernorm.weight", i))?,
+            )?;
             let gate = w.linear(&format!("layers.{}.mlp.gate_proj", i), &xn)?;
             let up = w.linear(&format!("layers.{}.mlp.up_proj", i), &xn)?;
             let act = gate.silu().ce()?.mul(&up).ce()?;
@@ -930,8 +901,7 @@ impl GpuRunner {
             x = x.add(&mlp).ce()?;
         }
         self.state.position += 1;
-        let final_w = w.vec("norm.weight")?;
-        let xf = w.rms_norm(&x, final_w)?;
+        let xf = w.rms_norm_with(&x, &w.norm1("norm.weight")?)?;
         let logits = w.linear("lm_head.weight", &xf)?;
         if logits.dim(0).ce()? != cfg.vocab_size {
             return Err(format!(
@@ -1024,6 +994,10 @@ impl GpuRunner {
             .copied()
             .filter(|(id, _)| (*id as usize) < vocab)
             .collect();
+        // Small device scalars reused by the top-n/top-k/top-p loops. Building
+        // them once saves one H2D copy per candidate/iteration.
+        let neg_inf = Tensor::from_slice(&[f32::NEG_INFINITY], (1,), dev).ce()?;
+        let neg_forty = Tensor::from_slice(&[-40.0f32], (1,), dev).ce()?;
 
         // ---- logit processors (mirrors server::prepare_logits) ----
         let need_penalty = (spec.repetition_penalty > 0.0 && spec.repetition_penalty != 1.0)
@@ -1102,13 +1076,7 @@ impl GpuRunner {
                     .reshape((1,))
                     .ce()?;
                 let val = masked.gather(&id, 0).ce()?;
-                masked = masked
-                    .scatter(
-                        &id,
-                        &Tensor::from_slice(&[f32::NEG_INFINITY], (1,), dev).ce()?,
-                        0,
-                    )
-                    .ce()?;
+                masked = masked.scatter(&id, &neg_inf, 0).ce()?;
                 top_ids.push(id);
                 top_vals.push(val);
             }
@@ -1127,12 +1095,12 @@ impl GpuRunner {
             // retained candidate costs a full vocab-sized device tensor here.
             let top_k = spec.top_k.min(vocab).min(1024);
             let top_k_on = top_k >= 1;
-            let mut sel = if top_k_on {
-                Tensor::zeros((vocab,), DType::F32, dev).ce()?
-            } else {
-                Tensor::ones((vocab,), DType::F32, dev).ce()?
-            };
+            // `None` means "every token is a candidate" — the default path
+            // (top_k=0, top_p=1) skips both the `ones` allocation and the
+            // `w * sel` kernel entirely.
+            let mut sel: Option<Tensor> = None;
             if top_k_on {
+                let mut s = Tensor::zeros((vocab,), DType::F32, dev).ce()?;
                 let mut masked = scores.clone();
                 let mut ids = Vec::with_capacity(top_k);
                 for _ in 0..top_k {
@@ -1144,18 +1112,13 @@ impl GpuRunner {
                         .reshape((1,))
                         .ce()?;
                     ids.push(id.clone());
-                    masked = masked
-                        .scatter(
-                            &id,
-                            &Tensor::from_slice(&[f32::NEG_INFINITY], (1,), dev).ce()?,
-                            0,
-                        )
-                        .ce()?;
+                    masked = masked.scatter(&id, &neg_inf, 0).ce()?;
                 }
                 let idx = Tensor::cat(&ids, 0).ce()?;
-                sel = sel
+                s = s
                     .scatter(&idx, &Tensor::ones((top_k,), DType::F32, dev).ce()?, 0)
                     .ce()?;
+                sel = Some(s);
             }
             if spec.top_p > 0.0 && spec.top_p < 1.0 {
                 // Nucleus = smallest set of highest-logit tokens whose mass is
@@ -1164,16 +1127,18 @@ impl GpuRunner {
                 // uses, without needing a sort (candle 0.11 has no topk/sort).
                 // Mass is measured over the candidates already kept by top-k,
                 // matching the host sampler's top-k then top-p order.
+                if sel.is_none() {
+                    sel = Some(Tensor::ones((vocab,), DType::F32, dev).ce()?);
+                }
+                let sel = sel.as_mut().unwrap();
                 let target = w
-                    .broadcast_mul(&sel)
+                    .broadcast_mul(sel)
                     .ce()?
                     .sum(0)
                     .ce()?
                     .affine(spec.top_p as f64, 0.0)
                     .ce()?;
-                let mut lo = smax
-                    .broadcast_add(&Tensor::from_slice(&[-40.0f32], (1,), dev).ce()?)
-                    .ce()?;
+                let mut lo = smax.broadcast_add(&neg_forty).ce()?;
                 let mut hi = smax.clone();
                 for _ in 0..32 {
                     let mid = lo.broadcast_add(&hi).ce()?.affine(0.5, 0.0).ce()?;
@@ -1185,7 +1150,7 @@ impl GpuRunner {
                     let mass = w
                         .broadcast_mul(&sel_mid)
                         .ce()?
-                        .broadcast_mul(&sel)
+                        .broadcast_mul(sel)
                         .ce()?
                         .sum(0)
                         .ce()?;
@@ -1207,9 +1172,12 @@ impl GpuRunner {
                     .ce()?
                     .to_dtype(DType::F32)
                     .ce()?;
-                sel = sel.broadcast_mul(&nucleus).ce()?;
+                *sel = sel.broadcast_mul(&nucleus).ce()?;
             }
-            let ws = w.broadcast_mul(&sel).ce()?;
+            let ws = match sel {
+                Some(s) => w.broadcast_mul(&s).ce()?,
+                None => w,
+            };
             // Candle 0.11 implements `cumsum` as a matmul against an
             // upper-triangular (n, n) matrix. With vocab=248320 that single
             // temporary is ~246 GB — an instant CUDA OOM on the first sample.
@@ -1329,26 +1297,15 @@ fn gqa_attention(
     let qg = q.reshape((nkv, groups, hd)).ce()?;
     let gate2 = gate.reshape((nkv, groups, hd)).ce()?;
     // scores[kh, t, g] = sum_d kmat[kh, t, d] * qg[kh, g, d]
-    let scores = matmul_c(&kmat.permute((1, 0, 2)).ce()?, &qg.transpose(1, 2).ce()?)?
-        .affine(scale as f64, 0.0)
-        .ce()?;
-    let m = scores.max_keepdim(1).ce()?;
-    let e = scores.broadcast_sub(&m).ce()?.exp().ce()?;
-    let probs = e.broadcast_div(&e.sum_keepdim(1).ce()?).ce()?;
+    let scores = matmul_c(&kmat.permute((1, 0, 2)).ce()?, &qg.transpose(1, 2).ce()?)?;
+    // Scaling and stable softmax are fused into one kernel.
+    let probs = crate::fused::softmax(&scores, scale)?;
     // out[kh, g, d] = sum_t probs[kh, t, g] * vmat[kh, t, d]
     let out = matmul_c(&vmat.permute((1, 2, 0)).ce()?, &probs)?
         .transpose(1, 2)
         .ce()?;
-    let sig = gate2
-        .neg()
-        .ce()?
-        .exp()
-        .ce()?
-        .affine(1.0, 1.0)
-        .ce()?
-        .recip()
-        .ce()?;
-    out.mul(&sig).ce()?.flatten_all().ce()
+    // `sigmoid(-gate)` applied to the attention output in one kernel.
+    crate::fused::sigmoid_gate(&out, &gate2)?.flatten_all().ce()
 }
 
 /// One Gated DeltaNet recurrence step, entirely on device.
@@ -1546,6 +1503,7 @@ mod tests {
             mats: HashMap::new(),
             qhat: HashMap::new(),
             vecs: HashMap::new(),
+            norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
             rope_sin: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
             h128: Tensor::zeros((128, 128), DType::F32, &dev).unwrap(),
@@ -1595,6 +1553,7 @@ mod tests {
             mats: HashMap::new(),
             qhat: HashMap::new(),
             vecs: HashMap::new(),
+            norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
             rope_sin: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
             h128: Tensor::zeros((128, 128), DType::F32, &dev).unwrap(),
@@ -1647,6 +1606,7 @@ mod tests {
             mats: HashMap::new(),
             qhat: HashMap::new(),
             vecs: HashMap::new(),
+            norm1: HashMap::new(),
             // pos 0: cos=0.8, sin=0.6 for both rotary pairs.
             rope_cos: Tensor::from_slice(&[0.8f32, 0.8, 0.8, 0.8], (2, half), &dev).unwrap(),
             rope_sin: Tensor::from_slice(&[0.6f32, 0.6, 0.6, 0.6], (2, half), &dev).unwrap(),
@@ -1971,6 +1931,7 @@ mod tests {
             mats,
             qhat: HashMap::new(),
             vecs,
+            norm1: HashMap::new(),
             rope_cos: tiny_f32_mat(&dev, 4, 1),
             rope_sin: tiny_f32_mat(&dev, 4, 1),
             h128: Tensor::zeros((128, 128), DType::F32, &dev).unwrap(),
@@ -2127,6 +2088,7 @@ mod tests {
             mats: HashMap::new(),
             qhat: HashMap::new(),
             vecs: HashMap::new(),
+            norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
             rope_sin: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
             h128: {
@@ -2144,12 +2106,18 @@ mod tests {
                 Tensor::from_slice(&h, (128, 128), &dev).unwrap()
             },
         };
-        // q_matmul now consumes the load-time-folded weight.
-        let folded = (
-            fold_hadamards(&parts.0, &gw.h128).unwrap(),
-            parts.1.clone(),
-            parts.2.clone(),
-        );
+        // q_matmul consumes one weight with the Hadamards and sign vectors
+        // folded in. Build it from the device-side fold reference here.
+        let folded = fold_hadamards(&parts.0, &gw.h128)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .broadcast_mul(&parts.1.reshape((1, k)).unwrap())
+            .unwrap()
+            .broadcast_mul(&parts.2.reshape((n, 1)).unwrap())
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
         let got = gw.q_matmul(&folded, &xt).unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(got.len(), n);
         assert!(got.iter().all(|v| v.is_finite()));
@@ -2206,6 +2174,7 @@ mod tests {
             mats: HashMap::new(),
             qhat: HashMap::new(),
             vecs: HashMap::new(),
+            norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
             rope_sin: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
             h128: h128.clone(),
@@ -2222,20 +2191,23 @@ mod tests {
         let expected = t.mul(&svh).unwrap().to_vec1::<f32>().unwrap();
 
         // New decode path: one GEMV. Test both the device-side reference fold
-        // and the host fold used by `upload_device` in production.
-        let folded = (fold_hadamards(&w, &h128).unwrap(), suh.clone(), svh.clone());
-        let got = gw.q_matmul(&folded, &xt).unwrap().to_vec1::<f32>().unwrap();
-        let host_bits = crate::exl3::fold_hadamards_host(&wf, n, k).unwrap();
-        let host_parts = (
-            Tensor::from_slice(&host_bits, (n, k), &dev).unwrap(),
-            suh.clone(),
-            svh.clone(),
-        );
-        let host_got = gw
-            .q_matmul(&host_parts, &xt)
+        // and the host fold used by `upload_device` in production. Both bake
+        // the sign vectors into the f16 weight, so only one f16 rounding is
+        // added relative to the old path.
+        let folded = fold_hadamards(&w, &h128)
             .unwrap()
-            .to_vec1::<f32>()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .broadcast_mul(&suh.reshape((1, k)).unwrap())
+            .unwrap()
+            .broadcast_mul(&svh.reshape((n, 1)).unwrap())
+            .unwrap()
+            .to_dtype(DType::F16)
             .unwrap();
+        let got = gw.q_matmul(&folded, &xt).unwrap().to_vec1::<f32>().unwrap();
+        let host_bits = crate::exl3::fold_hadamards_host(&wf, n, k, &su, &sv).unwrap();
+        let host_w = Tensor::from_slice(&host_bits, (n, k), &dev).unwrap();
+        let host_got = gw.q_matmul(&host_w, &xt).unwrap().to_vec1::<f32>().unwrap();
         // Observed max error ~0.3% of the largest logit (extra fp16 roundings
         // from baking the Hadamards into the weight).
         let scale = got.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
@@ -2341,11 +2313,16 @@ mod tests {
             }
         }
         let h128 = Tensor::from_slice(&h, (128, 128), &dev).unwrap();
-        let folded = (
-            fold_hadamards(&parts.0, &h128).unwrap(),
-            parts.1.clone(),
-            parts.2.clone(),
-        );
+        let folded = fold_hadamards(&parts.0, &h128)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .broadcast_mul(&parts.1.reshape((1, k)).unwrap())
+            .unwrap()
+            .broadcast_mul(&parts.2.reshape((n, 1)).unwrap())
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
         qhat.insert("lm_head".to_string(), folded.clone());
         let gw = GpuWeights {
             device: dev.clone(),
@@ -2354,6 +2331,7 @@ mod tests {
             mats,
             qhat,
             vecs: HashMap::new(),
+            norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
             rope_sin: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
             h128,
@@ -2436,6 +2414,7 @@ mod tests {
             mats: HashMap::new(),
             qhat: HashMap::new(),
             vecs: HashMap::new(),
+            norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
             rope_sin: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
             h128: Tensor::zeros((128, 128), DType::F32, &dev).unwrap(),
@@ -2699,6 +2678,7 @@ mod tests {
             mats,
             qhat: HashMap::new(),
             vecs,
+            norm1: HashMap::new(),
             rope_cos: Tensor::zeros((8, 1), DType::F32, &dev).unwrap(),
             rope_sin: Tensor::zeros((8, 1), DType::F32, &dev).unwrap(),
             h128: Tensor::zeros((128, 128), DType::F32, &dev).unwrap(),

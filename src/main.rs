@@ -9,6 +9,8 @@
 mod chat;
 mod compute;
 mod exl3;
+#[cfg(feature = "gpu")]
+mod fused;
 #[cfg(test)]
 mod fuzz;
 #[cfg(feature = "gpu")]

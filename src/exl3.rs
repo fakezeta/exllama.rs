@@ -457,16 +457,24 @@ pub(crate) fn hadamard_cols(w: &mut [f32], rows: usize, cols: usize) {
     }
 }
 
-/// Fold both 128-block Hadamards into a W_hat `(n, k)` **on the host**, before
-/// the tensor is uploaded. Doing it here instead of with device matmuls keeps
-/// the GPU free of full-size intermediates: a 248320x1024 lm_head is ~508 MB
-/// in fp16, and the device fold needed several such buffers at once, which
-/// OOM'd on cards that already had ~3 GB in use by other processes.
+/// Fold both 128-block Hadamards and the input/output sign vectors into a
+/// W_hat `(n, k)` **on the host**, before the tensor is uploaded. Doing it here
+/// instead of with device matmuls keeps the GPU free of full-size intermediates:
+/// a 248320x1024 lm_head is ~508 MB in fp16, and the device fold needed several
+/// such buffers at once, which OOM'd on cards that already had ~3 GB in use by
+/// other processes.
+///
+/// `B[i, j] = svh[i] * (H_n @ W_hat @ H_k)[i, j] * suh[j]`, so a decode step
+/// is a single `y = B @ x` GEMV with no pointwise scales on device. The scales
+/// are applied in f32 *before* the one final f16 rounding, keeping precision
+/// comparable to the old `svh * (B @ (x * suh))` path.
 #[cfg(feature = "gpu")]
 pub(crate) fn fold_hadamards_host(
     w: &[half::f16],
     n: usize,
     k: usize,
+    suh: &[f32],
+    svh: &[f32],
 ) -> Result<Vec<half::f16>, String> {
     if w.len() != n * k || n == 0 || k == 0 || !n.is_multiple_of(128) || !k.is_multiple_of(128) {
         return Err(format!(
@@ -476,11 +484,29 @@ pub(crate) fn fold_hadamards_host(
             w.len()
         ));
     }
+    if suh.len() != k || svh.len() != n {
+        return Err(format!(
+            "sign vectors have lengths suh={} (want k={}), svh={} (want n={})",
+            suh.len(),
+            k,
+            svh.len(),
+            n
+        ));
+    }
     // `hadamard_rows` applies H to each 128-row block: H_n @ W (rows are n).
     // `hadamard_cols` applies H to each 128-column block: (H_n @ W) @ H_k.
     let mut f: Vec<f32> = w.iter().map(|v| v.to_f32()).collect();
     hadamard_rows(&mut f, n, k);
     hadamard_cols(&mut f, n, k);
+    for i in 0..n {
+        let row_scale = svh[i];
+        for v in &mut f[i * k..(i + 1) * k] {
+            *v *= row_scale;
+        }
+        for (v, &s) in f[i * k..(i + 1) * k].iter_mut().zip(suh) {
+            *v *= s;
+        }
+    }
     Ok(f.into_iter().map(half::f16::from_f32).collect())
 }
 
@@ -1241,24 +1267,17 @@ impl QuantLinear {
         Ok(())
     }
 
-    /// Decode this linear's trellis, fold both Hadamards into W_hat on the
-    /// host, and upload the folded matrix as fp16. Used by the device-resident
-    /// GPU forward: the trellis is decoded once at load and never crosses the
-    /// bus again, and no full-size temporary weights are allocated on device.
-    /// Returns (folded W_hat `B = H_n @ W_hat @ H_k` (n,k) F16, suh (k,) F32,
-    /// svh (n,) F32).
+    /// Decode this linear's trellis, fold both Hadamards and the sign vectors
+    /// into W_hat on the host, and upload the single (n, k) fp16 matrix. Used by
+    /// the device-resident GPU forward: the trellis is decoded once at load and
+    /// never crosses the bus again, and no full-size temporary weights are
+    /// allocated on device. Returns `B[i, j] = svh[i] * (H_n @ W_hat @ H_k)[i, j]
+    /// * suh[j]` so a decode step is one `y = B @ x` GEMV.
     #[cfg(feature = "gpu")]
     pub(crate) fn upload_device(
         &self,
         device: &candle_core::Device,
-    ) -> Result<
-        (
-            candle_core::Tensor,
-            candle_core::Tensor,
-            candle_core::Tensor,
-        ),
-        String,
-    > {
+    ) -> Result<candle_core::Tensor, String> {
         use candle_core::Tensor;
         use half::f16;
         let trellis = self
@@ -1285,22 +1304,6 @@ impl QuantLinear {
                 }
             }
         }
-        // Fold both Hadamards on the host, before upload. The device only
-        // ever allocates the final (n, k) tensor; doing this with device
-        // matmuls needed several full-size buffers and OOM'd on large
-        // linears (notably the vocab-sized lm_head).
-        let bits = fold_hadamards_host(&bits, self.n, self.k)
-            .map_err(|e| format!("{}: {}", self.name, e))?;
-        let w = Tensor::from_slice(&bits, (self.n, self.k), device).map_err(|e| {
-            format!(
-                "{}: upload folded W_hat ({}x{}, {} values): {}",
-                self.name,
-                self.n,
-                self.k,
-                bits.len(),
-                e
-            )
-        })?;
         if self.suh.len() != self.k {
             return Err(format!(
                 "{}: suh has {} values, expected k={}",
@@ -1317,11 +1320,24 @@ impl QuantLinear {
                 self.n
             ));
         }
-        let suh = Tensor::from_slice(&self.suh, (self.k,), device)
-            .map_err(|e| format!("{}: upload suh: {}", self.name, e))?;
-        let svh = Tensor::from_slice(&self.svh, (self.n,), device)
-            .map_err(|e| format!("{}: upload svh: {}", self.name, e))?;
-        Ok((w, suh, svh))
+        // Fold both Hadamards *and* the sign vectors on the host, before upload.
+        // The device only ever allocates the final (n, k) tensor; doing this
+        // with device matmuls needed several full-size buffers and OOM'd on
+        // large linears (notably the vocab-sized lm_head). Baking the signs
+        // here also removes two pointwise kernels per linear per decode step.
+        let bits = fold_hadamards_host(&bits, self.n, self.k, &self.suh, &self.svh)
+            .map_err(|e| format!("{}: {}", self.name, e))?;
+        let w = Tensor::from_slice(&bits, (self.n, self.k), device).map_err(|e| {
+            format!(
+                "{}: upload folded W_hat ({}x{}, {} values): {}",
+                self.name,
+                self.n,
+                self.k,
+                bits.len(),
+                e
+            )
+        })?;
+        Ok(w)
     }
 
     /// Compute `y = W @ x` where W is the dequantized (n, k) weight, directly
