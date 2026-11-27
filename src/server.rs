@@ -3765,7 +3765,7 @@ mod tests {
             compute,
             backend.name()
         );
-        let model = crate::model::Model::load(&dir, 4096, threads, &weight_mode).unwrap();
+        let model = crate::model::Model::load(&dir, 4096, threads, &weight_mode, "f16").unwrap();
         let tok_path = std::path::Path::new(&dir).join("tokenizer.json");
         let tokenizer = Tokenizer::load(&tok_path.to_string_lossy()).unwrap();
         let engine = Engine::new(model, tokenizer, "bench".into(), 32, threads, true);
@@ -3833,7 +3833,7 @@ mod tests {
             compute,
             backend.name()
         );
-        let model = crate::model::Model::load(&dir, 4096, threads, &weight_mode).unwrap();
+        let model = crate::model::Model::load(&dir, 4096, threads, &weight_mode, "f16").unwrap();
         let tok_path = std::path::Path::new(&dir).join("tokenizer.json");
         let tokenizer = Tokenizer::load(&tok_path.to_string_lossy()).unwrap();
         let engine = Engine::new(model, tokenizer, "bench".into(), 32, threads, false);

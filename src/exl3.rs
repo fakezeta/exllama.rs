@@ -155,11 +155,22 @@ fn decode_mul1(idx: u16) -> u16 {
     half_fma(h, 0x1eee, 0xc931)
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Codebook {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Codebook {
     ThreeInst,
     Mcg,
     Mul1,
+}
+
+#[cfg(feature = "gpu")]
+impl Codebook {
+    pub(crate) fn id(self) -> usize {
+        match self {
+            Codebook::ThreeInst => 0,
+            Codebook::Mcg => 1,
+            Codebook::Mul1 => 2,
+        }
+    }
 }
 
 #[inline]
@@ -508,6 +519,172 @@ pub(crate) fn fold_hadamards_host(
         }
     }
     Ok(f.into_iter().map(half::f16::from_f32).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Packed weights for the device-resident forward (feature `gpu`)
+// ---------------------------------------------------------------------------
+
+/// Layout metadata a device kernel needs to walk a packed trellis. All bitrate
+/// variants (integer and half-integer K) are described by these fields.
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PackedLayout {
+    pub k: usize,
+    pub n: usize,
+    pub tiles_k: usize,
+    pub tiles_n: usize,
+    pub words_per_tile: usize,
+    pub k_bits_int: usize,
+    pub k_half: bool,
+}
+
+/// The packed trellis and scale vectors, ready to be uploaded as-is. No decode
+/// or requantization has been applied to the weights.
+#[cfg(feature = "gpu")]
+pub(crate) struct PackedUpload {
+    pub name: String,
+    pub layout: PackedLayout,
+    pub codebook: Codebook,
+    /// u32 words built from pairs of on-disk u16 trellis words exactly as in
+    /// `unpack_tile_impl` (high half = second u16).
+    pub words: Vec<u32>,
+    pub suh: Vec<f32>,
+    pub svh: Vec<f32>,
+}
+
+/// Exact f32 decode table for a codebook. This is a *decode* table, not a
+/// requantization: entry `i` is the f32 value of the fp16 codebook output for
+/// index `i`.
+#[cfg(feature = "gpu")]
+pub(crate) fn codebook_lut_f32(cb: Codebook) -> Vec<f32> {
+    (0..=u16::MAX).map(|i| decode_f32(i, cb)).collect()
+}
+
+#[cfg(feature = "gpu")]
+impl QuantLinear {
+    /// Hand the packed trellis to the device path without decoding it.
+    pub(crate) fn packed_upload(&self) -> Result<PackedUpload, String> {
+        let trellis = self
+            .trellis
+            .as_ref()
+            .ok_or_else(|| format!("{}: trellis already consumed", self.name))?;
+        if self.suh.len() != self.k || self.svh.len() != self.n {
+            return Err(format!(
+                "{}: sign vectors have lengths suh={} (want {}), svh={} (want {})",
+                self.name,
+                self.suh.len(),
+                self.k,
+                self.svh.len(),
+                self.n
+            ));
+        }
+        if !self.words_per_tile.is_multiple_of(2) {
+            return Err(format!(
+                "{}: odd trellis width {}",
+                self.name, self.words_per_tile
+            ));
+        }
+        let words = trellis
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| ((p[1] as u32) << 16) | p[0] as u32)
+            .collect();
+        Ok(PackedUpload {
+            name: self.name.clone(),
+            layout: PackedLayout {
+                k: self.k,
+                n: self.n,
+                tiles_k: self.tiles_k,
+                tiles_n: self.tiles_n,
+                words_per_tile: self.words_per_tile,
+                k_bits_int: self.k_bits_int,
+                k_half: self.k_half,
+            },
+            codebook: self.cb,
+            words,
+            suh: self.suh.clone(),
+            svh: self.svh.clone(),
+        })
+    }
+
+    /// Reference implementation of the device dequant-dot kernel: computes
+    /// `t = W_hat^T @ xr` straight from the packed trellis. Used as the exact
+    /// CPU fallback for the custom op and as a test oracle.
+    pub(crate) fn packed_dot_host(
+        &self,
+        words: &[u32],
+        lut: &[f32],
+        xr: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        let layout = PackedLayout {
+            k: self.k,
+            n: self.n,
+            tiles_k: self.tiles_k,
+            tiles_n: self.tiles_n,
+            words_per_tile: self.words_per_tile,
+            k_bits_int: self.k_bits_int,
+            k_half: self.k_half,
+        };
+        packed_dot_host_impl(words, layout, lut, xr)
+    }
+}
+
+/// Shared host implementation for `QuantLinear::packed_dot_host` and the
+/// CPU fallback of the device custom op.
+#[cfg(feature = "gpu")]
+pub(crate) fn packed_dot_host_impl(
+    words: &[u32],
+    layout: PackedLayout,
+    lut: &[f32],
+    xr: &[f32],
+) -> Result<Vec<f32>, String> {
+    let nw = layout.words_per_tile / 2;
+    if lut.len() != 65536 {
+        return Err(format!(
+            "codebook LUT has {} entries, want 65536",
+            lut.len()
+        ));
+    }
+    if xr.len() != layout.k {
+        return Err(format!(
+            "packed dot input has {} values, expected k={}",
+            xr.len(),
+            layout.k
+        ));
+    }
+    if words.len() != layout.tiles_k * layout.tiles_n * nw {
+        return Err(format!(
+            "packed trellis has {} words, expected {}",
+            words.len(),
+            layout.tiles_k * layout.tiles_n * nw
+        ));
+    }
+    let mut t = vec![0.0f32; layout.n];
+    let perm = tile_perm_table();
+    for tk in 0..layout.tiles_k {
+        for tn in 0..layout.tiles_n {
+            let base = (tk * layout.tiles_n + tn) * nw;
+            let tile = &words[base..base + nw];
+            for (i, &dst) in perm.iter().enumerate() {
+                let end = if !layout.k_half {
+                    ((i + 1) * layout.k_bits_int) as i64
+                } else {
+                    let g = i >> 4;
+                    let q = i & 15;
+                    let bpb = (16 * layout.k_bits_int + 8) as i64;
+                    g as i64 * bpb + (q * layout.k_bits_int) as i64 + q.div_ceil(2) as i64
+                };
+                let idx = window(tile, nw, end - 16);
+                let v = lut[idx as usize];
+                let r = dst >> 4;
+                let c = dst & 15;
+                t[tn * 16 + c] += v * xr[tk * 16 + r];
+            }
+        }
+    }
+    Ok(t)
 }
 
 // ---------------------------------------------------------------------------
@@ -2412,6 +2589,82 @@ mod synthetic_tests {
         let mut qh = QuantLinear::from_shards(&shards, "synthetic").unwrap();
         qh.build_decode_cache().unwrap();
         assert_close("f16 cache", &qh.matmul(&x, 1), &expect);
+    }
+
+    /// The device packed path (host reference and the CPU fallback of the
+    /// custom op) must reproduce the reconstruct-then-matmul reference.
+    #[cfg(feature = "gpu")]
+    fn check_packed(cb: Codebook, half: bool) {
+        let shards = synthetic_shards(cb, half);
+        let (w, _) = dequant_linear(&shards, "synthetic").unwrap();
+        let ql = QuantLinear::from_shards(&shards, "synthetic").unwrap();
+        let up = ql.packed_upload().unwrap();
+        let lut = codebook_lut_f32(up.codebook);
+        let x: Vec<f32> = (0..ql.k)
+            .map(|i| ((i % 17) as f32) * 0.031 - 0.25)
+            .collect();
+        let expect: Vec<f32> = (0..w.rows).map(|j| dot(w.row(j), &x)).collect();
+
+        let scale = 1.0 / (128.0f32).sqrt();
+        let mut xr = vec![0.0f32; ql.k];
+        for (i, (&xi, &s)) in x.iter().zip(ql.suh.iter()).enumerate() {
+            xr[i] = xi * s;
+        }
+        for blk in 0..(ql.k / 128) {
+            hadamard128(&mut xr, blk * 128, 1, scale);
+        }
+        let t = packed_dot_host_impl(&up.words, up.layout, &lut, &xr).unwrap();
+        let mut y = t.clone();
+        for blk in 0..(ql.n / 128) {
+            hadamard128(&mut y, blk * 128, 1, scale);
+        }
+        for (v, &s) in y.iter_mut().zip(ql.svh.iter()) {
+            *v *= s;
+        }
+        assert_close("packed device math", &y, &expect);
+
+        let dev = candle_core::Device::Cpu;
+        let tt = candle_core::Tensor::from_slice(
+            &up.words,
+            (
+                up.layout.tiles_k,
+                up.layout.tiles_n,
+                up.layout.words_per_tile / 2,
+            ),
+            &dev,
+        )
+        .unwrap();
+        let xt = candle_core::Tensor::from_slice(&xr, (ql.k,), &dev).unwrap();
+        let lt = candle_core::Tensor::from_slice(&lut, (65536,), &dev).unwrap();
+        let got = crate::fused::packed_dot(&tt, &xt, &lt, up.layout)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_close("fused CPU packed dot", &got, &t);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn packed_device_math_matches_dequant_3inst() {
+        check_packed(Codebook::ThreeInst, false);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn packed_device_math_matches_dequant_mcg() {
+        check_packed(Codebook::Mcg, false);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn packed_device_math_matches_dequant_mul1() {
+        check_packed(Codebook::Mul1, false);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn packed_device_math_matches_dequant_mul1_half_bitrate() {
+        check_packed(Codebook::Mul1, true);
     }
 
     /// A dirty, oversized reusable scratch buffer must produce exactly the

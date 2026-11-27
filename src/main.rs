@@ -44,6 +44,9 @@ struct Cli {
     /// Weight storage mode: "f32" (fast, ~4x disk), "f16" (fast-ish, ~2x),
     /// or "packed" (lowest RAM, on-the-fly decode, slow).
     weight_mode: String,
+    /// GPU device weight representation: "f16" (folded cache) or "packed"
+    /// (use the on-disk EXL3 trellis verbatim).
+    gpu_weight_mode: String,
     /// Compute backend: "auto" (best available), "blas", "gpu", "scalar".
     compute: String,
     /// Number of independent decoding instances sharing the loaded weights.
@@ -67,6 +70,7 @@ fn print_usage() {
                --threads <N>         Worker threads for matmul (default: all CPUs)\n\
                --name <NAME>         Model name exposed by the API\n\
                --weight-mode <MODE>  f32 (fast, default) | f16 | packed (lowest RAM, slow)\n\
+               --gpu-weight-mode <M> f16 (default) | packed (on-disk trellis on device)\n\
                --compute <BACKEND>   auto (best, default) | blas | gpu | scalar\n\
                --instances <N>       Concurrent decoding instances (default 1)\n\
            -h, --help                Show this help"
@@ -86,6 +90,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             .unwrap_or(4),
         name: None,
         weight_mode: "f32".into(),
+        gpu_weight_mode: "f16".into(),
         compute: "auto".into(),
         instances: 1,
     };
@@ -123,6 +128,12 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 cli.weight_mode = value()?;
                 if !matches!(cli.weight_mode.as_str(), "f32" | "f16" | "packed") {
                     return Err("--weight-mode must be f32, f16, or packed".into());
+                }
+            }
+            "--gpu-weight-mode" => {
+                cli.gpu_weight_mode = value()?;
+                if !matches!(cli.gpu_weight_mode.as_str(), "f16" | "packed") {
+                    return Err("--gpu-weight-mode must be f16 or packed".into());
                 }
             }
             "--compute" => {
@@ -176,14 +187,19 @@ fn main() -> ExitCode {
 
     // Load model.
     eprintln!("[init] loading model: {}", cli.model);
-    let model =
-        match model::Model::load(&cli.model, cli.context_size, cli.threads, &cli.weight_mode) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("error: failed to load model: {}", e);
-                return ExitCode::FAILURE;
-            }
-        };
+    let model = match model::Model::load(
+        &cli.model,
+        cli.context_size,
+        cli.threads,
+        &cli.weight_mode,
+        &cli.gpu_weight_mode,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: failed to load model: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
     eprintln!(
         "[init] architecture={} layers={} hidden={} vocab={} ctx={}",
         model.config().architecture,
@@ -333,6 +349,13 @@ mod tests {
         assert!(parse_cli(&args(&["-c", "0"])).is_err());
         assert!(parse_cli(&args(&["--threads", "0"])).is_err());
         assert!(parse_cli(&args(&["--max-tokens", "0"])).is_err());
+    }
+
+    #[test]
+    fn cli_parses_gpu_weight_mode() {
+        let cli = parse_cli(&args(&["--gpu-weight-mode", "packed"])).unwrap();
+        assert_eq!(cli.gpu_weight_mode, "packed");
+        assert!(parse_cli(&args(&["--gpu-weight-mode", "q8"])).is_err());
     }
 
     #[test]

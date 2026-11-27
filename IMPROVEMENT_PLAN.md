@@ -1,368 +1,124 @@
 # Improvement Plan — exllama.rs
 
-This document is the reviewed, prioritized plan for hardening and extending the
-server. It is derived from a full read of the four markdown docs (`README.md`,
-`TODO.md`, `tests/README.md`, `AGENTS.md`) and a code review of every `src/`
-module. It complements `TODO.md`: that file tracks individual checked-off tasks,
-while this file groups the *open* work into executable phases with acceptance
-criteria.
+This is the **source of truth for open priorities**. Read it before starting
+non-trivial work; keep it updated when priorities change. Architecture, format
+research and the *why* behind the code live in `AGENTS.md`. `TODO.md` tracks
+individual checked-off tasks; this file groups the remaining work into ordered
+priorities with acceptance criteria.
 
-> **Status:** Phases 0–2 are **implemented and verified** (see the completion
-> notes below); Phase 3 remains a plan. Commit only on explicit approval.
+> **Status (2026-11-27):** v0.7.0 — the opt-in packed-GPU mode is committed and
+> tagged. Commit only on explicit user approval.
 
-## Baseline (at time of review)
+## Current state
 
-- Branch `main`, tag `v0.4.2`, working tree clean at review time.
-- At review: `cargo test` **84 passed, 4 ignored**. After Phase 0:
-  **88 passed, 10 ignored**. After Phase 1: **99 passed, 10 ignored**. After
-  Phase 2: **102 passed, 11 ignored**; after the deferred Phase 2 work:
-  **115 passed, 11 ignored** (6 real-model / `/tmp` fixtures explicitly ignored
-  with reasons, 5 benchmarks). `cargo fmt --all -- --check` and
-  `cargo clippy --all-targets -- -D warnings` remain clean; the GPU feature
-  also compiles and its cache-key test passes.
-- The **forward math is correct**. `src/model.rs` matches both `AGENTS.md` §6
-  and the upstream HuggingFace `modeling_qwen3_5.py` / `modeling_qwen3_next.py`
-  reference on every subtlety checked: q_proj `[query|gate]` per-head
-  interleaving, per-head q/k norm before RoPE, partial rotate-half RoPE,
-  GQA grouping, gate sigmoid, depthwise conv layout, head-local L2 norm, the
-  Gated DeltaNet recurrence, and per-value-head RMSNormGated. The findings
-  below are therefore about **test coverage, robustness, API fidelity, and
-  performance**, not math errors.
+- Branch `main`, latest tag `v0.7.0`. The packed-GPU feature described in
+  Priority 0 below is included in this release.
+- Tests: `cargo test` **131 passed / 11 ignored**; `cargo test --features gpu`
+  **161 / 11**; on the RTX 5060 Ti host with `gpu-cuda`
+  **167 / 11** (real-GPU tests run with `-- --test-threads=1`).
+  `cargo fmt --all -- --check` and
+  `cargo clippy --all-targets --features gpu-cuda -- -D warnings` are clean.
+- GPU host: `192.168.178.46`, user `fakez`, Windows, RTX 5060 Ti 16 GB (sm_120),
+  CUDA 13 toolkit with `ptxas`. Use the real toolchain binaries:
+  `C:\Users\fakez\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe`
+  with `RUSTC` set to the matching `rustc.exe`; put MSVC `bin\Hostx64\x64`
+  ahead of `Hostx86\x86` in `PATH`. Test model:
+  `D:\Apps\AI\llama-swap\exllama.rs\qwen3.8_2` (2B, 8 bpw, MCG, tied embeddings).
+  Scratch build: `C:\Users\fakez\exllama-ab`.
 
 ## Guiding principles
 
-- Keep the std-only core. `matrixmultiply` stays the only required crate;
-  `candle` stays opt-in behind features. Do not add general-purpose crates.
+- Std-only core; `matrixmultiply` is the only required crate, `candle-core`/`half`
+  opt-in. No general-purpose crates (serde, tokio, serde_json, …) without approval.
 - Preserve the hand-written dequantizer and the `AGENTS.md` research notes.
-- Every new behavior gets a committed test that passes on a **fresh clone**
-  (no `/tmp` fixtures, no model download).
-- Keep `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`
-  green on every commit.
+- Fresh-clone-safe tests: no `/tmp` fixtures or model downloads required.
+- Keep fmt and clippy green on every change.
+- Use the weights on disk **as-is**; do not requantize EXL3 into INT8/FP8/FP4
+  or GGML formats without explicit user approval.
 
 ---
 
-## Phase 0 — Test & docs foundation (low risk, do first)
+## Done (condensed — details in `AGENTS.md` §10 and the git history)
 
-The single biggest risk today is that the most important correctness guarantees
-are *not actually tested on CI*: the dequantization-equivalence and tokenizer
-tests silently return early when `/tmp` files are absent.
-
-1. **Make dequant/matmul equivalence self-contained.** Rewrite
-   `quantized_matmul_matches_f32_dequant` (`src/exl3.rs`, ~line 1672) to build a
-   small synthetic EXL3 linear (trellis + suh/svh) committed under `tests/`, so
-   all three `--weight-mode` paths are verified on every `cargo test`. Mark the
-   real-model `/tmp/unstable_*.bin` tests `#[ignore]` with an explanatory
-   message so their intent is explicit.
-   *Acceptance:* a clean clone with no `/tmp` fixtures proves dequant and
-   quantized-matmul equivalence for 3INST / MCG / MUL1 codebooks.
-   **Done:** `exl3::synthetic_tests` builds a deterministic 128x128 EXL3 linear
-   entirely in memory and compares all three storage modes (packed / f32 cache
-   / f16 cache) against `dequant_linear` for 3INST, MCG, MUL1 integer and
-   MUL1 half-bitrate. Real-model `/tmp` tests are `#[ignore]`d with reasons.
-
-2. **Add numeric unit tests for the decoder primitives.** `src/model.rs` has
-   only one unit test today. Add hand-computed golden tests for: zero-centered
-   RMSNorm, partial RoPE (rotate-half), q_proj interleaving, GQA gather/scale,
-   attention gate sigmoid, a single Gated DeltaNet recurrence step (state
-   update with the *updated* state), and per-value-head RMSNormGated.
-   *Acceptance:* each primitive in `AGENTS.md` §6 has at least one assertion
-   that does not require a model download.
-   **Done:** extracted `split_q_gate`, `gqa_attention` and `deltanet_step`
-   (plus `AttnShape` / `DeltaNetScratch`) without changing the math and added
-   seven `model::tests` golden tests covering RMSNorm, per-head RMSNormGated,
-   partial RoPE, q_proj interleaving, GQA grouping/scale/gate, the DeltaNet
-   state update with decay, and fp16 embedding resolution.
-
-3. **Fix doc drift.** At review `AGENTS.md` §9 said "82 tests / 4 ignored"
-   and §3 said `exl3.rs` was 1556 lines (actual then: 84 / 4 and 1949 lines);
-   `TODO.md` "Suggested Next Steps" #1 (reduce embedding memory) was already
-   done. Update these to match reality and point `TODO.md` at this plan.
-   *Acceptance:* no stale counts or completed items presented as open.
-   **Done:** `AGENTS.md`, `TODO.md`, `README.md` and `tests/README.md` now
-   reflect 88 passed / 10 ignored, the synthetic fixtures, the new golden
-   tests and the explicit `#[ignore]` tagging of `/tmp`-dependent tests.
+- **Phase 0–2 (hardening, API fidelity, performance):** in-memory dequant
+  equivalence fixtures, decoder golden tests, bounded HTTP request line,
+  serialized threadpool `run()`, checked `dot()`, single-iterator CLI, SSE
+  logprob ordering / usage / tool-call deltas, request deadline, bounded regex
+  quantifiers, shared prefill for `n>1`, `--instances N`, fp16 KV cache and
+  embeddings, GPU cache fingerprints.
+- **Device-resident GPU forward** (`src/gpu.rs`): all weights/activations/state
+  stay on device; on-device sampling; fixed shape/indexing bugs, partial-RoPE
+  tail, per-head RMSNorm, untied `lm_head` shadowing; host-side Hadamard fold
+  to avoid vocab-sized OOM; `cumsum` OOM avoided by host inverse-CDF.
+- **v0.6.0 launch-count reduction:** host-baked Hadamards/signs, precomputed
+  `1+w` norms, fused pointwise kernels in `src/fused.rs`, in-place KV/conv
+  writes (measured +18%…+121% on an RTX 5060 Ti).
+- **Packed GPU mode (current working tree):** `--gpu-weight-mode f16|packed`
+  (default `f16`). `packed` uploads the EXL3 trellis verbatim as U32 words with
+  `suh`/`svh` and exact codebook decode LUTs; a new PTX kernel
+  `exl3_packed_dot` decodes 16×16 tiles during the forward, with candle ops for
+  input/output H128 and signs. No requantization, no full-size device
+  intermediates. Supports 3INST/MCG/MUL1, integer and half bitrates.
+  Measured on the 2B 8 bpw model: quantized-linear VRAM **1,676 MiB vs
+  3,586 MiB** for f16; decode **~7.2 vs ~59.6 tok/s**; identical 32-token
+  greedy output. Speed optimization was explicitly deferred by the user.
 
 ---
 
-## Phase 1 — API, streaming fidelity & robustness (medium risk)
+## Open priorities (ordered)
 
-4. **Guard the request line in `http.rs`.** `read_request()` (`src/http.rs:35`)
-   calls `BufReader::read_line` with no cap; the `MAX_HEADER_BYTES` check only
-   starts *after* the request line is read (`:62`). A client streaming a
-   huge line without `\n` grows `request_line` until OOM (600 s read timeout,
-   up to 64 connections). Use `take(MAX_HEADER_BYTES as u64)` on the reader for
-   both the request line and headers, and reject overlong lines.
-   *Acceptance:* fuzz test with a >64 KiB newline-free request line returns
-   an error without unbounded allocation.
-   **Done:** the request line and headers are read through
-   `Read::take(MAX_HEADER_BYTES + 1)`; overlong lines return "request line too
-   large". `http::tests` covers both the flood and a normal request.
+### Priority 0 — Make packed GPU mode fast enough to be useful
+*Owner: next agent. This is the highest priority; functionality is already
+proven correct.*
 
-5. **Serialize global threadpool `run()` calls.** `threadpool::run()`
-   (`src/threadpool.rs:78`) uses one global `POOL` and a per-call `Barrier`.
-   Concurrent callers can interleave sends so that W0 waits on its barrier
-   for a job queued behind another caller's barrier-blocked job — a deadlock.
-   Mitigations (pick one): a `run_mutex` around dispatch, or assign jobs to
-   workers so each `run()` gets a disjoint worker set. `catch_unwind` in the
-   worker does not help (the block is `Barrier::wait()`).
-   *Acceptance:* a stress test issues concurrent `matmul_t` calls from
-   multiple threads and completes without hanging.
-   **Done:** a global `RUN_LOCK` serializes whole `run()` calls (recovering
-   from a poisoned lock); `threadpool::tests::concurrent_runs_complete_without_deadlock`
-   exercises 8 callers x 50 batches.
+Context: packed mode fits ~2× more weights in VRAM but is currently ~8× slower
+than f16 because the per-token path streams and decodes the whole trellis with
+one thread per output and several extra kernels for the Hadamards/signs.
 
-6. **Strengthen `dot()` and CLI validation.**
-   - `tensor::dot()` (`src/tensor.rs:82`) uses `a.len().min(b.len())`, silently
-     hiding dimension mismatches. Make it assert equal lengths (or add a
-     checked variant) while keeping the hot loop allocation-free.
-   - `main.rs` CLI uses a closure that increments `i` *and* a separate
-     `i += 1` (`:87-92`, `:124`) — fragile; refactor to a single increment.
-     Clamp `--context-size` (and thread count) at startup.
-   *Acceptance:* mismatched dot inputs are caught in tests; CLI parsing tests
-   cover oversized context values.
-   **Done:** `dot()` and `dot_f16()` assert equal lengths; `parse_cli()` now
-   uses one iterator (no double index bump) and clamps context to
-   `1..=1_000_000` and threads to `1..=1024`. Tests cover both.
+Work, in order:
 
-7. **Align SSE streaming with OpenAI.**
-   - Emit the `logprobs` delta in the **same chunk as** the content delta (or
-     after it), not before it as today (`server.rs` ~479-493 vs 1599-1616).
-   - `/v1/completions` streaming should emit a final empty-choices `usage`
-     chunk, as chat already does (~1660-1670), rather than attaching usage to
-     the last choice's finish chunk (~1789-1796).
-   - Stream indexed `tool_calls` deltas (name / argument fragments) instead
-     of only XML text with `finish_reason: "tool_calls"` (~1620-1626).
-   *Acceptance:* a recorded SSE transcript matches the OpenAI SDK's expected
-   chunk shape; add assertions in `server::tests`.
-   **Done:** logprob deltas now follow the content delta; `/v1/completions`
-   emits a final `choices: []` usage chunk; `ToolCallStreamer` + `tool_call_delta`
-   emit indexed name/argument deltas and keep XML out of content. Assertions
-   cover chunk ordering, usage placement, streamer parsing and delta shape.
-   **Follow-up (real-client trace):** a client injecting an object-valued
-   `__labels__` pseudo-parameter into every tool schema made Qwen3.5 emit
-   `<parameter=__labels__\n{...}` without `>`; the old parser scanned to the
-   next `>` and merged both parameters into one garbage argument, so tools
-   received no `chat_id`. The parameter name now ends at `>` **or** a newline,
-   and `trailing_prefix_len()`/`finish()` drop unfinished blocks instead of
-   streaming raw XML. Regressions cover both streaming and non-streaming.
+1. **Measure first.** Build a repeatable A/B harness on the host (existing
+   `[decode]` log lines + `nvidia-smi`) for `--gpu-weight-mode packed` at 8/6/4
+   bpw. Record tok/s, peak VRAM, load time, and output parity against `f16`
+   for the same prompt. Target: **>= 40 tok/s** on the 2B model, 16 GB card.
+2. **Fuse the Hadamards and scales into the dequant kernel** so one launch per
+   linear replaces the current `mul → H128 → packed_dot → H128 → mul` chain.
+   Keep the exact CPU fallback and numeric parity tests.
+3. **Then consider a `dp4a` variant** (exllamav3-style fused codebook decode
+   into INT8 dot products) if step 2 cannot reach the target. Tensor cores
+   (FP8/FP4) are *not* useful at decode batch 1; do not pursue them for decode.
+4. **Validate large/low-bitrate models** (6/4/2 bpw, then a 27B checkpoint if
+   available) on 16 GB: VRAM, quality (greedy output/logit comparison), and
+   context-size limits. Document the recommended `f16`/`packed` choice.
 
-8. **Tighten generation semantics.**
-   - Reject `repetition_penalty <= 0` (currently `0` silently disables the
-     penalty, `server.rs` ~643-665 / validation ~1083-1088).
-   - Decide and document how reasoning delimiters (`<think>`/`</think>`) are
-     counted: they consume forward steps but are excluded from
-     `completion_tokens` and sampling history. Either count them consistently
-     or document the exclusion (already noted in `README.md`).
-   - Add a server-side generation deadline / hard output cap so a slow client
-     cannot hold the mutex-bound model indefinitely.
-   *Acceptance:* invalid penalties return 400; a deadline test terminates a
-   long generation; `completion_tokens` behavior is documented and tested.
-   **Done:** `repetition_penalty` must be finite and `> 0`; a 300 s
-   `MAX_GENERATION_SECONDS` deadline is checked each step (with an internal
-   `Params.deadline` override for tests); reasoning delimiters were explicitly
-   documented as excluded from `completion_tokens` in `README.md` / `AGENTS.md`.
+*Acceptance:* documented A/B numbers; >= 40 tok/s target met or an explicit
+measured ceiling with reasons; packed mode end-to-end on at least one 4 bpw
+model; fmt/clippy/tests still green.
 
-9. **Bound regex quantifier allocations.** `Re::Quant` (`src/regex.rs`, ~164-196)
-   builds `reachable: Vec<Vec<usize>>` with one entry per repetition, capped at
-   `text.len() + 1`. The shipped Qwen pre-tokenizer pattern has only sequential
-   quantifiers (no nested blow-up), but a crafted `tokenizer.json` with
-   `(a+)+b`-style patterns causes extreme memory/time use. Generate end sets
-   iteratively and cap work; validate untrusted patterns on load. This matters
-   for the 8 MiB body-cap threat model.
-   *Acceptance:* a pathological pattern returns an error or bounded-time
-   result instead of unbounded allocation.
-   **Done:** unbounded quantifiers cap at `MAX_QUANT_REPEATS = 4096` and a
-   `WorkBudget` of 1M steps is threaded through `possible_ends` / `all_seq_ends`;
-   `regex::tests::unbounded_quantifier_is_bounded` covers a long run and a
-   crafted `(a+)+b` pattern.
+### Priority 1 — Batched / continuous inference across requests
+`--instances N` overlaps non-matmul work but matmuls are not batched across
+requests and `threadpool::RUN_LOCK` serializes dispatch. Needs batch-aware
+attention and Gated DeltaNet, not just a bigger GEMM.
 
----
+*Acceptance:* a two-request benchmark shows overlapping decode without state
+cross-talk; `multiple_instances_serve_concurrent_requests` still passes.
 
-## Phase 2 — Performance (higher risk, measure first)
+### Priority 2 — GPU coverage in CI
+Real-GPU correctness and throughput are not exercised by CI (only candle CPU
+device tests). Keep `cuda_*` tests serial (per-device module cache) and add a
+packed-mode opt-in benchmark so regressions are measurable on a GPU host.
 
-10. **Reuse post-prefill state for `n > 1`.** Today each choice re-runs the full
-    prefill (`server.rs` ~1674-1686 / 1817-1829). Snapshot the model state after
-    prefill and restore it per choice; `n=8` should not cost `8x` prefill.
-    *Acceptance:* benchmark shows sublinear cost growth for `n`; equivalence
-    test confirms identical outputs for the same seed.
-    **Done:** `Model::snapshot()/restore()` copy only the used KV prefix plus
-    DeltaNet state; `Engine::prepare_*_prefill()` captures the post-prefill
-    logits, and both endpoints prepare once when `n > 1`. Equivalence test
-    `prefill_reuse_matches_fresh_prefill` passes; opt-in benchmark
-    `bench_n_choices_prefill_reuse` reports fresh vs reused timing.
-
-11. **Batched / continuous inference.** `Engine.model: Mutex<Model>` serializes
-    all requests. Add a request queue and batch prefill via the existing
-    multi-row sgemm path; potentially allow multiple `Model` instances behind
-    a semaphore rather than a single mutex. This is the main throughput ceiling.
-    **Done:** `n > 1` choices share one prefill (item 10); bounded admission
-    (`Engine::try_admit()`, 16 slots, 429 overflow) prevents thread pileup.
-    For independent requests, `Model` was split into an `Arc`-shared
-    `ModelCore` (weights/config/tables) plus per-instance state; `Model::spawn()`
-    creates cheap instances and `--instances N` wires them into an `Engine`
-    pool with leases (`Vec<Mutex<Model>>` + `Condvar`). Extra instances cost
-    KV/recurrent state, not another copy of the weights. Matmul kernels are
-    still not batched across requests (that needs batch-aware attention and
-    DeltaNet); documented in `AGENTS.md` §8.
-
-12. **Memory optimizations (in order of value).**
-    - f16 KV cache with per-step f32 upcast (halves context RAM).
-    - f16 embedding for tied models without breaking `lm_head` (~1 GB f32
-      matrix remains for the 0.8B model).
-    - Only if `packed` mode is to be supported interactively: SIMD gather for
-      the LUT decode (~3.5 s/token today — bottleneck is codebook decode, not
-      the dot product).
-    *Acceptance:* before/after numbers from `bench_generation_throughput` and
-    peak-RSS measurements; no correctness regression.
-    **Done:** fp16 KV cache (2 bytes/value, LUT-decoded per step) halves context
-    RAM (`kv_cache_stores_fp16_bits`). All plain embeddings are fp16 and tied
-    `lm_head` uses the new threaded `matmul_f16` (`f16_embedding_matmul_matches_f32`,
-    `tied_f16_embedding_supports_forward`). The packed decode hot path now uses
-    `unpack_tile_f32` — a direct codebook f32 LUT lookup that removes the
-    per-codeword arithmetic + fp16 conversion (bit-identical result, asserted
-    against `unpack_tile`). True SIMD gather is not available on stable std-only
-    Rust (no portable gather API); the arithmetic bottleneck it targeted is
-    gone. Real-model RSS numbers still require `EXLLAMA_BENCH_MODEL`.
-
-13. **GPU weight-cache key.** `compute.rs` (~270-289) keys cached device
-    tensors by raw pointer; an address reuse can yield a stale entry (bounded
-    by a 512-entry clear). Key by tensor identity/generation instead.
-    *Acceptance:* a reuse test forces the eviction path and verifies refresh.
-    **Done:** the GPU cache key is now `(pointer, rows, cols, fingerprint)`,
-    where the fingerprint is FNV-1a over sampled weight elements (including the
-    last). A GPU-only test verifies different buffers map to different keys;
-    `cargo check --features gpu` passes.
-
----
-
-## Phase 3 — Exploration (large, optional)
-
-14. Vision tower inference for `Qwen3_5ForConditionalGeneration`
-    (`image_url` / `video` content) — vision tensors are currently skipped.
-15. Other EXL3 architectures behind a generic config/weight abstraction
-    (Llama, Qwen3, ...).
-16. Unicode NFC normalization (currently ignored), reading `chat_template`
-    from `tokenizer.json` instead of a hard-coded template, Dockerfile,
-    crates.io publish, and an Anthropic-compatible `/v1/messages` endpoint.
-17. Structured logging (`EXLLAMA_LOG`, replacing the ad-hoc `EXLLAMA_DEBUG`
-    dump), remove dead logic (`multi_step_tool` computed then discarded in
-    `chat.rs` ~117-130).
+### Priority 3 — Feature exploration (optional, only after 0–2)
+- Vision tower inference for `Qwen3_5ForConditionalGeneration`.
+- Other EXL3 architectures behind a generic config/weight abstraction.
+- Unicode NFC normalization; read `chat_template` from `tokenizer.json`.
+- Dockerfile, crates.io publish, Anthropic `/v1/messages` endpoint.
+- Structured logging (`EXLLAMA_LOG`) and dead-code cleanup (`multi_step_tool`).
 
 ---
 
 ## Suggested execution order
 
-**Phases 0–2 are fully implemented** → **Phase 3**. Phase 2 now includes shared
-prefill, bounded admission, multiple Arc-shared model instances (`--instances`),
-fp16 KV cache, fp16 tied embeddings, and the direct-LUT packed decode. Real-model
-timing/RSS numbers still need `EXLLAMA_BENCH_MODEL`. Do not commit until the
-user explicitly approves.
-
-**Post-review benchmark fixes (not a new phase):** the opt-in benchmarks now
-initialize the threadpool and compute backend exactly like the server (before,
-matmuls ran single-threaded and the thread count was ignored), accept
-`EXLLAMA_BENCH_THREADS` / `EXLLAMA_BENCH_WEIGHT_MODE` /
-`EXLLAMA_BENCH_COMPUTE`, and report prefill and decode rates separately via new
-`GenResult` timing fields — the old "decode tok/s" was completion tokens divided
-by total request time (including the prompt pass). The auto backend picker's
-GEMV-vs-prefill score now weights decode 4x (extracted as `pick_by_score` with a
-regression test), since decode repeats per token and a 4x GEMV win must not be
-masked by a 2x prefill win. The f16 decode-cache build now uses a `decode_bits`
-LUT instead of per-codeword arithmetic (it was ~10x slower than the f32 cache
-build), with a bit-identity test; the rerun confirmed f16 load dropped from
-54.6 s to 3.9 s for 159 linears. Real-model A/B on a 12th-gen host showed f32
-fastest (~11.9 / 8.6 / 1.6 tok/s for f32 / f16 / packed) — documented in
-`AGENTS.md` §8 and `README.md`. Verified: 115 passed / 11 ignored, fmt and
-clippy clean.
-
-## Post-v0.4.3 follow-up: tool-call robustness
-
-A real-client trace exposed two edge cases in tool-call handling, both fixed
-with regression tests based on the exact observed output:
-
-- A client that injects an object-valued `__labels__` pseudo-parameter into
-  every tool schema makes Qwen3.5 emit `<parameter=__labels__\n{...}` without
-  the closing `>`. The old parser scanned forward to the next `>`, merging
-  `__labels__` and `chat_id` into one garbage argument — tool execution then
-  failed with "missing required positional argument". Parameter names now
-  terminate at `>` **or** a line break, so each argument stays separate.
-- A generation that stops mid-call (`finish_reason=length`) left the unfinished
-  `<tool_call>` XML in `content`. `ToolCallStreamer::finish()` and
-  `parse_tool_calls()` now drop incomplete blocks (and partial opener
-  prefixes), in both streaming and non-streaming paths.
-
-Verification: **115 passed, 11 ignored**, `cargo fmt --all -- --check` and
-`cargo clippy --all-targets -- -D warnings` clean.
-
-
-## Device-resident GPU forward (post-v0.4.3)
-
-Implemented per the requirement that, on GPU builds, all weights stay on device
-and no activations cross the bus during prefill/decode.
-
-- `src/gpu.rs` (new, feature `gpu`): `GpuWeights` decodes every EXL3 W_hat once
-  and uploads it as an fp16 device tensor; plain matrices/embeddings are fp16,
-  vectors/RoPE/H128 are fp32. `GpuRunner` owns shared weights plus per-instance
-  device state; the whole forward (RMSNorm, RoPE, Hadamard, GQA attention,
-  conv1d, Gated DeltaNet recurrence, gated RMSNorm, MLP, lm_head) runs with
-  candle tensor ops. KV cache and DeltaNet state stay on device. Prefill copies
-  logits to the host once for the whole prompt; decode once per token.
-- `Model::load` builds the GPU runner when the backend is `Gpu`, loads EXL3 in
-  `packed` mode (small host trellis as fallback) and ignores `--weight-mode`.
-  `Model::spawn`, `reset`, `snapshot`/`restore` and `forward` dispatch to it.
-  The CPU path is unchanged and remains the fallback.
-- `half` is an opt-in dependency under the `gpu` feature (candle already
-  compiles it transitively). Device GEMMs use fp16 inputs with f32 accumulate,
-  so outputs can differ slightly from the f32 CPU path.
-- Verified: `cargo test` (115 passed / 11 ignored), `cargo test --features gpu`
-  (126 passed / 11 ignored), fmt and clippy clean with and without `gpu`.
-  Device-op tests run on candle's CPU device; **real-GPU correctness and
-  throughput must be validated on the target hardware** with
-  `EXLLAMA_BENCH_COMPUTE=gpu` A/B runs (the benchmark accepts `gpu` now).
-
-### Follow-up: GPU forward shape/indexing fixes
-A real-model prefill failed with `shape mismatch in mul, lhs: [16,128],
-rhs: [1,128]`. Candle's `.mul()` needs exactly equal shapes (only
-`broadcast_mul()` broadcasts). Fixed in `src/gpu.rs`: `rms_norm` now
-broadcasts the 1-D weight over 2-D q/k tensors; per-head gated norm broadcasts
-`(1,vd)` and `(nvh,vd)`; q_proj reshape is `(nh,hd*2)` (query|gate contiguous
-per head, not `(nh,2,hd)`); RoPE tables are indexed with one row
-(`narrow(0,pos,1)`); and the full-attention KV gather selects one KV head
-(`narrow(1,kh,1)` + `squeeze(1)`). Added
-`gpu::tests::device_forward_runs_end_to_end_on_cpu` (multi-head tiny model,
-prefill + decode) and a synthetic `q_matmul` test — together they exercise
-every device forward branch and catch shape bugs without a GPU.
-
-#### Second GPU hotfix: partial RoPE tail
-A second real-model prefill then failed with `Shape mismatch, got buffer of
-size 128 which is compatible with shape [1, 512]`. `rope_half` is
-`head_dim*factor/2` (16 for the 0.8B model), so only the first 32 of 128 dims
-rotate; the GPU `rope()` returned only those 32 and dropped the tail, leaving
-`k` with 128 elements instead of `nkv*head_dim=512`. It now appends the
-unrotated tail (matching CPU `apply_rope`). The end-to-end test fixture was
-changed to `rope_half < head_dim/2` so the full forward exercises partial
-rotation, and `gpu::tests::rope_preserves_unrotated_tail` checks the numbers.
-Weight-upload errors now include tensor names and dimensions. Verification:
-115 passed / 11 ignored, 124 with `--features gpu`; fmt and clippy clean.
-
-#### Follow-up device-forward audit
-A full audit found two more bugs that produced *no* shape error: 2-D q/k
-RMSNorm reduced over dim 0 (pooling statistics across heads) instead of the
-last dim, and `mat()` resolved untied `lm_head.weight` to the embedding table
-before `q()` was tried — both `(vocab, hidden)`, so logits silently came from
-the wrong weights. Fixed by reducing over the last dim and treating the
-embedding as a last-resort tied-checkpoint fallback in `linear()`. Added
-head-divisibility, projection-length, Hadamard-divisibility and context
-guards with named diagnostics. Regression tests:
-`rms_norm_2d_normalizes_each_head` and
-`linear_prefers_quantized_lm_head_over_tied_embedding`. Verification:
-115 passed / 11 ignored, 126 with `--features gpu`; fmt and clippy clean.
-
-### Resolved — fully on-device sampling
-`GpuRunner::sample()` now applies penalties and temperature/top-k/top-p on
-device; only a token id, its logprob and optional top pairs cross back (plus
-one f32 RNG uniform per step). The inverse-CDF walk is on the host because
-candle 0.11's `Tensor::cumsum` materializes a `(vocab, vocab)` triangular
-matrix. `device_forward_matches_cpu_forward_on_same_weights` now compares the
-whole CPU and device forwards on identical tiny weights, closing the gap where
-earlier tests only compared GPU ops to other GPU ops.
+Work Priority 0 first (measure → fuse → `dp4a` if needed → 27B/low-bitrate
+validation), then 1, 2, 3. Update this file with results and re-prioritize after
+each measurement. No commit until the user explicitly approves.

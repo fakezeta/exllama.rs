@@ -275,6 +275,7 @@ impl Model {
         context_size: usize,
         threads: usize,
         weight_mode: &str,
+        gpu_weight_mode: &str,
     ) -> Result<Model, String> {
         if context_size == 0 {
             return Err("context_size must be > 0".into());
@@ -369,18 +370,30 @@ impl Model {
         let gpu = if use_gpu {
             let device = crate::compute::device()
                 .ok_or_else(|| "GPU backend selected but no device available".to_string())?;
-            let weights = GpuWeights::build(
-                &ex,
-                &config,
-                context_size,
-                &rope_cos,
-                &rope_sin,
-                rope_half,
-                &device,
-            )?;
+            let weights = if gpu_weight_mode == "packed" {
+                GpuWeights::build_packed(
+                    &ex,
+                    &config,
+                    context_size,
+                    &rope_cos,
+                    &rope_sin,
+                    rope_half,
+                    &device,
+                )?
+            } else {
+                GpuWeights::build(
+                    &ex,
+                    &config,
+                    context_size,
+                    &rope_cos,
+                    &rope_sin,
+                    rope_half,
+                    &device,
+                )?
+            };
             eprintln!(
-                "[gpu] device-resident forward active (--weight-mode {} ignored; weights are f16 on device)",
-                weight_mode
+                "[gpu] device-resident forward active (--weight-mode {} ignored; GPU weights: {})",
+                weight_mode, gpu_weight_mode
             );
             Some(GpuRunner::new(weights)?)
         } else {
@@ -1207,6 +1220,7 @@ impl Model {
     /// Build a CPU-forward model from the same plain tensors as the device
     /// fixture in `gpu.rs`, so the two forwards can be compared numerically.
     #[cfg(feature = "gpu")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_plain_parts(
         config: ModelConfig,
         weights: HashMap<String, Matrix>,

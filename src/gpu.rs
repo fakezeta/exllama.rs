@@ -15,7 +15,7 @@ use std::sync::Arc;
 use candle_core::{DType, Device, Tensor};
 use half::f16;
 
-use crate::exl3::Exl3Model;
+use crate::exl3::{Exl3Model, PackedLayout, PackedUpload};
 use crate::model::ModelConfig;
 
 trait CandleExt<T> {
@@ -58,6 +58,30 @@ struct GpuCfg {
     rope_half: usize,
 }
 
+/// One EXL3 linear on device. `Dense` is the original folded-f16 matrix;
+/// `Packed` keeps the on-disk trellis verbatim and decodes it in the kernel.
+enum QuantWeight {
+    Dense(Tensor),
+    Packed {
+        trellis: Tensor,
+        lut: Tensor,
+        suh: Tensor,
+        svh: Tensor,
+        layout: PackedLayout,
+    },
+}
+
+impl QuantWeight {
+    fn device_bytes(&self) -> usize {
+        match self {
+            QuantWeight::Dense(t) => t.elem_count() * 2,
+            QuantWeight::Packed {
+                trellis, suh, svh, ..
+            } => (trellis.elem_count() * 4) + (suh.elem_count() * 4) + (svh.elem_count() * 4),
+        }
+    }
+}
+
 /// Immutable device weights, shared by every instance (`Arc`).
 pub(crate) struct GpuWeights {
     device: Device,
@@ -65,10 +89,10 @@ pub(crate) struct GpuWeights {
     cfg: GpuCfg,
     /// Plain matrices and fp16 embedding tables, both (out, in) F16.
     mats: HashMap<String, Tensor>,
-    /// Quantized linears: folded `B[i, j] = svh[i] * (H_n @ W_hat @ H_k)[i, j]
-    /// * suh[j]` (n,k) F16. Both Hadamards *and* both sign vectors are baked
-    /// into `B` at load, so a decode step is one GEMV with no pointwise scales.
-    qhat: HashMap<String, Tensor>,
+    /// Quantized linears, either folded f16 matrices or packed trellises.
+    qhat: HashMap<String, QuantWeight>,
+    /// Exact f32 codebook decode tables, one per codebook actually used.
+    luts: Vec<Option<Tensor>>,
     /// 1-D tensors (norms, conv weights, A_log, dt_bias), F32.
     vecs: HashMap<String, Tensor>,
     /// `1 + w` for every `*norm.weight` vector, precomputed at load. RMSNorm
@@ -92,6 +116,55 @@ impl GpuWeights {
         rope_sin: &[f32],
         rope_half: usize,
         device: &Device,
+    ) -> Result<Arc<Self>, String> {
+        Self::build_inner(
+            ex,
+            config,
+            context_size,
+            rope_cos,
+            rope_sin,
+            rope_half,
+            device,
+            false,
+        )
+    }
+
+    /// Upload the EXL3 trellises themselves (no host decode, no requantization)
+    /// and decode them on device during the forward.
+    pub(crate) fn build_packed(
+        ex: &Exl3Model,
+        config: &ModelConfig,
+        context_size: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+        rope_half: usize,
+        device: &Device,
+    ) -> Result<Arc<Self>, String> {
+        if !matches!(device, Device::Cuda(_)) {
+            return Err("--gpu-weight-mode packed requires a CUDA device".into());
+        }
+        Self::build_inner(
+            ex,
+            config,
+            context_size,
+            rope_cos,
+            rope_sin,
+            rope_half,
+            device,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_inner(
+        ex: &Exl3Model,
+        config: &ModelConfig,
+        context_size: usize,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+        rope_half: usize,
+        device: &Device,
+        packed: bool,
     ) -> Result<Arc<Self>, String> {
         // Both attention paths map query heads onto KV heads by integer
         // division. A non-divisible count would index past the KV head array
@@ -162,15 +235,48 @@ impl GpuWeights {
             }
         }
         let h128 = Tensor::from_slice(&h, (128, 128), device).ce()?;
-        // `upload_device` folds both Hadamards into W_hat on the host and
-        // uploads only the final matrix, so the device never needs the
+        // Default: `upload_device` folds both Hadamards into W_hat on the host
+        // and uploads only the final matrix, so the device never needs the
         // full-size intermediates a device-side fold would allocate.
+        // Packed: upload the trellis verbatim and decode it in the forward.
+        let mut luts: Vec<Option<Tensor>> = vec![None, None, None];
         let mut qhat = HashMap::new();
         let mut qhat_bytes = 0usize;
         for (name, ql) in &ex.linears {
-            let w = ql.upload_device(device)?;
-            qhat_bytes += w.elem_count() * 2;
-            qhat.insert(name.clone(), w);
+            let qw = if packed {
+                let up: PackedUpload = ql.packed_upload()?;
+                let nw = up.layout.words_per_tile / 2;
+                let trellis = Tensor::from_slice(
+                    &up.words,
+                    (up.layout.tiles_k, up.layout.tiles_n, nw),
+                    device,
+                )
+                .map_err(|e| format!("{}: upload trellis: {}", name, e))?;
+                let id = up.codebook.id();
+                if luts[id].is_none() {
+                    let lut = Tensor::from_slice(
+                        &crate::exl3::codebook_lut_f32(up.codebook),
+                        (65536,),
+                        device,
+                    )
+                    .map_err(|e| format!("{}: upload codebook LUT: {}", name, e))?;
+                    luts[id] = Some(lut);
+                }
+                let lut = luts[id].as_ref().expect("LUT just uploaded").clone();
+                let suh = Tensor::from_slice(&up.suh, (up.layout.k,), device).ce()?;
+                let svh = Tensor::from_slice(&up.svh, (up.layout.n,), device).ce()?;
+                QuantWeight::Packed {
+                    trellis,
+                    lut,
+                    suh,
+                    svh,
+                    layout: up.layout,
+                }
+            } else {
+                QuantWeight::Dense(ql.upload_device(device)?)
+            };
+            qhat_bytes += qw.device_bytes();
+            qhat.insert(name.clone(), qw);
         }
         let mut vecs = HashMap::new();
         for (name, v) in &ex.vectors {
@@ -190,7 +296,8 @@ impl GpuWeights {
         // `mats` holds only fp16 tensors (plain matrices + embeddings).
         let mats_bytes: usize = mats.values().map(|t| t.elem_count() * 2).sum();
         eprintln!(
-            "[gpu] weights uploaded: {} matrices ({:.1} MiB), {} quantized linears ({:.1} MiB), {} vectors; config: layers={} ctx={} nh={} nkv={} hd={} nvh={}",
+            "[gpu] weights uploaded (mode={}): {} matrices ({:.1} MiB), {} quantized linears ({:.1} MiB), {} vectors; config: layers={} ctx={} nh={} nkv={} hd={} nvh={}",
+            if packed { "packed" } else { "f16" },
             mats.len(),
             mats_bytes as f64 / 1048576.0,
             qhat.len(),
@@ -226,6 +333,7 @@ impl GpuWeights {
             },
             mats,
             qhat,
+            luts,
             vecs,
             norm1,
             rope_cos: rope_cos_t,
@@ -255,7 +363,7 @@ impl GpuWeights {
         self.candidates(name).iter().find_map(|k| self.mats.get(k))
     }
 
-    fn q(&self, name: &str) -> Option<&Tensor> {
+    fn q(&self, name: &str) -> Option<&QuantWeight> {
         self.candidates(name).iter().find_map(|k| self.qhat.get(k))
     }
 
@@ -313,6 +421,31 @@ impl GpuWeights {
         Self::matmul_w(w, x)
     }
 
+    /// One EXL3 linear from the packed trellis: mask + H128 on the input,
+    /// dequant-dot from the trellis, H128 and sign vector on the output.
+    fn packed_linear(
+        &self,
+        trellis: &Tensor,
+        lut: &Tensor,
+        suh: &Tensor,
+        svh: &Tensor,
+        layout: PackedLayout,
+        x: &Tensor,
+    ) -> Result<Tensor, String> {
+        if x.elem_count() != layout.k {
+            return Err(format!(
+                "packed linear input has {} values, expected k={}",
+                x.elem_count(),
+                layout.k
+            ));
+        }
+        let x = x.reshape((layout.k,)).ce()?;
+        let xr = self.hadamard(&x.mul(suh).ce()?)?;
+        let t = crate::fused::packed_dot(trellis, &xr, lut, layout)?;
+        let th = self.hadamard(&t)?;
+        th.mul(svh).ce()
+    }
+
     /// Resolve the embedding table (shared by the token lookup and the tied
     /// lm_head fallback).
     fn embedding_table(&self) -> Option<&Tensor> {
@@ -327,7 +460,16 @@ impl GpuWeights {
             return Self::matmul_w(w, x);
         }
         if let Some(q) = self.q(name) {
-            return Self::matmul_w(q, x);
+            return match q {
+                QuantWeight::Dense(w) => Self::matmul_w(w, x),
+                QuantWeight::Packed {
+                    trellis,
+                    lut,
+                    suh,
+                    svh,
+                    layout,
+                } => self.packed_linear(trellis, lut, suh, svh, *layout, x),
+            };
         }
         // Tied checkpoints have no separate lm_head: the embedding table is
         // the output projection. Only try it after the plain and quantized
@@ -1466,6 +1608,7 @@ mod tests {
             cfg,
             mats: HashMap::new(),
             qhat: HashMap::new(),
+            luts: vec![None, None, None],
             vecs: HashMap::new(),
             norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
@@ -1516,6 +1659,7 @@ mod tests {
             cfg,
             mats: HashMap::new(),
             qhat: HashMap::new(),
+            luts: vec![None, None, None],
             vecs: HashMap::new(),
             norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
@@ -1569,6 +1713,7 @@ mod tests {
             cfg,
             mats: HashMap::new(),
             qhat: HashMap::new(),
+            luts: vec![None, None, None],
             vecs: HashMap::new(),
             norm1: HashMap::new(),
             // pos 0: cos=0.8, sin=0.6 for both rotary pairs.
@@ -1894,6 +2039,7 @@ mod tests {
             cfg,
             mats,
             qhat: HashMap::new(),
+            luts: vec![None, None, None],
             vecs,
             norm1: HashMap::new(),
             rope_cos: tiny_f32_mat(&dev, 4, 1),
@@ -2051,6 +2197,7 @@ mod tests {
             cfg,
             mats: HashMap::new(),
             qhat: HashMap::new(),
+            luts: vec![None, None, None],
             vecs: HashMap::new(),
             norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
@@ -2137,6 +2284,7 @@ mod tests {
             cfg,
             mats: HashMap::new(),
             qhat: HashMap::new(),
+            luts: vec![None, None, None],
             vecs: HashMap::new(),
             norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
@@ -2287,13 +2435,14 @@ mod tests {
             .unwrap()
             .to_dtype(DType::F16)
             .unwrap();
-        qhat.insert("lm_head".to_string(), folded.clone());
+        qhat.insert("lm_head".to_string(), QuantWeight::Dense(folded.clone()));
         let gw = GpuWeights {
             device: dev.clone(),
             prefix: String::new(),
             cfg,
             mats,
             qhat,
+            luts: vec![None, None, None],
             vecs: HashMap::new(),
             norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
@@ -2377,6 +2526,7 @@ mod tests {
             cfg,
             mats: HashMap::new(),
             qhat: HashMap::new(),
+            luts: vec![None, None, None],
             vecs: HashMap::new(),
             norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
@@ -2641,6 +2791,7 @@ mod tests {
             cfg,
             mats,
             qhat: HashMap::new(),
+            luts: vec![None, None, None],
             vecs,
             norm1: HashMap::new(),
             rope_cos: Tensor::zeros((8, 1), DType::F32, &dev).unwrap(),

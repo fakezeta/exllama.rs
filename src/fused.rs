@@ -2377,6 +2377,326 @@ done:
 }
 "#;
 
+// ---------------------------------------------------------------------------
+// EXL3 packed trellis dequant-dot (device-resident packed weights)
+// ---------------------------------------------------------------------------
+
+use crate::exl3::PackedLayout;
+
+static PACKED_OK: AtomicBool = AtomicBool::new(true);
+
+/// `t = W_hat^T @ xr`, decoded directly from the packed trellis. `trellis` is a
+/// contiguous (tiles_k, tiles_n, words_per_tile/2) U32 tensor, `xr` is the
+/// input-side Hadamard of the masked activations, and `lut` is the exact f32
+/// decode table for the layer's codebook. The caller applies the output-side
+/// Hadamard and sign vector, so this op never materializes a full weight.
+pub(crate) fn packed_dot(
+    trellis: &Tensor,
+    xr: &Tensor,
+    lut: &Tensor,
+    layout: PackedLayout,
+) -> Result<Tensor, String> {
+    if !fused_enabled() || !PACKED_OK.load(Ordering::Relaxed) {
+        return packed_dot_fallback(trellis, xr, lut, layout);
+    }
+    let op = FusedPackedDot {
+        lut: lut.clone(),
+        layout,
+    };
+    match trellis.apply_op2_no_bwd(xr, &op) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            static REPORTED: OnceLock<()> = OnceLock::new();
+            report_once(&REPORTED, "exl3_packed_dot", &e.to_string());
+            PACKED_OK.store(false, Ordering::Relaxed);
+            packed_dot_fallback(trellis, xr, lut, layout)
+        }
+    }
+}
+
+fn packed_dot_fallback(
+    trellis: &Tensor,
+    xr: &Tensor,
+    lut: &Tensor,
+    layout: PackedLayout,
+) -> Result<Tensor, String> {
+    use candle_core::Storage;
+    let (ts, tl) = trellis.storage_and_layout();
+    let (xs, xl) = xr.storage_and_layout();
+    let (ls, _) = lut.storage_and_layout();
+    match (&*ts, &*xs, &*ls) {
+        (Storage::Cpu(tc), Storage::Cpu(xc), Storage::Cpu(lc)) => {
+            let all_words = tc.as_slice::<u32>().map_err(|e| e.to_string())?;
+            let nw = layout.words_per_tile / 2;
+            let nwords = layout.tiles_k * layout.tiles_n * nw;
+            let start = tl.start_offset();
+            if start + nwords > all_words.len() {
+                return Err("packed_dot: trellis storage too short".into());
+            }
+            let words = &all_words[start..start + nwords];
+            let all_x = xc.as_slice::<f32>().map_err(|e| e.to_string())?;
+            let xs0 = xl.start_offset();
+            if xs0 + layout.k > all_x.len() {
+                return Err("packed_dot: xr storage too short".into());
+            }
+            let xr = &all_x[xs0..xs0 + layout.k];
+            let lut = lc.as_slice::<f32>().map_err(|e| e.to_string())?;
+            let t = crate::exl3::packed_dot_host_impl(words, layout, lut, xr)?;
+            Tensor::from_vec(t, (layout.n,), trellis.device()).map_err(|e| e.to_string())
+        }
+        _ => Err("packed_dot fallback is only implemented for CPU tensors".into()),
+    }
+}
+
+struct FusedPackedDot {
+    lut: Tensor,
+    layout: PackedLayout,
+}
+
+impl CustomOp2 for FusedPackedDot {
+    fn name(&self) -> &'static str {
+        "exlama_fused_exl3_packed_dot"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        let words = s1.as_slice::<u32>()?;
+        let xvals = s2.as_slice::<f32>()?;
+        let (ls, _) = self.lut.storage_and_layout();
+        let candle_core::Storage::Cpu(lc) = &*ls else {
+            return Err(candle_core::Error::Msg("packed LUT is not on CPU".into()));
+        };
+        let t = crate::exl3::packed_dot_host_impl(
+            &words[l1.start_offset()..],
+            self.layout,
+            lc.as_slice::<f32>()?,
+            &xvals[l2.start_offset()..l2.start_offset() + self.layout.k],
+        )
+        .map_err(candle_core::Error::Msg)?;
+        Ok((CpuStorage::F32(t), (self.layout.n,).into()))
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        _l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        _l2: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::Storage;
+
+        let words = s1.as_cuda_slice::<u32>()?;
+        let xr = s2.as_cuda_slice::<f32>()?;
+        let (ls, _) = self.lut.storage_and_layout();
+        let Storage::Cuda(lc) = &*ls else {
+            return Err(candle_core::Error::Msg("packed LUT is not on CUDA".into()));
+        };
+        let lut = lc.as_cuda_slice::<f32>()?;
+        let func = s1.device.get_or_load_custom_func(
+            "exl3_packed_dot",
+            "exllama_exl3_packed",
+            PACKED_DOT_PTX,
+        )?;
+        let out = unsafe { s1.device.alloc::<f32>(self.layout.n)? };
+        let nw = (self.layout.words_per_tile / 2) as u32;
+        let ring = nw * 32;
+        let (n_u, tk_u, tn_u) = (
+            self.layout.n as u32,
+            self.layout.tiles_k as u32,
+            self.layout.tiles_n as u32,
+        );
+        let (bits_u, half_u) = (self.layout.k_bits_int as u32, self.layout.k_half as u32);
+        let mut args = func.builder();
+        args.arg(words)
+            .arg(xr)
+            .arg(lut)
+            .arg(&out)
+            .arg(&n_u)
+            .arg(&tk_u)
+            .arg(&tn_u)
+            .arg(&nw)
+            .arg(&bits_u)
+            .arg(&half_u)
+            .arg(&ring);
+        let cfg = LaunchConfig {
+            grid_dim: (self.layout.n.div_ceil(256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            args.launch(cfg)
+                .map_err(|e| candle_core::Error::Cuda(Box::new(e)))?
+        };
+        Ok((
+            candle_core::CudaStorage::wrap_cuda_slice(out, s1.device.clone()),
+            (self.layout.n,).into(),
+        ))
+    }
+}
+
+#[cfg(feature = "gpu-cuda")]
+const PACKED_DOT_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry exl3_packed_dot(
+    .param .u64 p_trellis,
+    .param .u64 p_xr,
+    .param .u64 p_lut,
+    .param .u64 p_out,
+    .param .u32 p_n,
+    .param .u32 p_tiles_k,
+    .param .u32 p_tiles_n,
+    .param .u32 p_nw,
+    .param .u32 p_bits,
+    .param .u32 p_half,
+    .param .u32 p_ring
+)
+{
+    .reg .u32 %j, %tn, %tk, %rr, %c, %i, %end, %s, %wi, %o;
+    .reg .u32 %w0, %w1, %idx, %base, %wo, %wi1, %sh, %xi, %nwn;
+    .reg .u32 %n, %ntk, %ntn, %nnw, %nbits, %nhalf, %nring;
+    .reg .u32 %ctaidv, %ntidv, %tidv;
+    .reg .u32 %a0, %a1, %a2, %a3, %a4, %a5, %g, %q, %tmp;
+    .reg .u64 %rd1, %rd2, %rd3, %rd4, %rd5, %rd6, %rd7, %rd8, %rd9;
+    .reg .f32 %acc, %fv, %fx;
+    .reg .pred %p0, %p1, %p2, %p3, %p4, %p5;
+
+    ld.param.u64 %rd1, [p_trellis];
+    ld.param.u64 %rd2, [p_xr];
+    ld.param.u64 %rd3, [p_lut];
+    ld.param.u64 %rd4, [p_out];
+    ld.param.u32 %n, [p_n];
+    ld.param.u32 %ntk, [p_tiles_k];
+    ld.param.u32 %ntn, [p_tiles_n];
+    ld.param.u32 %nnw, [p_nw];
+    ld.param.u32 %nbits, [p_bits];
+    ld.param.u32 %nhalf, [p_half];
+    ld.param.u32 %nring, [p_ring];
+
+    mov.u32 %ctaidv, %ctaid.x;
+    mov.u32 %ntidv, %ntid.x;
+    mov.u32 %tidv, %tid.x;
+    mad.lo.u32 %j, %ctaidv, %ntidv, %tidv;
+    setp.ge.u32 %p0, %j, %n;
+    @%p0 bra done;
+
+    and.b32 %c, %j, 15;
+    shr.u32 %tn, %j, 4;
+    mov.f32 %acc, 0f00000000;
+    mov.u32 %tk, 0;
+
+tk_loop:
+    setp.ge.u32 %p1, %tk, %ntk;
+    @%p1 bra tk_end;
+
+    mad.lo.u32 %tmp, %tk, %ntn, %tn;
+    mul.lo.u32 %base, %tmp, %nnw;
+    mov.u32 %rr, 0;
+
+r_loop:
+    setp.ge.u32 %p2, %rr, 16;
+    @%p2 bra r_end;
+
+    // inverse of tile_perm: (r,c) -> ring position i
+    and.b32 %a0, %c, 7;
+    shl.b32 %a0, %a0, 2;
+    and.b32 %a1, %rr, 7;
+    shr.u32 %a1, %a1, 1;
+    or.b32 %a0, %a0, %a1;
+    shl.b32 %i, %a0, 3;
+    and.b32 %a2, %rr, 1;
+    add.u32 %i, %i, %a2;
+    and.b32 %a3, %rr, 8;
+    shr.u32 %a3, %a3, 2;
+    add.u32 %i, %i, %a3;
+    and.b32 %a4, %c, 8;
+    shr.u32 %a4, %a4, 1;
+    add.u32 %i, %i, %a4;
+
+    // bit index of the end of this 16-bit window (may be negative)
+    setp.eq.u32 %p3, %nhalf, 0;
+    @%p3 bra int_end;
+    shr.u32 %g, %i, 4;
+    and.b32 %q, %i, 15;
+    mul.lo.u32 %nwn, %nnw, 2; // words_per_tile = nw * 2
+    mad.lo.u32 %end, %g, %nwn, 0;
+    mad.lo.u32 %end, %q, %nbits, %end;
+    add.u32 %a5, %q, 1;
+    shr.u32 %a5, %a5, 1;
+    add.u32 %end, %end, %a5;
+    bra calc_window;
+
+int_end:
+    add.u32 %a5, %i, 1;
+    mul.lo.u32 %end, %a5, %nbits;
+
+calc_window:
+    add.u32 %s, %end, 0xfffffff0;
+    rem.s32 %s, %s, %nring;
+    setp.lt.s32 %p4, %s, 0;
+    @%p4 add.u32 %s, %s, %nring;
+    shr.u32 %wi, %s, 5;
+    and.b32 %o, %s, 31;
+
+    add.u32 %wi1, %wi, 1;
+    setp.eq.u32 %p5, %wi1, %nnw;
+    @%p5 mov.u32 %wi1, 0;
+
+    add.u32 %wo, %base, %wi;
+    mul.wide.u32 %rd5, %wo, 4;
+    add.u64 %rd5, %rd1, %rd5;
+    ld.global.u32 %w0, [%rd5];
+
+    add.u32 %wo, %base, %wi1;
+    mul.wide.u32 %rd6, %wo, 4;
+    add.u64 %rd6, %rd1, %rd6;
+    ld.global.u32 %w1, [%rd6];
+
+    cvt.u64.u32 %rd7, %w0;
+    shl.b64 %rd7, %rd7, 32;
+    cvt.u64.u32 %rd8, %w1;
+    or.b64 %rd7, %rd7, %rd8;
+    sub.u32 %sh, 48, %o;
+    shr.u64 %rd9, %rd7, %sh;
+    and.b64 %rd9, %rd9, 0x000000000000ffff;
+    cvt.u32.u64 %idx, %rd9;
+
+    mul.wide.u32 %rd5, %idx, 4;
+    add.u64 %rd5, %rd3, %rd5;
+    ld.global.f32 %fv, [%rd5];
+
+    mad.lo.u32 %xi, %tk, 16, %rr;
+    mul.wide.u32 %rd6, %xi, 4;
+    add.u64 %rd6, %rd2, %rd6;
+    ld.global.f32 %fx, [%rd6];
+
+    fma.rn.f32 %acc, %fv, %fx, %acc;
+    add.u32 %rr, %rr, 1;
+    bra r_loop;
+
+r_end:
+    add.u32 %tk, %tk, 1;
+    bra tk_loop;
+
+tk_end:
+    mul.wide.u32 %rd5, %j, 4;
+    add.u64 %rd5, %rd4, %rd5;
+    st.global.f32 [%rd5], %acc;
+
+done:
+    ret;
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2465,6 +2785,59 @@ mod tests {
             }
         }
     }
+}
+
+/// Real-GPU numeric check for the EXL3 packed-trellis dequant-dot kernel.
+#[cfg(all(test, feature = "gpu-cuda"))]
+#[test]
+fn cuda_packed_dot_matches_cpu_reference() {
+    use crate::exl3::{codebook_lut_f32, packed_dot_host_impl, Codebook, PackedLayout};
+    if !candle_core::utils::cuda_is_available() {
+        eprintln!("[fused] CUDA unavailable, skipping packed-dot check");
+        return;
+    }
+    let dev = candle_core::Device::new_cuda(0).unwrap();
+    let layout = PackedLayout {
+        k: 128,
+        n: 128,
+        tiles_k: 8,
+        tiles_n: 8,
+        words_per_tile: 128,
+        k_bits_int: 8,
+        k_half: false,
+    };
+    let nw = layout.words_per_tile / 2;
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let words: Vec<u32> = (0..layout.tiles_k * layout.tiles_n * nw)
+        .map(|_| next() as u32)
+        .collect();
+    let xr: Vec<f32> = (0..layout.k)
+        .map(|i| ((i % 11) as f32) * 0.03 - 0.15)
+        .collect();
+    let lut = codebook_lut_f32(Codebook::Mcg);
+    let expect = packed_dot_host_impl(&words, layout, &lut, &xr).unwrap();
+
+    let wt = candle_core::Tensor::from_slice(&words, (layout.tiles_k, layout.tiles_n, nw), &dev)
+        .unwrap();
+    let xt = candle_core::Tensor::from_slice(&xr, (layout.k,), &dev).unwrap();
+    let lt = candle_core::Tensor::from_slice(&lut, (65536,), &dev).unwrap();
+    let got = packed_dot(&wt, &xt, &lt, layout)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    for (i, (g, e)) in got.iter().zip(expect.iter()).enumerate() {
+        assert!(
+            (g - e).abs() < 5e-3 + 5e-3 * e.abs(),
+            "packed dot row {i}: got {g}, expected {e}"
+        );
+    }
+    eprintln!("[fused] CUDA packed-dot check passed");
 }
 
 /// Real-GPU numeric check: the PTX kernels must match the candle-op fallback.
