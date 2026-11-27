@@ -10,7 +10,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-use candle_core::{CpuStorage, CustomOp1, CustomOp2, CustomOp3, Layout, Shape, Tensor};
+use candle_core::{
+    CpuStorage, CustomOp1, CustomOp2, CustomOp3, DType, InplaceOp2, Layout, Shape, Tensor,
+};
+use half::f16;
 
 /// `EXLLAMA_DISABLE_FUSED=1` skips the custom kernels and uses the original
 /// candle-op sequence. Useful for A/B testing on a real GPU without rebuilding.
@@ -616,6 +619,9 @@ static GATED_OK: AtomicBool = AtomicBool::new(true);
 static GATES_OK: AtomicBool = AtomicBool::new(true);
 static SOFTMAX_OK: AtomicBool = AtomicBool::new(true);
 static SIGMOID_OK: AtomicBool = AtomicBool::new(true);
+static QK_OK: AtomicBool = AtomicBool::new(true);
+static KV_OK: AtomicBool = AtomicBool::new(true);
+static CONV_OK: AtomicBool = AtomicBool::new(true);
 
 fn read2(s: &[f32], l: &Layout, r: usize, c: usize) -> f32 {
     s[l.start_offset() + r * l.stride()[0] + c * l.stride()[1]]
@@ -1129,6 +1135,283 @@ impl CustomOp2 for FusedSigmoidGate {
     }
 }
 
+/// L2-normalize the DeltaNet query/key heads and repeat each key head across
+/// its value heads in one kernel. `q`/`k` are `(nkh * kd,)`; the result is
+/// `(2, nvh, kd)` with row 0 = normalized q, row 1 = normalized k.
+pub(crate) fn deltanet_qk_norm(
+    q: &Tensor,
+    k: &Tensor,
+    nkh: usize,
+    nvh: usize,
+    kd: usize,
+) -> Result<Tensor, String> {
+    if !fused_enabled() || !QK_OK.load(Ordering::Relaxed) {
+        return deltanet_qk_norm_fallback(q, k, nkh, nvh, kd);
+    }
+    let op = FusedDeltanetQkNorm { nkh, nvh, kd };
+    match q.apply_op2_no_bwd(k, &op) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            static REPORTED: OnceLock<()> = OnceLock::new();
+            report_once(&REPORTED, "deltanet_qk_norm", &e.to_string());
+            QK_OK.store(false, Ordering::Relaxed);
+            deltanet_qk_norm_fallback(q, k, nkh, nvh, kd)
+        }
+    }
+}
+
+fn deltanet_qk_norm_fallback(
+    q: &Tensor,
+    k: &Tensor,
+    nkh: usize,
+    nvh: usize,
+    kd: usize,
+) -> Result<Tensor, String> {
+    let rep = nvh / nkh;
+    let repeat_heads = |t: &Tensor| -> Result<Tensor, String> {
+        t.reshape((nkh, kd))
+            .map_err(|e| e.to_string())?
+            .unsqueeze(1)
+            .map_err(|e| e.to_string())?
+            .repeat((1, rep, 1))
+            .map_err(|e| e.to_string())?
+            .reshape((nvh, kd))
+            .map_err(|e| e.to_string())
+    };
+    let scale = 1.0 / (kd as f64).sqrt();
+    let qh = repeat_heads(q)?
+        .broadcast_div(
+            &k_add_eps_rows_fallback(&repeat_heads(q)?)?
+                .unsqueeze(1)
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?
+        .affine(scale, 0.0)
+        .map_err(|e| e.to_string())?;
+    let kh = repeat_heads(k)?
+        .broadcast_div(
+            &k_add_eps_rows_fallback(&repeat_heads(k)?)?
+                .unsqueeze(1)
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    let nvh = qh.dim(0).map_err(|e| e.to_string())?;
+    let kd = qh.dim(1).map_err(|e| e.to_string())?;
+    Tensor::cat(&[qh, kh], 0)
+        .and_then(|t| t.reshape((2, nvh, kd)))
+        .map_err(|e| e.to_string())
+}
+
+fn k_add_eps_rows_fallback(v: &Tensor) -> Result<Tensor, String> {
+    v.sqr()
+        .map_err(|e| e.to_string())?
+        .sum(1)
+        .map_err(|e| e.to_string())?
+        .affine(1.0, 1e-6)
+        .map_err(|e| e.to_string())?
+        .sqrt()
+        .map_err(|e| e.to_string())
+}
+
+struct FusedDeltanetQkNorm {
+    nkh: usize,
+    nvh: usize,
+    kd: usize,
+}
+
+impl CustomOp2 for FusedDeltanetQkNorm {
+    fn name(&self) -> &'static str {
+        "exllama_fused_deltanet_qk_norm"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        let q = s1.as_slice::<f32>()?;
+        let k = s2.as_slice::<f32>()?;
+        let rep = self.nvh / self.nkh;
+        let scale = 1.0 / (self.kd as f32).sqrt();
+        let mut out = vec![0.0f32; 2 * self.nvh * self.kd];
+        for vh in 0..self.nvh {
+            let h = vh / rep;
+            let mut qs = 0.0f32;
+            let mut ks = 0.0f32;
+            for d in 0..self.kd {
+                let i = l1.start_offset() + h * self.kd * l1.stride()[0] + d * l1.stride()[0];
+                let j = l2.start_offset() + h * self.kd * l2.stride()[0] + d * l2.stride()[0];
+                qs += q[i] * q[i];
+                ks += k[j] * k[j];
+            }
+            let qn = 1.0 / (qs + 1e-6).sqrt() * scale;
+            let kn = 1.0 / (ks + 1e-6).sqrt();
+            for d in 0..self.kd {
+                let i = l1.start_offset() + h * self.kd * l1.stride()[0] + d * l1.stride()[0];
+                let j = l2.start_offset() + h * self.kd * l2.stride()[0] + d * l2.stride()[0];
+                out[vh * self.kd + d] = q[i] * qn;
+                out[self.nvh * self.kd + vh * self.kd + d] = k[j] * kn;
+            }
+        }
+        Ok((CpuStorage::F32(out), Shape::from((2, self.nvh, self.kd))))
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        let q = s1.as_cuda_slice::<f32>()?;
+        let k = s2.as_cuda_slice::<f32>()?;
+        let func = s1.device.get_or_load_custom_func(
+            "deltanet_qk_norm_f32",
+            "exllama_fused_qk_norm",
+            QK_NORM_PTX,
+        )?;
+        let out = unsafe { s1.device.alloc::<f32>(2 * self.nvh * self.kd)? };
+        let cfg = LaunchConfig {
+            grid_dim: (self.nvh as u32, 1, 1),
+            block_dim: (self.kd as u32, 1, 1),
+            shared_mem_bytes: self.kd as u32 * 4 * 2,
+        };
+        let (kd_u, rep_u, nvh_u) = (
+            self.kd as u32,
+            (self.nvh / self.nkh) as u32,
+            self.nvh as u32,
+        );
+        let qscale = 1.0 / (self.kd as f32).sqrt();
+        let (sq, oq, sk, ok) = (
+            l1.stride()[0] as u32,
+            l1.start_offset() as u32,
+            l2.stride()[0] as u32,
+            l2.start_offset() as u32,
+        );
+        let mut args = func.builder();
+        args.arg(q)
+            .arg(k)
+            .arg(&out)
+            .arg(&kd_u)
+            .arg(&rep_u)
+            .arg(&nvh_u)
+            .arg(&sq)
+            .arg(&oq)
+            .arg(&sk)
+            .arg(&ok)
+            .arg(&qscale);
+        unsafe {
+            args.launch(cfg)
+                .map_err(|e| candle_core::Error::Cuda(Box::new(e)))?
+        };
+        Ok((
+            candle_core::CudaStorage::wrap_cuda_slice(out, s1.device.clone()),
+            Shape::from((2, self.nvh, self.kd)),
+        ))
+    }
+}
+
+#[cfg(feature = "gpu-cuda")]
+const QK_NORM_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry deltanet_qk_norm_f32(
+    .param .u64 p_q, .param .u64 p_k, .param .u64 p_y,
+    .param .u32 p_kd, .param .u32 p_rep, .param .u32 p_nvh,
+    .param .u32 p_sq, .param .u32 p_oq,
+    .param .u32 p_sk, .param .u32 p_ok,
+    .param .f32 p_qscale
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<16>;
+    .reg .f32 %f<6>;
+    .reg .b64 %rd<8>;
+    .shared .align 4 .f32 sdata[2];
+
+    ld.param.u64 %rd1, [p_q];
+    ld.param.u64 %rd2, [p_k];
+    ld.param.u64 %rd3, [p_y];
+    ld.param.u32 %r1, [p_kd];
+    ld.param.u32 %r2, [p_rep];
+    ld.param.u32 %r5, [p_nvh];
+    ld.param.u32 %r3, [p_sq];
+    ld.param.u32 %r4, [p_oq];
+    ld.param.u32 %r6, [p_sk];
+    ld.param.u32 %r7, [p_ok];
+    ld.param.f32 %f5, [p_qscale];
+
+    mov.u32 %r8, %ctaid.x;
+    div.u32 %r9, %r8, %r2;
+    mov.u32 %r10, %tid.x;
+    mad.lo.u32 %r11, %r9, %r1, 0;
+    mad.lo.u32 %r11, %r11, %r3, %r4;
+    mad.lo.u32 %r12, %r9, %r1, 0;
+    mad.lo.u32 %r12, %r12, %r6, %r7;
+
+    setp.ne.u32 %p1, %r10, 0;
+    @%p1 bra reduce_done;
+    mov.f32 %f1, 0f00000000;
+    mov.f32 %f2, 0f00000000;
+    mov.u32 %r13, 0;
+sum_loop:
+    setp.ge.u32 %p2, %r13, %r1;
+    @%p2 bra sum_done;
+    mad.lo.u32 %r14, %r13, %r3, %r11;
+    mul.wide.u32 %rd4, %r14, 4;
+    add.u64 %rd4, %rd1, %rd4;
+    ld.global.f32 %f3, [%rd4];
+    fma.rn.f32 %f1, %f3, %f3, %f1;
+    mad.lo.u32 %r14, %r13, %r6, %r12;
+    mul.wide.u32 %rd5, %r14, 4;
+    add.u64 %rd5, %rd2, %rd5;
+    ld.global.f32 %f4, [%rd5];
+    fma.rn.f32 %f2, %f4, %f4, %f2;
+    add.u32 %r13, %r13, 1;
+    bra sum_loop;
+sum_done:
+    st.shared.f32 [sdata], %f1;
+    st.shared.f32 [sdata+4], %f2;
+reduce_done:
+    bar.sync 0;
+    ld.shared.f32 %f3, [sdata];
+    ld.shared.f32 %f4, [sdata+4];
+    add.f32 %f3, %f3, 1e-6;
+    add.f32 %f4, %f4, 1e-6;
+    rsqrt.approx.f32 %f3, %f3;
+    rsqrt.approx.f32 %f4, %f4;
+    mul.f32 %f3, %f3, %f5;
+
+    mad.lo.u32 %r14, %r10, %r3, %r11;
+    mul.wide.u32 %rd4, %r14, 4;
+    add.u64 %rd4, %rd1, %rd4;
+    ld.global.f32 %f1, [%rd4];
+    mad.lo.u32 %r14, %r10, %r6, %r12;
+    mul.wide.u32 %rd5, %r14, 4;
+    add.u64 %rd5, %rd2, %rd5;
+    ld.global.f32 %f2, [%rd5];
+    mul.f32 %f1, %f1, %f3;
+    mul.f32 %f2, %f2, %f4;
+
+    mad.lo.u32 %r14, %r8, %r1, 0;
+    mad.lo.u32 %r14, %r14, 1, %r10;
+    mul.wide.u32 %rd6, %r14, 4;
+    add.u64 %rd6, %rd3, %rd6;
+    st.global.f32 [%rd6], %f1;
+    mad.lo.u32 %r14, %r5, %r1, %r14;
+    mul.wide.u32 %rd6, %r14, 4;
+    add.u64 %rd6, %rd3, %rd6;
+    st.global.f32 [%rd6], %f2;
+    ret;
+}
+"#;
+
 #[cfg(feature = "gpu-cuda")]
 const GATED_NORM_PTX: &str = r#"
 .version 7.0
@@ -1544,6 +1827,551 @@ const SIGMOID_PTX: &str = r#"
     mul.wide.u32 %rd5, %r4, 4;
     add.u64 %rd5, %rd3, %rd5;
     st.global.f32 [%rd5], %f1;
+done:
+    ret;
+}
+"#;
+
+/// Write one fp16 KV row in place instead of copying the whole cache with
+/// `slice_scatter` on every generated token.
+pub(crate) fn write_kv_row(dst: &mut Tensor, row: &Tensor, pos: usize) -> Result<(), String> {
+    if fused_enabled() && KV_OK.load(Ordering::Relaxed) {
+        match dst.inplace_op2(row, &WriteKvRow { pos }) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                static REPORTED: OnceLock<()> = OnceLock::new();
+                report_once(&REPORTED, "write_kv_row", &e.to_string());
+                KV_OK.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+    // Fallback: rebuild the cache with one row replaced.
+    let cols = dst.dim(1).map_err(|e| e.to_string())?;
+    let r = row.reshape((1, cols)).map_err(|e| e.to_string())?;
+    let zeros = Tensor::zeros(dst.shape(), DType::F16, dst.device()).map_err(|e| e.to_string())?;
+    *dst = zeros.slice_scatter(&r, 0, pos).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+struct WriteKvRow {
+    pos: usize,
+}
+
+impl InplaceOp2 for WriteKvRow {
+    fn name(&self) -> &'static str {
+        "exllama_fused_write_kv_row"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &mut CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> candle_core::Result<()> {
+        let CpuStorage::F16(dst) = s1 else {
+            candle_core::bail!("write_kv_row: destination is not fp16")
+        };
+        let src = s2.as_slice::<f16>()?;
+        let cols = l1.dim(1)?;
+        for i in 0..cols {
+            let doff = l1.start_offset() + self.pos * l1.stride()[0] + i * l1.stride()[1];
+            let soff = l2.start_offset() + i * l2.stride()[1];
+            dst[doff] = src[soff];
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &mut candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+    ) -> candle_core::Result<()> {
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        let dev = s1.device.clone();
+        let dst = s1.as_cuda_slice_mut::<f16>()?;
+        let src = s2.as_cuda_slice::<f16>()?;
+        let cols = l1.dim(1)?;
+        let func = dev.get_or_load_custom_func(
+            "write_kv_row_f16",
+            "exllama_fused_write_kv_row",
+            WRITE_KV_PTX,
+        )?;
+        let cfg = LaunchConfig::for_num_elems(cols as u32);
+        let (cols_u, pos_u) = (cols as u32, self.pos as u32);
+        let (sd0, sd1, od) = (
+            l1.stride()[0] as u32,
+            l1.stride()[1] as u32,
+            l1.start_offset() as u32,
+        );
+        let (ss, os) = (l2.stride()[1] as u32, l2.start_offset() as u32);
+        let mut args = func.builder();
+        args.arg(&mut *dst)
+            .arg(src)
+            .arg(&cols_u)
+            .arg(&pos_u)
+            .arg(&sd0)
+            .arg(&sd1)
+            .arg(&od)
+            .arg(&ss)
+            .arg(&os);
+        unsafe {
+            args.launch(cfg)
+                .map_err(|e| candle_core::Error::Cuda(Box::new(e)))?
+        };
+        Ok(())
+    }
+}
+
+#[cfg(feature = "gpu-cuda")]
+const WRITE_KV_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry write_kv_row_f16(
+    .param .u64 p_dst, .param .u64 p_src,
+    .param .u32 p_cols, .param .u32 p_pos,
+    .param .u32 p_sd0, .param .u32 p_sd1, .param .u32 p_od,
+    .param .u32 p_ss, .param .u32 p_os
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<11>;
+    .reg .b16 %rs<2>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [p_dst];
+    ld.param.u64 %rd2, [p_src];
+    ld.param.u32 %r1, [p_cols];
+    ld.param.u32 %r2, [p_pos];
+    ld.param.u32 %r3, [p_sd0];
+    ld.param.u32 %r4, [p_sd1];
+    ld.param.u32 %r5, [p_od];
+    ld.param.u32 %r6, [p_ss];
+    ld.param.u32 %r7, [p_os];
+    mov.u32 %r8, %ctaid.x;
+    mov.u32 %r0, %ntid.x;
+    mov.u32 %r9, %tid.x;
+    mad.lo.u32 %r8, %r8, %r0, %r9;
+    setp.ge.u32 %p1, %r8, %r1;
+    @%p1 bra done;
+    mad.lo.u32 %r2, %r2, %r3, %r5;
+    mad.lo.u32 %r2, %r8, %r4, %r2;
+    mul.lo.u32 %r2, %r2, 2;
+    mul.wide.u32 %rd5, %r2, 1;
+    add.u64 %rd3, %rd1, %rd5;
+    mad.lo.u32 %r7, %r8, %r6, %r7;
+    mul.lo.u32 %r7, %r7, 2;
+    mul.wide.u32 %rd5, %r7, 1;
+    add.u64 %rd4, %rd2, %rd5;
+    ld.global.b16 %rs1, [%rd4];
+    st.global.b16 [%rd3], %rs1;
+done:
+    ret;
+}
+"#;
+
+/// Depthwise conv1d + circular window gather + SiLU in one kernel.
+/// `conv` is `(hist, conv_dim)` where `hist = kernel - 1`, `cur` is the new
+/// `(conv_dim,)` row, `cw` is `(conv_dim, kernel)`. Returns `(conv_dim,)`.
+pub(crate) fn conv_step(
+    conv: &Tensor,
+    cur: &Tensor,
+    cw: &Tensor,
+    pos: usize,
+    kernel: usize,
+) -> Result<Tensor, String> {
+    if !fused_enabled() || !CONV_OK.load(Ordering::Relaxed) {
+        return conv_step_fallback(conv, cur, cw, pos, kernel);
+    }
+    let op = FusedConvStep { pos, kernel };
+    match conv.apply_op3_no_bwd(cur, cw, &op) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            static REPORTED: OnceLock<()> = OnceLock::new();
+            report_once(&REPORTED, "conv_step", &e.to_string());
+            CONV_OK.store(false, Ordering::Relaxed);
+            conv_step_fallback(conv, cur, cw, pos, kernel)
+        }
+    }
+}
+
+fn conv_step_fallback(
+    conv: &Tensor,
+    cur: &Tensor,
+    cw: &Tensor,
+    pos: usize,
+    kernel: usize,
+) -> Result<Tensor, String> {
+    let hist = kernel - 1;
+    let mut parts: Vec<Tensor> = Vec::with_capacity(kernel);
+    for j in 0..hist {
+        parts.push(
+            conv.narrow(0, (pos + j) % hist, 1)
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    parts.push(
+        cur.reshape((1, cur.elem_count()))
+            .map_err(|e| e.to_string())?,
+    );
+    let window = Tensor::cat(&parts, 0).map_err(|e| e.to_string())?;
+    window
+        .t()
+        .map_err(|e| e.to_string())?
+        .mul(cw)
+        .map_err(|e| e.to_string())?
+        .sum(1)
+        .map_err(|e| e.to_string())?
+        .silu()
+        .map_err(|e| e.to_string())
+}
+
+struct FusedConvStep {
+    pos: usize,
+    kernel: usize,
+}
+
+impl CustomOp3 for FusedConvStep {
+    fn name(&self) -> &'static str {
+        "exllama_fused_conv_step"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+        s3: &CpuStorage,
+        l3: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        let conv = s1.as_slice::<f32>()?;
+        let cur = s2.as_slice::<f32>()?;
+        let w = s3.as_slice::<f32>()?;
+        let hist = self.kernel - 1;
+        let dims = l1.dims();
+        let cols = dims[1];
+        let mut out = vec![0.0f32; cols];
+        for c in 0..cols {
+            let mut sum = 0.0f32;
+            for j in 0..self.kernel {
+                let v = if j < hist {
+                    conv[l1.start_offset()
+                        + ((self.pos + j) % hist) * l1.stride()[0]
+                        + c * l1.stride()[1]]
+                } else {
+                    cur[l2.start_offset() + c * l2.stride()[0]]
+                };
+                sum += v * w[l3.start_offset() + c * l3.stride()[0] + j * l3.stride()[1]];
+            }
+            out[c] = silu(sum);
+        }
+        Ok((CpuStorage::F32(out), Shape::from(cols)))
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+        s3: &candle_core::CudaStorage,
+        l3: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        let conv = s1.as_cuda_slice::<f32>()?;
+        let cur = s2.as_cuda_slice::<f32>()?;
+        let w = s3.as_cuda_slice::<f32>()?;
+        let cols = l1.dim(1)?;
+        let func = s1.device.get_or_load_custom_func(
+            "conv_step_f32",
+            "exllama_fused_conv_step",
+            CONV_STEP_PTX,
+        )?;
+        let out = unsafe { s1.device.alloc::<f32>(cols)? };
+        let cfg = LaunchConfig::for_num_elems(cols as u32);
+        let (cols_u, kernel_u, hist_u, pos_u) = (
+            cols as u32,
+            self.kernel as u32,
+            (self.kernel - 1) as u32,
+            self.pos as u32,
+        );
+        let (sc0, sc1, oc) = (
+            l1.stride()[0] as u32,
+            l1.stride()[1] as u32,
+            l1.start_offset() as u32,
+        );
+        let (su, ou) = (l2.stride()[0] as u32, l2.start_offset() as u32);
+        let (sw0, sw1, ow) = (
+            l3.stride()[0] as u32,
+            l3.stride()[1] as u32,
+            l3.start_offset() as u32,
+        );
+        let mut args = func.builder();
+        args.arg(conv)
+            .arg(cur)
+            .arg(w)
+            .arg(&out)
+            .arg(&cols_u)
+            .arg(&kernel_u)
+            .arg(&hist_u)
+            .arg(&pos_u)
+            .arg(&sc0)
+            .arg(&sc1)
+            .arg(&oc)
+            .arg(&su)
+            .arg(&ou)
+            .arg(&sw0)
+            .arg(&sw1)
+            .arg(&ow);
+        unsafe {
+            args.launch(cfg)
+                .map_err(|e| candle_core::Error::Cuda(Box::new(e)))?
+        };
+        Ok((
+            candle_core::CudaStorage::wrap_cuda_slice(out, s1.device.clone()),
+            Shape::from(cols),
+        ))
+    }
+}
+
+#[cfg(feature = "gpu-cuda")]
+const CONV_STEP_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry conv_step_f32(
+    .param .u64 p_conv, .param .u64 p_cur, .param .u64 p_w, .param .u64 p_y,
+    .param .u32 p_cols, .param .u32 p_kernel, .param .u32 p_hist, .param .u32 p_pos,
+    .param .u32 p_sc0, .param .u32 p_sc1, .param .u32 p_oc,
+    .param .u32 p_su, .param .u32 p_ou,
+    .param .u32 p_sw0, .param .u32 p_sw1, .param .u32 p_ow
+)
+{
+    .reg .pred %p<5>;
+    .reg .b32 %r<20>;
+    .reg .f32 %f<5>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [p_conv];
+    ld.param.u64 %rd2, [p_cur];
+    ld.param.u64 %rd3, [p_w];
+    ld.param.u64 %rd4, [p_y];
+    ld.param.u32 %r1, [p_cols];
+    ld.param.u32 %r2, [p_kernel];
+    ld.param.u32 %r3, [p_hist];
+    ld.param.u32 %r4, [p_pos];
+    ld.param.u32 %r5, [p_sc0];
+    ld.param.u32 %r6, [p_sc1];
+    ld.param.u32 %r7, [p_oc];
+    ld.param.u32 %r8, [p_su];
+    ld.param.u32 %r9, [p_ou];
+    ld.param.u32 %r10, [p_sw0];
+    ld.param.u32 %r11, [p_sw1];
+    ld.param.u32 %r12, [p_ow];
+    mov.u32 %r13, %ctaid.x;
+    mov.u32 %r14, %ntid.x;
+    mov.u32 %r15, %tid.x;
+    mad.lo.u32 %r13, %r13, %r14, %r15;
+    setp.ge.u32 %p1, %r13, %r1;
+    @%p1 bra done;
+    mov.f32 %f1, 0f00000000;
+    mov.u32 %r16, 0;
+    mov.u32 %r17, %r4;
+loop:
+    setp.ge.u32 %p2, %r16, %r2;
+    @%p2 bra loop_done;
+    setp.lt.u32 %p3, %r16, %r3;
+    @%p3 bra from_hist;
+    mad.lo.u32 %r18, %r13, %r8, %r9;
+    mul.wide.u32 %rd5, %r18, 4;
+    add.u64 %rd5, %rd2, %rd5;
+    ld.global.f32 %f2, [%rd5];
+    bra have_w;
+from_hist:
+    mad.lo.u32 %r18, %r17, %r5, %r7;
+    mad.lo.u32 %r18, %r13, %r6, %r18;
+    mul.wide.u32 %rd5, %r18, 4;
+    add.u64 %rd5, %rd1, %rd5;
+    ld.global.f32 %f2, [%rd5];
+have_w:
+    mad.lo.u32 %r18, %r13, %r10, %r12;
+    mad.lo.u32 %r18, %r16, %r11, %r18;
+    mul.wide.u32 %rd6, %r18, 4;
+    add.u64 %rd6, %rd3, %rd6;
+    ld.global.f32 %f3, [%rd6];
+    fma.rn.f32 %f1, %f2, %f3, %f1;
+    add.u32 %r16, %r16, 1;
+    add.u32 %r17, %r17, 1;
+    setp.eq.u32 %p4, %r17, %r3;
+    @%p4 mov.u32 %r17, 0;
+    bra loop;
+loop_done:
+    // silu: s / (1 + exp(-s))
+    neg.f32 %f2, %f1;
+    mul.f32 %f2, %f2, 1.44269504;
+    ex2.approx.f32 %f2, %f2;
+    add.f32 %f2, %f2, 1.0;
+    rcp.approx.f32 %f2, %f2;
+    mul.f32 %f1, %f1, %f2;
+    mul.wide.u32 %rd7, %r13, 4;
+    add.u64 %rd7, %rd4, %rd7;
+    st.global.f32 [%rd7], %f1;
+done:
+    ret;
+}
+"#;
+
+/// In-place fp32 row write for the DeltaNet conv circular buffer.
+pub(crate) fn write_conv_row(dst: &mut Tensor, row: &Tensor, pos: usize) -> Result<(), String> {
+    if fused_enabled() && KV_OK.load(Ordering::Relaxed) {
+        match dst.inplace_op2(row, &WriteRowF32 { pos }) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                static REPORTED: OnceLock<()> = OnceLock::new();
+                report_once(&REPORTED, "write_conv_row", &e.to_string());
+                KV_OK.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+    let cols = dst.dim(1).map_err(|e| e.to_string())?;
+    let r = row.reshape((1, cols)).map_err(|e| e.to_string())?;
+    let zeros = Tensor::zeros(dst.shape(), DType::F32, dst.device()).map_err(|e| e.to_string())?;
+    *dst = zeros.slice_scatter(&r, 0, pos).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+struct WriteRowF32 {
+    pos: usize,
+}
+
+impl InplaceOp2 for WriteRowF32 {
+    fn name(&self) -> &'static str {
+        "exllama_fused_write_row_f32"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &mut CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> candle_core::Result<()> {
+        let CpuStorage::F32(dst) = s1 else {
+            candle_core::bail!("write_conv_row: destination is not fp32")
+        };
+        let src = s2.as_slice::<f32>()?;
+        let cols = l1.dim(1)?;
+        let srow = if l2.stride().len() == 2 {
+            l2.stride()[1]
+        } else {
+            l2.stride()[0]
+        };
+        for i in 0..cols {
+            let doff = l1.start_offset() + self.pos * l1.stride()[0] + i * l1.stride()[1];
+            let soff = l2.start_offset() + i * srow;
+            dst[doff] = src[soff];
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &mut candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+    ) -> candle_core::Result<()> {
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        let dev = s1.device.clone();
+        let dst = s1.as_cuda_slice_mut::<f32>()?;
+        let src = s2.as_cuda_slice::<f32>()?;
+        let cols = l1.dim(1)?;
+        let func = dev.get_or_load_custom_func(
+            "write_row_f32",
+            "exllama_fused_write_row_f32",
+            WRITE_ROW_F32_PTX,
+        )?;
+        let cfg = LaunchConfig::for_num_elems(cols as u32);
+        let (cols_u, pos_u) = (cols as u32, self.pos as u32);
+        let (sd0, sd1, od) = (
+            l1.stride()[0] as u32,
+            l1.stride()[1] as u32,
+            l1.start_offset() as u32,
+        );
+        let ss = if l2.stride().len() == 2 {
+            l2.stride()[1]
+        } else {
+            l2.stride()[0]
+        };
+        let (ss_u, os) = (ss as u32, l2.start_offset() as u32);
+        let mut args = func.builder();
+        args.arg(&mut *dst)
+            .arg(src)
+            .arg(&cols_u)
+            .arg(&pos_u)
+            .arg(&sd0)
+            .arg(&sd1)
+            .arg(&od)
+            .arg(&ss_u)
+            .arg(&os);
+        unsafe {
+            args.launch(cfg)
+                .map_err(|e| candle_core::Error::Cuda(Box::new(e)))?
+        };
+        Ok(())
+    }
+}
+
+#[cfg(feature = "gpu-cuda")]
+const WRITE_ROW_F32_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry write_row_f32(
+    .param .u64 p_dst, .param .u64 p_src,
+    .param .u32 p_cols, .param .u32 p_pos,
+    .param .u32 p_sd0, .param .u32 p_sd1, .param .u32 p_od,
+    .param .u32 p_ss, .param .u32 p_os
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<11>;
+    .reg .f32 %f<2>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [p_dst];
+    ld.param.u64 %rd2, [p_src];
+    ld.param.u32 %r1, [p_cols];
+    ld.param.u32 %r2, [p_pos];
+    ld.param.u32 %r3, [p_sd0];
+    ld.param.u32 %r4, [p_sd1];
+    ld.param.u32 %r5, [p_od];
+    ld.param.u32 %r6, [p_ss];
+    ld.param.u32 %r7, [p_os];
+    mov.u32 %r8, %ctaid.x;
+    mov.u32 %r0, %ntid.x;
+    mov.u32 %r9, %tid.x;
+    mad.lo.u32 %r8, %r8, %r0, %r9;
+    setp.ge.u32 %p1, %r8, %r1;
+    @%p1 bra done;
+    mad.lo.u32 %r2, %r2, %r3, %r5;
+    mad.lo.u32 %r2, %r8, %r4, %r2;
+    mul.lo.u32 %r2, %r2, 4;
+    mul.wide.u32 %rd5, %r2, 1;
+    add.u64 %rd3, %rd1, %rd5;
+    mad.lo.u32 %r7, %r8, %r6, %r7;
+    mul.lo.u32 %r7, %r7, 4;
+    mul.wide.u32 %rd5, %r7, 1;
+    add.u64 %rd4, %rd2, %rd5;
+    ld.global.f32 %f1, [%rd4];
+    st.global.f32 [%rd3], %f1;
 done:
     ret;
 }
@@ -1965,4 +2793,169 @@ fn cuda_phase2b_kernels_match_fallback() {
         );
     }
     eprintln!("[fused] phase 2b real-GPU numeric check passed");
+}
+
+#[test]
+fn fused_deltanet_qk_norm_matches_fallback_on_cpu() {
+    let dev = candle_core::Device::Cpu;
+    let (nkh, nvh, kd) = (4usize, 8usize, 16usize);
+    let qv: Vec<f32> = (0..nkh * kd).map(|i| i as f32 / 13.0 - 2.0).collect();
+    let kv: Vec<f32> = (0..nkh * kd).map(|i| i as f32 / 17.0 + 1.0).collect();
+    let q = Tensor::from_slice(&qv, (nkh * kd,), &dev).unwrap();
+    let k = Tensor::from_slice(&kv, (nkh * kd,), &dev).unwrap();
+    let got = deltanet_qk_norm(&q, &k, nkh, nvh, kd)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let want = deltanet_qk_norm_fallback(&q, &k, nkh, nvh, kd)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    for (a, b) in got.iter().zip(&want) {
+        assert!((a - b).abs() < 1e-6, "qk norm: {} vs {}", a, b);
+    }
+    // Repetition order: value heads 2 and 3 must share key head 1.
+    for d in 0..kd {
+        assert_eq!(got[2 * kd + d], got[3 * kd + d]);
+    }
+}
+
+#[cfg(feature = "gpu-cuda")]
+#[test]
+fn cuda_deltanet_qk_norm_matches_fallback() {
+    if !candle_core::utils::cuda_is_available() {
+        eprintln!("[fused] CUDA unavailable, skipping qk norm GPU check");
+        return;
+    }
+    let dev = candle_core::Device::new_cuda(0).unwrap();
+    let (nkh, nvh, kd) = (8usize, 16usize, 128usize);
+    let qv: Vec<f32> = (0..nkh * kd).map(|i| i as f32 / 100.0 - 4.0).collect();
+    let kv: Vec<f32> = (0..nkh * kd).map(|i| i as f32 / 70.0 + 1.0).collect();
+    let q = Tensor::from_slice(&qv, (nkh * kd,), &dev).unwrap();
+    let k = Tensor::from_slice(&kv, (nkh * kd,), &dev).unwrap();
+    let got = q
+        .apply_op2_no_bwd(&k, &FusedDeltanetQkNorm { nkh, nvh, kd })
+        .expect("qk norm CUDA kernel must load")
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let want = deltanet_qk_norm_fallback(&q, &k, nkh, nvh, kd)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let mut bad = 0;
+    for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+        if (a - b).abs() >= 1e-4 + 2e-4 * scale {
+            if bad < 10 {
+                eprintln!("qk norm mismatch idx={} got={} want={}", i, a, b);
+            }
+            bad += 1;
+        }
+    }
+    assert_eq!(bad, 0, "{} qk norm values diverge", bad);
+    eprintln!("[fused] qk norm real-GPU numeric check passed");
+}
+
+#[cfg(feature = "gpu-cuda")]
+#[test]
+fn cuda_write_kv_row_matches_fallback() {
+    if !candle_core::utils::cuda_is_available() {
+        eprintln!("[fused] CUDA unavailable, skipping KV row GPU check");
+        return;
+    }
+    let dev = candle_core::Device::new_cuda(0).unwrap();
+    let (ctx, cols, pos) = (8usize, 512usize, 3usize);
+    let cache = Tensor::zeros((ctx, cols), DType::F16, &dev).unwrap();
+    let rowv: Vec<f16> = (0..cols)
+        .map(|i| f16::from_f32(i as f32 / 100.0 - 2.0))
+        .collect();
+    let row = Tensor::from_slice(&rowv, (1, cols), &dev).unwrap();
+    let got = cache;
+    got.inplace_op2(&row, &WriteKvRow { pos })
+        .expect("write_kv_row CUDA kernel must load");
+    let want = Tensor::zeros((ctx, cols), DType::F16, &dev)
+        .unwrap()
+        .slice_scatter(&row, 0, pos)
+        .unwrap();
+    let a = got
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let b = want
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_eq!(a, b);
+    eprintln!("[fused] KV row real-GPU check passed");
+}
+
+#[cfg(feature = "gpu-cuda")]
+#[test]
+fn cuda_conv_step_matches_fallback() {
+    if !candle_core::utils::cuda_is_available() {
+        eprintln!("[fused] CUDA unavailable, skipping conv GPU check");
+        return;
+    }
+    let dev = candle_core::Device::new_cuda(0).unwrap();
+    let (hist, cols, kernel, pos) = (3usize, 256usize, 4usize, 2usize);
+    let cv: Vec<f32> = (0..hist * cols).map(|i| i as f32 / 50.0 - 2.0).collect();
+    let cur: Vec<f32> = (0..cols).map(|i| i as f32 / 30.0 + 1.0).collect();
+    let wv: Vec<f32> = (0..cols * kernel).map(|i| i as f32 / 100.0 - 1.0).collect();
+    let conv = Tensor::from_slice(&cv, (hist, cols), &dev).unwrap();
+    let cur_t = Tensor::from_slice(&cur, (cols,), &dev).unwrap();
+    let w = Tensor::from_slice(&wv, (cols, kernel), &dev).unwrap();
+    let got = conv
+        .apply_op3_no_bwd(&cur_t, &w, &FusedConvStep { pos, kernel })
+        .expect("conv_step CUDA kernel must load")
+        .to_vec1::<f32>()
+        .unwrap();
+    let want = conv_step_fallback(&conv, &cur_t, &w, pos, kernel)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let mut bad = 0;
+    for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+        if (a - b).abs() >= 2e-4 + 2e-4 * scale {
+            if bad < 12 {
+                eprintln!(
+                    "conv mismatch c={} got={} want={} cur={} w0..3={:?}",
+                    i,
+                    a,
+                    b,
+                    cur[i],
+                    &wv[i * kernel..i * kernel + kernel]
+                );
+            }
+            bad += 1;
+        }
+    }
+    assert_eq!(bad, 0, "{} conv values diverge", bad);
+    // In-place row write.
+    let c2 = conv;
+    c2.inplace_op2(&cur_t, &WriteRowF32 { pos })
+        .expect("write_row_f32 CUDA kernel must load");
+    let row = c2
+        .narrow(0, pos, 1)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_eq!(row, cur);
+    eprintln!("[fused] conv real-GPU check passed");
 }

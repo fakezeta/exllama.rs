@@ -735,8 +735,10 @@ impl GpuRunner {
             .ce()?
             .to_dtype(DType::F16)
             .ce()?;
-        *kc = kc.slice_scatter(&krow, 0, pos).ce()?;
-        *vc = vc.slice_scatter(&vrow, 0, pos).ce()?;
+        // One-row in-place writes instead of copying the whole KV cache each
+        // token (the cache is allocated for the full context).
+        crate::fused::write_kv_row(kc, &krow, pos)?;
+        crate::fused::write_kv_row(vc, &vrow, pos)?;
 
         let attn = gqa_attention(kc, vc, &q, &gate, pos + 1, nh, nkv, hd)?;
         let y = w.linear(&format!("layers.{}.self_attn.o_proj", layer), &attn)?;
@@ -782,30 +784,12 @@ impl GpuRunner {
 
         let (conv, conv_pos, sstate) = &mut self.state.linear[layer_idx(w, layer, false)];
         let hist = kernel - 1;
-        let mut window_parts: Vec<Tensor> = Vec::with_capacity(hist + 1);
-        for j in 0..hist {
-            let idx = (*conv_pos + j) % hist;
-            window_parts.push(conv.narrow(0, idx, 1).ce()?.copy().ce()?);
-        }
-        window_parts.push(
-            qkv.narrow(0, 0, conv_dim)
-                .ce()?
-                .reshape((1, conv_dim))
-                .ce()?,
-        );
-        let window = Tensor::cat(&window_parts, 0).ce()?;
-        *conv = conv
-            .slice_scatter(
-                &qkv.narrow(0, 0, conv_dim)
-                    .ce()?
-                    .reshape((1, conv_dim))
-                    .ce()?,
-                0,
-                *conv_pos,
-            )
-            .ce()?;
+        let cur = qkv.narrow(0, 0, conv_dim).ce()?.reshape((conv_dim,)).ce()?;
+        // Circular gather + depthwise conv + SiLU in one kernel, then write
+        // the new row into the conv state in place.
+        let conv_out = crate::fused::conv_step(conv, &cur, &cw, *conv_pos, kernel)?;
+        crate::fused::write_conv_row(conv, &cur, *conv_pos)?;
         *conv_pos = (*conv_pos + 1) % hist;
-        let conv_out = window.t().ce()?.mul(&cw).ce()?.sum(1).ce()?.silu().ce()?;
 
         let q = conv_out.narrow(0, 0, key_dim).ce()?;
         let k = conv_out.narrow(0, key_dim, key_dim).ce()?;
@@ -1390,31 +1374,11 @@ fn deltanet_step_all(
     kd: usize,
     vd: usize,
 ) -> Result<(Tensor, Tensor), String> {
-    let rep = nvh / nkh;
-    // q/k are per key head; repeat each key head `rep` times so head i lines
-    // up with value heads i*rep .. i*rep+rep. unsqueeze(1) + repeat gives
-    // [h0,h0,h1,h1,...] order (a plain repeat of the matrix would give
-    // [h0,h1,...,h0,h1,...] instead).
-    let repeat_heads = |t: &Tensor| -> Result<Tensor, String> {
-        t.reshape((nkh, kd))
-            .ce()?
-            .unsqueeze(1)
-            .ce()?
-            .repeat((1, rep, 1))
-            .ce()?
-            .reshape((nvh, kd))
-            .ce()
-    };
-    let qh = repeat_heads(q)?;
-    let kh = repeat_heads(k)?;
-    let qh = qh
-        .broadcast_div(&k_add_eps_rows(&qh)?.unsqueeze(1).ce()?)
-        .ce()?
-        .affine(1.0 / (kd as f64).sqrt(), 0.0)
-        .ce()?;
-    let kh = kh
-        .broadcast_div(&k_add_eps_rows(&kh)?.unsqueeze(1).ce()?)
-        .ce()?;
+    // Per-head L2 norm + key-head repetition in one kernel. The result is
+    // (2, nvh, kd): row 0 = q_hat, row 1 = k_hat.
+    let qk = crate::fused::deltanet_qk_norm(q, k, nkh, nvh, kd)?;
+    let qh = qk.narrow(0, 0, 1).ce()?.reshape((nvh, kd)).ce()?;
+    let kh = qk.narrow(0, 1, 1).ce()?.reshape((nvh, kd)).ce()?;
 
     // exp(g) < 1 decays each head's recurrent state; broadcast over (kd, vd).
     let s = state
