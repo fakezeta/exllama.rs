@@ -275,7 +275,7 @@ impl Model {
         context_size: usize,
         threads: usize,
         weight_mode: &str,
-        gpu_weight_mode: &str,
+        #[cfg_attr(not(feature = "gpu"), allow(unused_variables))] gpu_weight_mode: &str,
     ) -> Result<Model, String> {
         if context_size == 0 {
             return Err("context_size must be > 0".into());
