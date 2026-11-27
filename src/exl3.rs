@@ -561,6 +561,30 @@ pub(crate) fn codebook_lut_f32(cb: Codebook) -> Vec<f32> {
     (0..=u16::MAX).map(|i| decode_f32(i, cb)).collect()
 }
 
+/// INT8 decode table for the opt-in `dp4a` kernel. Each entry is the exact
+/// f32 codebook value scaled to fill the signed int8 range and stored as the
+/// low byte of a u32 (so a warp can gather four with `ld.global.u32`). The
+/// second return value converts the integer dot product back to f32.
+/// This is an on-the-fly approximation of the fp16 codebook output; the
+/// EXL3 trellis itself is never requantized or stored in INT8 form.
+#[cfg(feature = "gpu")]
+pub(crate) fn codebook_lut_i8(cb: Codebook) -> (Vec<u32>, f32) {
+    let f = codebook_lut_f32(cb);
+    let vmax = f.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+    if vmax == 0.0 {
+        return (vec![0u32; 65536], 0.0);
+    }
+    let to_i8 = 127.0 / vmax;
+    let bytes = f
+        .iter()
+        .map(|&v| {
+            let q = (v * to_i8).round().clamp(-127.0, 127.0) as i8;
+            (q as u8) as u32
+        })
+        .collect();
+    (bytes, 1.0 / to_i8)
+}
+
 #[cfg(feature = "gpu")]
 impl QuantLinear {
     /// Hand the packed trellis to the device path without decoding it.
@@ -2636,11 +2660,14 @@ mod synthetic_tests {
         .unwrap();
         let xt = candle_core::Tensor::from_slice(&xr, (ql.k,), &dev).unwrap();
         let lt = candle_core::Tensor::from_slice(&lut, (65536,), &dev).unwrap();
-        let got = crate::fused::packed_dot(&tt, &xt, &lt, up.layout)
+        let st = candle_core::Tensor::from_slice(&ql.svh, (ql.n,), &dev).unwrap();
+        let (lut8, ws) = codebook_lut_i8(up.codebook);
+        let lt_i8 = candle_core::Tensor::from_slice(&lut8, (65536,), &dev).unwrap();
+        let got = crate::fused::packed_linear(&tt, &xt, &lt, &lt_i8, ws, &st, up.layout)
             .unwrap()
             .to_vec1::<f32>()
             .unwrap();
-        assert_close("fused CPU packed dot", &got, &t);
+        assert_close("fused CPU packed linear", &got, &y);
     }
 
     #[cfg(feature = "gpu")]

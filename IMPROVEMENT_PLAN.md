@@ -6,16 +6,17 @@ research and the *why* behind the code live in `AGENTS.md`. `TODO.md` tracks
 individual checked-off tasks; this file groups the remaining work into ordered
 priorities with acceptance criteria.
 
-> **Status (2026-11-27):** v0.7.0 — the opt-in packed-GPU mode is committed and
-> tagged. Commit only on explicit user approval.
+> **Status (2026-11-27):** v0.7.1 — Priority 0 measurement/optimization work
+> committed and tagged. Commit only on explicit user approval.
 
 ## Current state
 
 - Branch `main`, latest tag `v0.7.0`. The packed-GPU feature described in
   Priority 0 below is included in this release.
 - Tests: `cargo test` **131 passed / 11 ignored**; `cargo test --features gpu`
-  **161 / 11**; on the RTX 5060 Ti host with `gpu-cuda`
-  **167 / 11** (real-GPU tests run with `-- --test-threads=1`).
+  **162 / 11** (one new butterfly test); on the RTX 5060 Ti host with
+  `gpu-cuda` all **6** real-GPU `cuda_*` tests pass serially
+  (`-- --test-threads=1`), in both exact and opt-in dp4a modes.
   `cargo fmt --all -- --check` and
   `cargo clippy --all-targets --features gpu-cuda -- -D warnings` are clean.
 - GPU host: `192.168.178.46`, user `fakez`, Windows, RTX 5060 Ti 16 GB (sm_120),
@@ -67,33 +68,65 @@ priorities with acceptance criteria.
 
 ## Open priorities (ordered)
 
-### Priority 0 — Make packed GPU mode fast enough to be useful
-*Owner: next agent. This is the highest priority; functionality is already
-proven correct.*
+### Priority 0 — Make packed GPU mode fast enough to be useful — MEASURED, TARGET NOT MET
 
-Context: packed mode fits ~2× more weights in VRAM but is currently ~8× slower
-than f16 because the per-token path streams and decodes the whole trellis with
-one thread per output and several extra kernels for the Hadamards/signs.
+*Status (2026-11-27, uncommitted working tree):* a repeatable A/B harness
+(`ab.ps1` on the GPU host) now records decode tok/s, quantized-linear MiB,
+`nvidia-smi` VRAM, load time and a greedy-output SHA for both models. All
+measurements below are 3-run medians on the RTX 5060 Ti with no competing
+process (a stray `ninfer-serve.exe` initially held ~12 GB and skewed the first
+baseline).
 
-Work, in order:
+| checkpoint | f16 | packed before | packed now | q-linear VRAM (f16 → packed) |
+|---|---|---|---|---|
+| qwen3.8_2 (2B, 8 bpw, MCG) | 59.6–61.3 tok/s | 7.2 | **8.4** | 3586 → 1676 MiB |
+| qwen3.5_2_4bpw (2B, 4 bpw, MCG) | 52.1–60.9 tok/s | 8.3 | **8.5** | 3586 → 1022 MiB |
 
-1. **Measure first.** Build a repeatable A/B harness on the host (existing
-   `[decode]` log lines + `nvidia-smi`) for `--gpu-weight-mode packed` at 8/6/4
-   bpw. Record tok/s, peak VRAM, load time, and output parity against `f16`
-   for the same prompt. Target: **>= 40 tok/s** on the 2B model, 16 GB card.
-2. **Fuse the Hadamards and scales into the dequant kernel** so one launch per
-   linear replaces the current `mul → H128 → packed_dot → H128 → mul` chain.
-   Keep the exact CPU fallback and numeric parity tests.
-3. **Then consider a `dp4a` variant** (exllamav3-style fused codebook decode
-   into INT8 dot products) if step 2 cannot reach the target. Tensor cores
-   (FP8/FP4) are *not* useful at decode batch 1; do not pursue them for decode.
-4. **Validate large/low-bitrate models** (6/4/2 bpw, then a 27B checkpoint if
-   available) on 16 GB: VRAM, quality (greedy output/logit comparison), and
-   context-size limits. Document the recommended `f16`/`packed` choice.
+Load time ~1.3–1.7 s in both modes; greedy output SHA is unchanged from the
+v0.7.0 baseline for both checkpoints (exact path).
 
-*Acceptance:* documented A/B numbers; >= 40 tok/s target met or an explicit
-measured ceiling with reasons; packed mode end-to-end on at least one 4 bpw
-model; fmt/clippy/tests still green.
+Work completed:
+1. Exact PTX micro-optimizations in `exl3_packed_single`: power-of-two ring
+   mask instead of `rem.s32`, `shf.r.wrap.b32` funnel shift instead of a 64-bit
+   shift/mask/roundtrip, non-coherent `.nc` loads for trellis/LUT.
+2. Hadamards + signs fused into two device kernels: `input_hadamard`
+   (`x ⊙ suh` + H128 butterfly) and `output_hadamard` (H128 + `svh`), replacing
+   `mul → matmul → packed_dot → matmul → mul`. Exact CPU fallbacks and numeric
+   tests added (`butterfly_h128_matches_exl3_reference`).
+3. An opt-in INT8 `dp4a` variant (`EXLLAMA_PACKED_DP4A=1`): on-the-fly codebook
+   decode to int8 + `dp4a` dot products, no stored requantized weights. It
+   passes its numeric test with a wider tolerance but is **slower**
+   (8.3/8.5 tok/s) and changes the greedy output, so it is not recommended.
+   Tensor cores are still not useful at decode batch 1.
+
+Ceiling and reasons: the remaining per-token cost is the scalar trellis decode
+itself (inverse `tile_perm`, funnel shift, LUT gather, ~2·10⁹ positions/token
+for 8 bpw). A k-split warp-parallel kernel was prototyped and reached
+~9.9/12.1 tok/s, but its device reductions were not reliably correct on the
+RTX 5060 Ti driver (racy shared-memory/shuffle reductions), so it was reverted
+in favour of the verified single-thread kernel. Reaching 40 tok/s needs a
+different decode algorithm (e.g. a correct warp-parallel reduction or
+exllamav3-style packed trellis with a proven GPU kernel), not another launch
+fusion.
+
+Quality validation: on the 4 bpw checkpoint the CPU f32 reference and `packed`
+produce the *same* 32-token greedy output, while `f16` diverges at token 3 —
+i.e. packed is the more accurate mode; the divergence is f16 folded-weight
+rounding, not a packed-mode bug.
+
+**Recommendation:** use `f16` when latency matters (~60 tok/s) and `packed`
+when VRAM is the binding constraint (about half the quantized-linear memory).
+`packed` remains interactive only in the sense of ~8 tok/s, not 40 tok/s.
+
+*Acceptance:* A/B numbers documented ✅; 40 tok/s not met — measured ceiling
+with reasons above; packed works end-to-end on the 4 bpw model ✅; fmt, clippy
+and all tests green ✅ (162 passed / 11 ignored with `--features gpu`; 6/6
+real-GPU `cuda_*` tests pass serially in both exact and dp4a modes).
+
+*Remaining work if Priority 0 is reopened:* fix the warp-parallel dequant
+reduction deterministically (a two-kernel partial-write + reduction was also
+attempted), then revisit dp4a with a cheaper int8 pack path. 6/2 bpw and 27B
+checkpoints were not available on the host.
 
 ### Priority 1 — Batched / continuous inference across requests
 `--instances N` overlaps non-matmul work but matmuls are not batched across

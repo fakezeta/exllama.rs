@@ -65,6 +65,10 @@ enum QuantWeight {
     Packed {
         trellis: Tensor,
         lut: Tensor,
+        /// INT8 decode table for the opt-in dp4a kernel (one byte per codeword).
+        lut_i8: Tensor,
+        /// f32 multiplier that converts an INT8 dot product back to f32.
+        w_scale: f32,
         suh: Tensor,
         svh: Tensor,
         layout: PackedLayout,
@@ -93,6 +97,9 @@ pub(crate) struct GpuWeights {
     qhat: HashMap<String, QuantWeight>,
     /// Exact f32 codebook decode tables, one per codebook actually used.
     luts: Vec<Option<Tensor>>,
+    /// INT8 decode tables + dequantization scales for the dp4a variant.
+    luts_i8: Vec<Option<Tensor>>,
+    w_scales: Vec<f32>,
     /// 1-D tensors (norms, conv weights, A_log, dt_bias), F32.
     vecs: HashMap<String, Tensor>,
     /// `1 + w` for every `*norm.weight` vector, precomputed at load. RMSNorm
@@ -240,6 +247,8 @@ impl GpuWeights {
         // full-size intermediates a device-side fold would allocate.
         // Packed: upload the trellis verbatim and decode it in the forward.
         let mut luts: Vec<Option<Tensor>> = vec![None, None, None];
+        let mut luts_i8: Vec<Option<Tensor>> = vec![None, None, None];
+        let mut w_scales = vec![0.0f32; 3];
         let mut qhat = HashMap::new();
         let mut qhat_bytes = 0usize;
         for (name, ql) in &ex.linears {
@@ -263,11 +272,24 @@ impl GpuWeights {
                     luts[id] = Some(lut);
                 }
                 let lut = luts[id].as_ref().expect("LUT just uploaded").clone();
+                if luts_i8[id].is_none() {
+                    let (bytes, scale) = crate::exl3::codebook_lut_i8(up.codebook);
+                    let t = Tensor::from_slice(&bytes, (65536,), device)
+                        .map_err(|e| format!("{}: upload INT8 codebook LUT: {}", name, e))?;
+                    luts_i8[id] = Some(t);
+                    w_scales[id] = scale;
+                }
+                let lut_i8 = luts_i8[id]
+                    .as_ref()
+                    .expect("INT8 LUT just uploaded")
+                    .clone();
                 let suh = Tensor::from_slice(&up.suh, (up.layout.k,), device).ce()?;
                 let svh = Tensor::from_slice(&up.svh, (up.layout.n,), device).ce()?;
                 QuantWeight::Packed {
                     trellis,
                     lut,
+                    lut_i8,
+                    w_scale: w_scales[id],
                     suh,
                     svh,
                     layout: up.layout,
@@ -334,6 +356,8 @@ impl GpuWeights {
             mats,
             qhat,
             luts,
+            luts_i8,
+            w_scales,
             vecs,
             norm1,
             rope_cos: rope_cos_t,
@@ -421,12 +445,16 @@ impl GpuWeights {
         Self::matmul_w(w, x)
     }
 
-    /// One EXL3 linear from the packed trellis: mask + H128 on the input,
-    /// dequant-dot from the trellis, H128 and sign vector on the output.
+    /// One EXL3 linear from the packed trellis. Both Hadamards and the sign
+    /// vectors are fused into two device kernels (`input_h128` and
+    /// `packed_linear`); the trellis is never materialized as a dense weight.
+    #[allow(clippy::too_many_arguments)]
     fn packed_linear(
         &self,
         trellis: &Tensor,
         lut: &Tensor,
+        lut_i8: &Tensor,
+        w_scale: f32,
         suh: &Tensor,
         svh: &Tensor,
         layout: PackedLayout,
@@ -440,10 +468,8 @@ impl GpuWeights {
             ));
         }
         let x = x.reshape((layout.k,)).ce()?;
-        let xr = self.hadamard(&x.mul(suh).ce()?)?;
-        let t = crate::fused::packed_dot(trellis, &xr, lut, layout)?;
-        let th = self.hadamard(&t)?;
-        th.mul(svh).ce()
+        let xr = crate::fused::input_hadamard(&x, suh)?;
+        crate::fused::packed_linear(trellis, &xr, lut, lut_i8, w_scale, svh, layout)
     }
 
     /// Resolve the embedding table (shared by the token lookup and the tied
@@ -465,10 +491,12 @@ impl GpuWeights {
                 QuantWeight::Packed {
                     trellis,
                     lut,
+                    lut_i8,
+                    w_scale,
                     suh,
                     svh,
                     layout,
-                } => self.packed_linear(trellis, lut, suh, svh, *layout, x),
+                } => self.packed_linear(trellis, lut, lut_i8, *w_scale, suh, svh, *layout, x),
             };
         }
         // Tied checkpoints have no separate lm_head: the embedding table is
@@ -1609,6 +1637,8 @@ mod tests {
             mats: HashMap::new(),
             qhat: HashMap::new(),
             luts: vec![None, None, None],
+            luts_i8: vec![None, None, None],
+            w_scales: vec![0.0f32; 3],
             vecs: HashMap::new(),
             norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
@@ -1660,6 +1690,8 @@ mod tests {
             mats: HashMap::new(),
             qhat: HashMap::new(),
             luts: vec![None, None, None],
+            luts_i8: vec![None, None, None],
+            w_scales: vec![0.0f32; 3],
             vecs: HashMap::new(),
             norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
@@ -1714,6 +1746,8 @@ mod tests {
             mats: HashMap::new(),
             qhat: HashMap::new(),
             luts: vec![None, None, None],
+            luts_i8: vec![None, None, None],
+            w_scales: vec![0.0f32; 3],
             vecs: HashMap::new(),
             norm1: HashMap::new(),
             // pos 0: cos=0.8, sin=0.6 for both rotary pairs.
@@ -2040,6 +2074,8 @@ mod tests {
             mats,
             qhat: HashMap::new(),
             luts: vec![None, None, None],
+            luts_i8: vec![None, None, None],
+            w_scales: vec![0.0f32; 3],
             vecs,
             norm1: HashMap::new(),
             rope_cos: tiny_f32_mat(&dev, 4, 1),
@@ -2198,6 +2234,8 @@ mod tests {
             mats: HashMap::new(),
             qhat: HashMap::new(),
             luts: vec![None, None, None],
+            luts_i8: vec![None, None, None],
+            w_scales: vec![0.0f32; 3],
             vecs: HashMap::new(),
             norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
@@ -2285,6 +2323,8 @@ mod tests {
             mats: HashMap::new(),
             qhat: HashMap::new(),
             luts: vec![None, None, None],
+            luts_i8: vec![None, None, None],
+            w_scales: vec![0.0f32; 3],
             vecs: HashMap::new(),
             norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
@@ -2443,6 +2483,8 @@ mod tests {
             mats,
             qhat,
             luts: vec![None, None, None],
+            luts_i8: vec![None, None, None],
+            w_scales: vec![0.0f32; 3],
             vecs: HashMap::new(),
             norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
@@ -2527,6 +2569,8 @@ mod tests {
             mats: HashMap::new(),
             qhat: HashMap::new(),
             luts: vec![None, None, None],
+            luts_i8: vec![None, None, None],
+            w_scales: vec![0.0f32; 3],
             vecs: HashMap::new(),
             norm1: HashMap::new(),
             rope_cos: Tensor::zeros((1, 1), DType::F32, &dev).unwrap(),
@@ -2792,6 +2836,8 @@ mod tests {
             mats,
             qhat: HashMap::new(),
             luts: vec![None, None, None],
+            luts_i8: vec![None, None, None],
+            w_scales: vec![0.0f32; 3],
             vecs,
             norm1: HashMap::new(),
             rope_cos: Tensor::zeros((8, 1), DType::F32, &dev).unwrap(),

@@ -30,6 +30,303 @@ fn report_once(slot: &'static OnceLock<()>, op: &str, err: &str) {
     eprintln!("[fused] {op} kernel unavailable ({err}); using fallback for this process");
 }
 
+// ---------------------------------------------------------------------------
+// Packed EXL3: fused input/output H128 + sign vectors
+// ---------------------------------------------------------------------------
+
+static INPUT_H_OK: AtomicBool = AtomicBool::new(true);
+
+/// Normalized Sylvester H128, in place, one 128-element block. This is the
+/// exact butterfly used by `exl3::hadamard128` and by the CUDA kernels; keeping
+/// the same operation order makes the CPU fallback a numeric reference.
+pub(crate) fn butterfly_h128(v: &mut [f32]) {
+    debug_assert_eq!(v.len(), 128);
+    let scale = 1.0 / (128.0f32).sqrt();
+    for step in [1usize, 2, 4, 8, 16, 32, 64] {
+        for i in 0..128 {
+            if i & step == 0 {
+                let a = v[i];
+                let b = v[i + step];
+                v[i] = a + b;
+                v[i + step] = a - b;
+            }
+        }
+    }
+    for x in v.iter_mut() {
+        *x *= scale;
+    }
+}
+
+/// `xr = H128(x * suh)`, applied independently to each 128-block.
+pub(crate) fn input_hadamard_f32(x: &[f32], suh: &[f32]) -> Result<Vec<f32>, String> {
+    if x.len() != suh.len() || x.is_empty() || !x.len().is_multiple_of(128) {
+        return Err(format!(
+            "input hadamard: x={} suh={}, want equal non-zero multiples of 128",
+            x.len(),
+            suh.len()
+        ));
+    }
+    let mut out: Vec<f32> = x.iter().zip(suh).map(|(&a, &b)| a * b).collect();
+    for blk in out.as_chunks_mut::<128>().0 {
+        butterfly_h128(blk);
+    }
+    Ok(out)
+}
+
+/// `y = svh * H128(t)`, applied independently to each 128-block.
+pub(crate) fn output_hadamard_scale_f32(t: &[f32], svh: &[f32]) -> Result<Vec<f32>, String> {
+    if t.len() != svh.len() || t.is_empty() || !t.len().is_multiple_of(128) {
+        return Err(format!(
+            "output hadamard: t={} svh={}, want equal non-zero multiples of 128",
+            t.len(),
+            svh.len()
+        ));
+    }
+    let mut out = t.to_vec();
+    for blk in out.as_chunks_mut::<128>().0 {
+        butterfly_h128(blk);
+    }
+    for (v, &s) in out.iter_mut().zip(svh) {
+        *v *= s;
+    }
+    Ok(out)
+}
+
+/// Fused `xr = H128(x * suh)`. Replaces `x.mul(suh)` followed by a
+/// reshape/matmul/flatten Hadamard with one launch. Falls back to the exact
+/// butterfly if the CUDA kernel cannot be loaded or launched.
+pub(crate) fn input_hadamard(x: &Tensor, suh: &Tensor) -> Result<Tensor, String> {
+    if x.elem_count() != suh.elem_count() || !x.elem_count().is_multiple_of(128) {
+        return Err(format!(
+            "input hadamard: x={} suh={}, want equal non-zero multiples of 128",
+            x.elem_count(),
+            suh.elem_count()
+        ));
+    }
+    if !fused_enabled() || !INPUT_H_OK.load(Ordering::Relaxed) {
+        return input_hadamard_fallback(x, suh);
+    }
+    let op = FusedInputH;
+    match x.apply_op2_no_bwd(suh, &op) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            static REPORTED: OnceLock<()> = OnceLock::new();
+            report_once(&REPORTED, "input_h128", &e.to_string());
+            INPUT_H_OK.store(false, Ordering::Relaxed);
+            input_hadamard_fallback(x, suh)
+        }
+    }
+}
+
+fn input_hadamard_fallback(x: &Tensor, suh: &Tensor) -> Result<Tensor, String> {
+    use candle_core::Storage;
+    let read = |t: &Tensor| -> Result<Vec<f32>, String> {
+        let (storage, layout) = t.storage_and_layout();
+        match &*storage {
+            Storage::Cpu(c) => {
+                let all = c.as_slice::<f32>().map_err(|e| e.to_string())?;
+                let start = layout.start_offset();
+                Ok(all[start..start + t.elem_count()].to_vec())
+            }
+            _ => Err("input_h128 fallback needs CPU tensors".into()),
+        }
+    };
+    let out = input_hadamard_f32(&read(x)?, &read(suh)?)?;
+    Tensor::from_vec(out, (x.elem_count(),), x.device()).map_err(|e| e.to_string())
+}
+
+struct FusedInputH;
+
+impl CustomOp2 for FusedInputH {
+    fn name(&self) -> &'static str {
+        "exlama_fused_input_h128"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        let x = s1.as_slice::<f32>()?;
+        let su = s2.as_slice::<f32>()?;
+        let out = input_hadamard_f32(
+            &x[l1.start_offset()..l1.start_offset() + l1.shape().elem_count()],
+            &su[l2.start_offset()..l2.start_offset() + l2.shape().elem_count()],
+        )
+        .map_err(candle_core::Error::Msg)?;
+        Ok((CpuStorage::F32(out), l1.shape().clone()))
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        let x = s1.as_cuda_slice::<f32>()?;
+        let su = s2.as_cuda_slice::<f32>()?;
+        let len = l1.shape().elem_count();
+        let out = unsafe { s1.device.alloc::<f32>(len)? };
+        let func = s1.device.get_or_load_custom_func(
+            "exl3_input_h128",
+            "exllama_exl3_h128",
+            INPUT_H_PTX,
+        )?;
+        let blocks_u = (len / 128) as u32;
+        let sx = l1.start_offset() as u32;
+        let ss = l2.start_offset() as u32;
+        let after = 0u32;
+        let scale = 1.0f32 / (128.0f32).sqrt();
+        let mut args = func.builder();
+        args.arg(x)
+            .arg(su)
+            .arg(&out)
+            .arg(&blocks_u)
+            .arg(&scale)
+            .arg(&sx)
+            .arg(&ss)
+            .arg(&after);
+        let cfg = LaunchConfig {
+            grid_dim: (blocks_u, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 128 * 4,
+        };
+        unsafe {
+            args.launch(cfg)
+                .map_err(|e| candle_core::Error::Cuda(Box::new(e)))?
+        };
+        Ok((
+            candle_core::CudaStorage::wrap_cuda_slice(out, s1.device.clone()),
+            l1.shape().clone(),
+        ))
+    }
+}
+
+#[cfg(feature = "gpu-cuda")]
+const INPUT_H_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry exl3_input_h128(
+    .param .u64 p_x,
+    .param .u64 p_su,
+    .param .u64 p_out,
+    .param .u32 p_blocks,
+    .param .f32 p_scale,
+    .param .u32 p_start_x,
+    .param .u32 p_start_su,
+    .param .u32 p_after
+)
+{
+    .reg .u32 %blk, %tidv, %idx, %ix, %is, %off, %off2, %partner, %bit, %after;
+    .reg .u32 %sbase, %saddr;
+    .reg .u64 %rd1, %rd2, %rd3, %rd4;
+    .reg .f32 %val, %other, %scale, %sv;
+    .reg .pred %padd, %pA, %pB;
+    .shared .f32 sdata[128];
+
+    mov.u32 %sbase, sdata;
+
+    ld.param.u64 %rd1, [p_x];
+    ld.param.u64 %rd2, [p_su];
+    ld.param.u64 %rd3, [p_out];
+    ld.param.f32 %scale, [p_scale];
+    ld.param.u32 %ix, [p_start_x];
+    ld.param.u32 %is, [p_start_su];
+    ld.param.u32 %after, [p_after];
+    mov.u32 %blk, %ctaid.x;
+    mov.u32 %tidv, %tid.x;
+    mad.lo.u32 %idx, %blk, 128, %tidv;
+    add.u32 %ix, %ix, %idx;
+    add.u32 %is, %is, %idx;
+
+    mul.wide.u32 %rd4, %ix, 4;
+    add.u64 %rd4, %rd1, %rd4;
+    ld.global.f32 %val, [%rd4];
+    mul.wide.u32 %rd4, %is, 4;
+    add.u64 %rd4, %rd2, %rd4;
+    ld.global.f32 %sv, [%rd4];
+    setp.eq.u32 %pA, %after, 0;
+    @%pA mul.f32 %val, %val, %sv;
+
+    mul.lo.u32 %off, %tidv, 4;
+    add.u32 %saddr, %sbase, %off;
+    st.shared.f32 [%saddr], %val;
+    bar.sync 0;
+
+    // Seven butterfly strides; sign is (-1)^(tid & stride), matching
+    // exl3::hadamard128 exactly.
+    xor.b32 %partner, %tidv, 1; mul.lo.u32 %off2, %partner, 4;
+    add.u32 %saddr, %sbase, %off2;
+    ld.shared.f32 %other, [%saddr]; and.b32 %bit, %tidv, 1;
+    setp.eq.u32 %padd, %bit, 0;
+    @%padd add.f32 %val, %val, %other;
+    @!%padd sub.f32 %val, %other, %val;
+    bar.sync 0; add.u32 %saddr, %sbase, %off; st.shared.f32 [%saddr], %val; bar.sync 0;
+
+    xor.b32 %partner, %tidv, 2; mul.lo.u32 %off2, %partner, 4;
+    add.u32 %saddr, %sbase, %off2;
+    ld.shared.f32 %other, [%saddr]; and.b32 %bit, %tidv, 2;
+    setp.eq.u32 %padd, %bit, 0;
+    @%padd add.f32 %val, %val, %other;
+    @!%padd sub.f32 %val, %other, %val;
+    bar.sync 0; add.u32 %saddr, %sbase, %off; st.shared.f32 [%saddr], %val; bar.sync 0;
+
+    xor.b32 %partner, %tidv, 4; mul.lo.u32 %off2, %partner, 4;
+    add.u32 %saddr, %sbase, %off2;
+    ld.shared.f32 %other, [%saddr]; and.b32 %bit, %tidv, 4;
+    setp.eq.u32 %padd, %bit, 0;
+    @%padd add.f32 %val, %val, %other;
+    @!%padd sub.f32 %val, %other, %val;
+    bar.sync 0; add.u32 %saddr, %sbase, %off; st.shared.f32 [%saddr], %val; bar.sync 0;
+
+    xor.b32 %partner, %tidv, 8; mul.lo.u32 %off2, %partner, 4;
+    add.u32 %saddr, %sbase, %off2;
+    ld.shared.f32 %other, [%saddr]; and.b32 %bit, %tidv, 8;
+    setp.eq.u32 %padd, %bit, 0;
+    @%padd add.f32 %val, %val, %other;
+    @!%padd sub.f32 %val, %other, %val;
+    bar.sync 0; add.u32 %saddr, %sbase, %off; st.shared.f32 [%saddr], %val; bar.sync 0;
+
+    xor.b32 %partner, %tidv, 16; mul.lo.u32 %off2, %partner, 4;
+    add.u32 %saddr, %sbase, %off2;
+    ld.shared.f32 %other, [%saddr]; and.b32 %bit, %tidv, 16;
+    setp.eq.u32 %padd, %bit, 0;
+    @%padd add.f32 %val, %val, %other;
+    @!%padd sub.f32 %val, %other, %val;
+    bar.sync 0; add.u32 %saddr, %sbase, %off; st.shared.f32 [%saddr], %val; bar.sync 0;
+
+    xor.b32 %partner, %tidv, 32; mul.lo.u32 %off2, %partner, 4;
+    add.u32 %saddr, %sbase, %off2;
+    ld.shared.f32 %other, [%saddr]; and.b32 %bit, %tidv, 32;
+    setp.eq.u32 %padd, %bit, 0;
+    @%padd add.f32 %val, %val, %other;
+    @!%padd sub.f32 %val, %other, %val;
+    bar.sync 0; add.u32 %saddr, %sbase, %off; st.shared.f32 [%saddr], %val; bar.sync 0;
+
+    xor.b32 %partner, %tidv, 64; mul.lo.u32 %off2, %partner, 4;
+    add.u32 %saddr, %sbase, %off2;
+    ld.shared.f32 %other, [%saddr]; and.b32 %bit, %tidv, 64;
+    setp.eq.u32 %padd, %bit, 0;
+    @%padd add.f32 %val, %val, %other;
+    @!%padd sub.f32 %val, %other, %val;
+
+    setp.ne.u32 %pB, %after, 0;
+    @%pB mul.f32 %val, %val, %sv;
+    mul.f32 %val, %val, %scale;
+    mul.wide.u32 %rd4, %idx, 4;
+    add.u64 %rd4, %rd3, %rd4;
+    st.global.f32 [%rd4], %val;
+    ret;
+}
+"#;
+
 /// `out = x * rsqrt(mean(x^2) + eps) * w1`, where `w1 = 1 + w` is precomputed
 /// at load. `x` is 1-D `(cols,)` or 2-D `(rows, cols)`; the reduction is always
 /// over the last dim (one scale per row/head).
@@ -2385,21 +2682,58 @@ use crate::exl3::PackedLayout;
 
 static PACKED_OK: AtomicBool = AtomicBool::new(true);
 
-/// `t = W_hat^T @ xr`, decoded directly from the packed trellis. `trellis` is a
-/// contiguous (tiles_k, tiles_n, words_per_tile/2) U32 tensor, `xr` is the
-/// input-side Hadamard of the masked activations, and `lut` is the exact f32
-/// decode table for the layer's codebook. The caller applies the output-side
-/// Hadamard and sign vector, so this op never materializes a full weight.
-pub(crate) fn packed_dot(
+/// One EXL3 quantized linear, entirely on device from the packed trellis:
+/// `y = svh * H128(W_hat^T @ xr)`. The input Hadamard is `input_hadamard`;
+/// the dequant kernel splits each output row's k-loop over a warp's lanes
+/// (so the GPU is not limited to one block per SM), and a small output
+/// butterfly applies H128 and the sign vector.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn packed_linear(
+    trellis: &Tensor,
+    xr: &Tensor,
+    lut: &Tensor,
+    lut_i8: &Tensor,
+    w_scale: f32,
+    svh: &Tensor,
+    layout: PackedLayout,
+) -> Result<Tensor, String> {
+    if svh.elem_count() != layout.n {
+        return Err(format!(
+            "packed linear: svh has {} values, expected n={}",
+            svh.elem_count(),
+            layout.n
+        ));
+    }
+    if !fused_enabled() || !PACKED_OK.load(Ordering::Relaxed) {
+        return packed_linear_fallback(trellis, xr, lut, svh, layout);
+    }
+    let t = if dp4a_enabled() {
+        let op = FusedPackedDp4a {
+            lut_i8: lut_i8.clone(),
+            w_scale,
+            layout,
+        };
+        trellis
+            .apply_op2_no_bwd(xr, &op)
+            .map_err(|e| e.to_string())?
+    } else {
+        packed_dot_split(trellis, xr, lut, layout)?
+    };
+    output_hadamard(&t, svh)
+}
+
+/// `t = W_hat^T @ xr`, decoded from the trellis. One warp per output row; the
+/// 32 lanes split the `tiles_k` loop, so even a small linear fills the GPU.
+fn packed_dot_split(
     trellis: &Tensor,
     xr: &Tensor,
     lut: &Tensor,
     layout: PackedLayout,
 ) -> Result<Tensor, String> {
     if !fused_enabled() || !PACKED_OK.load(Ordering::Relaxed) {
-        return packed_dot_fallback(trellis, xr, lut, layout);
+        return packed_dot_split_fallback(trellis, xr, lut, layout);
     }
-    let op = FusedPackedDot {
+    let op = FusedPackedDotSplit {
         lut: lut.clone(),
         layout,
     };
@@ -2407,55 +2741,436 @@ pub(crate) fn packed_dot(
         Ok(t) => Ok(t),
         Err(e) => {
             static REPORTED: OnceLock<()> = OnceLock::new();
-            report_once(&REPORTED, "exl3_packed_dot", &e.to_string());
+            report_once(&REPORTED, "exl3_packed_single", &e.to_string());
             PACKED_OK.store(false, Ordering::Relaxed);
-            packed_dot_fallback(trellis, xr, lut, layout)
+            packed_dot_split_fallback(trellis, xr, lut, layout)
         }
     }
 }
 
-fn packed_dot_fallback(
+fn packed_dot_split_fallback(
     trellis: &Tensor,
     xr: &Tensor,
     lut: &Tensor,
     layout: PackedLayout,
 ) -> Result<Tensor, String> {
     use candle_core::Storage;
-    let (ts, tl) = trellis.storage_and_layout();
-    let (xs, xl) = xr.storage_and_layout();
-    let (ls, _) = lut.storage_and_layout();
-    match (&*ts, &*xs, &*ls) {
-        (Storage::Cpu(tc), Storage::Cpu(xc), Storage::Cpu(lc)) => {
-            let all_words = tc.as_slice::<u32>().map_err(|e| e.to_string())?;
-            let nw = layout.words_per_tile / 2;
-            let nwords = layout.tiles_k * layout.tiles_n * nw;
-            let start = tl.start_offset();
-            if start + nwords > all_words.len() {
-                return Err("packed_dot: trellis storage too short".into());
+    let read = |t: &Tensor| -> Result<Vec<f32>, String> {
+        let (storage, l) = t.storage_and_layout();
+        match &*storage {
+            Storage::Cpu(c) => {
+                let all = c.as_slice::<f32>().map_err(|e| e.to_string())?;
+                Ok(all[l.start_offset()..l.start_offset() + t.elem_count()].to_vec())
             }
-            let words = &all_words[start..start + nwords];
-            let all_x = xc.as_slice::<f32>().map_err(|e| e.to_string())?;
-            let xs0 = xl.start_offset();
-            if xs0 + layout.k > all_x.len() {
-                return Err("packed_dot: xr storage too short".into());
-            }
-            let xr = &all_x[xs0..xs0 + layout.k];
-            let lut = lc.as_slice::<f32>().map_err(|e| e.to_string())?;
-            let t = crate::exl3::packed_dot_host_impl(words, layout, lut, xr)?;
-            Tensor::from_vec(t, (layout.n,), trellis.device()).map_err(|e| e.to_string())
+            _ => Err("packed_dot fallback needs CPU tensors".into()),
         }
-        _ => Err("packed_dot fallback is only implemented for CPU tensors".into()),
+    };
+    let (ts, tl) = trellis.storage_and_layout();
+    let Storage::Cpu(tc) = &*ts else {
+        return Err("packed_dot fallback needs CPU tensors".into());
+    };
+    let all_words = tc.as_slice::<u32>().map_err(|e| e.to_string())?;
+    let nw = layout.words_per_tile / 2;
+    let nwords = layout.tiles_k * layout.tiles_n * nw;
+    let start = tl.start_offset();
+    if start + nwords > all_words.len() {
+        return Err("packed_dot: trellis storage too short".into());
+    }
+    let t = crate::exl3::packed_dot_host_impl(
+        &all_words[start..start + nwords],
+        layout,
+        &read(lut)?,
+        &read(xr)?,
+    )?;
+    Tensor::from_vec(t, (layout.n,), trellis.device()).map_err(|e| e.to_string())
+}
+
+// Opt-in INT8 dp4a variant. On-the-fly decode approximation; the trellis is
+// never requantized or stored as INT8. Enabled with EXLLAMA_PACKED_DP4A=1.
+fn dp4a_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("EXLLAMA_PACKED_DP4A").is_some())
+}
+
+struct FusedPackedDp4a {
+    lut_i8: Tensor,
+    w_scale: f32,
+    layout: PackedLayout,
+}
+
+impl CustomOp2 for FusedPackedDp4a {
+    fn name(&self) -> &'static str {
+        "exlama_fused_exl3_packed_dp4a"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        // CPU fallback stays exact: the INT8 path is device-only.
+        let words = s1.as_slice::<u32>()?;
+        let xvals = s2.as_slice::<f32>()?;
+        let (ls, _) = self.lut_i8.storage_and_layout();
+        let candle_core::Storage::Cpu(_) = &*ls else {
+            return Err(candle_core::Error::Msg("packed LUT is not on CPU".into()));
+        };
+        let t = crate::exl3::packed_dot_host_impl(
+            &words[l1.start_offset()..],
+            self.layout,
+            &vec![0.0f32; 65536],
+            &xvals[l2.start_offset()..l2.start_offset() + self.layout.k],
+        )
+        .map_err(candle_core::Error::Msg)?;
+        Ok((CpuStorage::F32(t), (self.layout.n,).into()))
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        _l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        _l2: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::Storage;
+        let words = s1.as_cuda_slice::<u32>()?;
+        let xr = s2.as_cuda_slice::<f32>()?;
+        let (ls, _) = self.lut_i8.storage_and_layout();
+        let Storage::Cuda(lc) = &*ls else {
+            return Err(candle_core::Error::Msg("INT8 LUT is not on CUDA".into()));
+        };
+        let lut_i8 = lc.as_cuda_slice::<u32>()?;
+        let func = s1.device.get_or_load_custom_func(
+            "exl3_packed_dp4a",
+            "exllama_exl3_packed",
+            PACKED_DP4A_PTX,
+        )?;
+        let out = unsafe { s1.device.alloc::<f32>(self.layout.n)? };
+        let nw = (self.layout.words_per_tile / 2) as u32;
+        let ring = nw * 32;
+        let (n_u, tk_u, tn_u) = (
+            self.layout.n as u32,
+            self.layout.tiles_k as u32,
+            self.layout.tiles_n as u32,
+        );
+        let (bits_u, half_u) = (self.layout.k_bits_int as u32, self.layout.k_half as u32);
+        // dp4a dequantizes 4 INT8 products with scale `w_scale / 32`.
+        let out_scale = self.w_scale / 32.0;
+        let mut args = func.builder();
+        args.arg(words)
+            .arg(xr)
+            .arg(lut_i8)
+            .arg(&out)
+            .arg(&n_u)
+            .arg(&tk_u)
+            .arg(&tn_u)
+            .arg(&nw)
+            .arg(&bits_u)
+            .arg(&half_u)
+            .arg(&ring)
+            .arg(lut_i8)
+            .arg(&out_scale);
+        let cfg = LaunchConfig {
+            grid_dim: (self.layout.n.div_ceil(256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            args.launch(cfg)
+                .map_err(|e| candle_core::Error::Cuda(Box::new(e)))?
+        };
+        Ok((
+            candle_core::CudaStorage::wrap_cuda_slice(out, s1.device.clone()),
+            (self.layout.n,).into(),
+        ))
     }
 }
 
-struct FusedPackedDot {
+#[cfg(feature = "gpu-cuda")]
+const PACKED_DP4A_PTX: &str = r#"
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry exl3_packed_dp4a(
+    .param .u64 p_trellis,
+    .param .u64 p_xr,
+    .param .u64 p_lut,
+    .param .u64 p_out,
+    .param .u32 p_n,
+    .param .u32 p_tiles_k,
+    .param .u32 p_tiles_n,
+    .param .u32 p_nw,
+    .param .u32 p_bits,
+    .param .u32 p_half,
+    .param .u32 p_ring,
+    .param .u64 p_lut_i8,
+    .param .f32 p_out_scale
+)
+{
+    .reg .u32 %j, %tn, %tk, %rr, %c, %i, %end, %s, %wi, %o;
+    .reg .u32 %w0, %w1, %idx, %base, %wo, %wi1, %sh, %sh2, %xi, %nwn;
+    .reg .u32 %n, %ntk, %ntn, %nnw, %nbits, %nhalf, %nring, %mask;
+    .reg .u32 %ctaidv, %ntidv, %tidv;
+    .reg .u32 %a0, %a1, %a2, %a3, %a4, %a5, %g, %q, %tmp;
+    .reg .u64 %rd1, %rd2, %rd3, %rd4, %rd5, %rd6, %rd7, %rd8, %rd9;
+    .reg .f32 %acc, %fv, %fx, %accF;
+    .reg .s32 %xi8;
+    .reg .u32 %accI, %packW, %packX, %wByte, %xByte, %shft, %grp;
+    .reg .pred %p0, %p1, %p2, %p3, %p4, %p5, %p6, %p7, %pG;
+
+    ld.param.u64 %rd1, [p_trellis];
+    ld.param.u64 %rd2, [p_xr];
+    ld.param.u64 %rd3, [p_lut];
+    ld.param.u64 %rd4, [p_out];
+    ld.param.u32 %n, [p_n];
+    ld.param.u32 %ntk, [p_tiles_k];
+    ld.param.u32 %ntn, [p_tiles_n];
+    ld.param.u32 %nnw, [p_nw];
+    ld.param.u32 %nbits, [p_bits];
+    ld.param.u32 %nhalf, [p_half];
+    ld.param.u32 %nring, [p_ring];
+    ld.param.u64 %rd7, [p_lut_i8];
+
+    mov.u32 %ctaidv, %ctaid.x;
+    mov.u32 %ntidv, %ntid.x;
+    mov.u32 %tidv, %tid.x;
+    mad.lo.u32 %j, %ctaidv, %ntidv, %tidv;
+    setp.ge.u32 %p0, %j, %n;
+    @%p0 bra done;
+
+    and.b32 %c, %j, 15;
+    shr.u32 %tn, %j, 4;
+    mov.u32 %accI, 0;
+    mov.u32 %packW, 0;
+    mov.u32 %packX, 0;
+    mov.u32 %grp, 0;
+    mov.u32 %tk, 0;
+
+tk_loop:
+    setp.ge.u32 %p1, %tk, %ntk;
+    @%p1 bra tk_end;
+
+    mad.lo.u32 %tmp, %tk, %ntn, %tn;
+    mul.lo.u32 %base, %tmp, %nnw;
+    mov.u32 %rr, 0;
+
+r_loop:
+    setp.ge.u32 %p2, %rr, 16;
+    @%p2 bra r_end;
+
+    // inverse of tile_perm: (r,c) -> ring position i
+    and.b32 %a0, %c, 7;
+    shl.b32 %a0, %a0, 2;
+    and.b32 %a1, %rr, 7;
+    shr.u32 %a1, %a1, 1;
+    or.b32 %a0, %a0, %a1;
+    shl.b32 %i, %a0, 3;
+    and.b32 %a2, %rr, 1;
+    add.u32 %i, %i, %a2;
+    and.b32 %a3, %rr, 8;
+    shr.u32 %a3, %a3, 2;
+    add.u32 %i, %i, %a3;
+    and.b32 %a4, %c, 8;
+    shr.u32 %a4, %a4, 1;
+    add.u32 %i, %i, %a4;
+
+    // bit index of the end of this 16-bit window (may be negative)
+    setp.eq.u32 %p3, %nhalf, 0;
+    @%p3 bra int_end;
+    shr.u32 %g, %i, 4;
+    and.b32 %q, %i, 15;
+    mul.lo.u32 %nwn, %nnw, 2; // words_per_tile = nw * 2
+    mad.lo.u32 %end, %g, %nwn, 0;
+    mad.lo.u32 %end, %q, %nbits, %end;
+    add.u32 %a5, %q, 1;
+    shr.u32 %a5, %a5, 1;
+    add.u32 %end, %end, %a5;
+    bra calc_window;
+
+int_end:
+    add.u32 %a5, %i, 1;
+    mul.lo.u32 %end, %a5, %nbits;
+
+calc_window:
+    add.u32 %s, %end, 0xfffffff0;
+    sub.u32 %mask, %nring, 1;
+    and.b32 %tmp, %nring, %mask;
+    setp.eq.u32 %p6, %tmp, 0;
+    @%p6 bra wrap_pow2;
+    rem.s32 %s, %s, %nring;
+    setp.lt.s32 %p4, %s, 0;
+    @%p4 add.u32 %s, %s, %nring;
+    bra wrap_done;
+wrap_pow2:
+    and.b32 %s, %s, %mask;
+wrap_done:
+    shr.u32 %wi, %s, 5;
+    and.b32 %o, %s, 31;
+
+    add.u32 %wi1, %wi, 1;
+    setp.eq.u32 %p5, %wi1, %nnw;
+    @%p5 mov.u32 %wi1, 0;
+
+    add.u32 %wo, %base, %wi;
+    mul.wide.u32 %rd5, %wo, 4;
+    add.u64 %rd5, %rd1, %rd5;
+    ld.global.u32 %w0, [%rd5];
+
+    add.u32 %wo, %base, %wi1;
+    mul.wide.u32 %rd6, %wo, 4;
+    add.u64 %rd6, %rd1, %rd6;
+    ld.global.u32 %w1, [%rd6];
+
+    sub.u32 %sh, 48, %o;
+    setp.gt.u32 %p7, %sh, 31;
+    @%p7 bra wide_window;
+    shf.r.wrap.b32 %idx, %w1, %w0, %sh;
+    and.b32 %idx, %idx, 0x0000ffff;
+    bra window_done;
+wide_window:
+    sub.u32 %sh2, %sh, 32;
+    shr.u32 %idx, %w0, %sh2;
+    and.b32 %idx, %idx, 0x0000ffff;
+window_done:
+
+    mul.wide.u32 %rd5, %idx, 4;
+    add.u64 %rd5, %rd7, %rd5;
+    ld.global.u32 %wByte, [%rd5];
+    and.b32 %wByte, %wByte, 0xff;
+
+    mad.lo.u32 %xi, %tk, 16, %rr;
+    mul.wide.u32 %rd6, %xi, 4;
+    add.u64 %rd6, %rd2, %rd6;
+    ld.global.f32 %fx, [%rd6];
+    mul.f32 %fx, %fx, 32.0;
+    cvt.rni.s32.f32 %xi8, %fx;
+    max.s32 %xi8, %xi8, -127;
+    min.s32 %xi8, %xi8, 127;
+    and.b32 %xByte, %xi8, 0xff;
+
+    shl.b32 %shft, %grp, 3;
+    shl.b32 %wByte, %wByte, %shft;
+    shl.b32 %xByte, %xByte, %shft;
+    or.b32 %packW, %packW, %wByte;
+    or.b32 %packX, %packX, %xByte;
+    add.u32 %grp, %grp, 1;
+    setp.eq.u32 %pG, %grp, 4;
+    @%pG dp4a.s32.s32 %accI, %packW, %packX, %accI;
+    @%pG mov.u32 %packW, 0;
+    @%pG mov.u32 %packX, 0;
+    @%pG mov.u32 %grp, 0;
+    add.u32 %rr, %rr, 1;
+    bra r_loop;
+
+r_end:
+    add.u32 %tk, %tk, 1;
+    bra tk_loop;
+
+tk_end:
+    cvt.rn.f32.s32 %accF, %accI;
+    ld.param.f32 %fv, [p_out_scale];
+    mul.f32 %accF, %accF, %fv;
+    mul.wide.u32 %rd5, %j, 4;
+    add.u64 %rd5, %rd4, %rd5;
+    st.global.f32 [%rd5], %accF;
+
+done:
+    ret;
+}
+"#;
+
+/// `y = svh * H128(t)`, one launch per layer.
+pub(crate) fn output_hadamard(t: &Tensor, svh: &Tensor) -> Result<Tensor, String> {
+    if t.elem_count() != svh.elem_count() || !t.elem_count().is_multiple_of(128) {
+        return Err(format!(
+            "output hadamard: t={} svh={}, want equal non-zero multiples of 128",
+            t.elem_count(),
+            svh.elem_count()
+        ));
+    }
+    static OUTPUT_H_OK: AtomicBool = AtomicBool::new(true);
+    if !fused_enabled() || !OUTPUT_H_OK.load(Ordering::Relaxed) {
+        return output_hadamard_fallback(t, svh);
+    }
+    match t.apply_op2_no_bwd(svh, &FusedOutputH) {
+        Ok(y) => Ok(y),
+        Err(e) => {
+            static REPORTED: OnceLock<()> = OnceLock::new();
+            report_once(&REPORTED, "output_h128", &e.to_string());
+            OUTPUT_H_OK.store(false, Ordering::Relaxed);
+            output_hadamard_fallback(t, svh)
+        }
+    }
+}
+
+fn output_hadamard_fallback(t: &Tensor, svh: &Tensor) -> Result<Tensor, String> {
+    use candle_core::Storage;
+    let read = |x: &Tensor| -> Result<Vec<f32>, String> {
+        let (storage, l) = x.storage_and_layout();
+        match &*storage {
+            Storage::Cpu(c) => {
+                let all = c.as_slice::<f32>().map_err(|e| e.to_string())?;
+                Ok(all[l.start_offset()..l.start_offset() + x.elem_count()].to_vec())
+            }
+            _ => Err("output_h128 fallback needs CPU tensors".into()),
+        }
+    };
+    let y = output_hadamard_scale_f32(&read(t)?, &read(svh)?)?;
+    Tensor::from_vec(y, (t.elem_count(),), t.device()).map_err(|e| e.to_string())
+}
+
+fn packed_linear_fallback(
+    trellis: &Tensor,
+    xr: &Tensor,
+    lut: &Tensor,
+    svh: &Tensor,
+    layout: PackedLayout,
+) -> Result<Tensor, String> {
+    use candle_core::Storage;
+    let read_f32 = |t: &Tensor| -> Result<Vec<f32>, String> {
+        let (storage, l) = t.storage_and_layout();
+        match &*storage {
+            Storage::Cpu(c) => {
+                let all = c.as_slice::<f32>().map_err(|e| e.to_string())?;
+                Ok(all[l.start_offset()..l.start_offset() + t.elem_count()].to_vec())
+            }
+            _ => Err("packed_linear fallback needs CPU tensors".into()),
+        }
+    };
+    let (ts, tl) = trellis.storage_and_layout();
+    let Storage::Cpu(tc) = &*ts else {
+        return Err("packed_linear fallback needs CPU tensors".into());
+    };
+    let all_words = tc.as_slice::<u32>().map_err(|e| e.to_string())?;
+    let nw = layout.words_per_tile / 2;
+    let nwords = layout.tiles_k * layout.tiles_n * nw;
+    let start = tl.start_offset();
+    if start + nwords > all_words.len() {
+        return Err("packed_linear: trellis storage too short".into());
+    }
+    let t = crate::exl3::packed_dot_host_impl(
+        &all_words[start..start + nwords],
+        layout,
+        &read_f32(lut)?,
+        &read_f32(xr)?,
+    )?;
+    let y = output_hadamard_scale_f32(&t, &read_f32(svh)?)?;
+    Tensor::from_vec(y, (layout.n,), trellis.device()).map_err(|e| e.to_string())
+}
+
+struct FusedPackedDotSplit {
     lut: Tensor,
     layout: PackedLayout,
 }
 
-impl CustomOp2 for FusedPackedDot {
+impl CustomOp2 for FusedPackedDotSplit {
     fn name(&self) -> &'static str {
-        "exlama_fused_exl3_packed_dot"
+        "exlama_fused_exl3_packed_single"
     }
 
     fn cpu_fwd(
@@ -2485,9 +3200,9 @@ impl CustomOp2 for FusedPackedDot {
     fn cuda_fwd(
         &self,
         s1: &candle_core::CudaStorage,
-        _l1: &Layout,
+        l1: &Layout,
         s2: &candle_core::CudaStorage,
-        _l2: &Layout,
+        l2: &Layout,
     ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
         use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
         use candle_core::Storage;
@@ -2500,9 +3215,9 @@ impl CustomOp2 for FusedPackedDot {
         };
         let lut = lc.as_cuda_slice::<f32>()?;
         let func = s1.device.get_or_load_custom_func(
-            "exl3_packed_dot",
+            "exl3_packed_single",
             "exllama_exl3_packed",
-            PACKED_DOT_PTX,
+            PACKED_SINGLE_PTX,
         )?;
         let out = unsafe { s1.device.alloc::<f32>(self.layout.n)? };
         let nw = (self.layout.words_per_tile / 2) as u32;
@@ -2513,6 +3228,7 @@ impl CustomOp2 for FusedPackedDot {
             self.layout.tiles_n as u32,
         );
         let (bits_u, half_u) = (self.layout.k_bits_int as u32, self.layout.k_half as u32);
+        let (st, sx) = (l1.start_offset() as u32, l2.start_offset() as u32);
         let mut args = func.builder();
         args.arg(words)
             .arg(xr)
@@ -2524,7 +3240,9 @@ impl CustomOp2 for FusedPackedDot {
             .arg(&nw)
             .arg(&bits_u)
             .arg(&half_u)
-            .arg(&ring);
+            .arg(&ring)
+            .arg(&st)
+            .arg(&sx);
         let cfg = LaunchConfig {
             grid_dim: (self.layout.n.div_ceil(256) as u32, 1, 1),
             block_dim: (256, 1, 1),
@@ -2541,13 +3259,87 @@ impl CustomOp2 for FusedPackedDot {
     }
 }
 
+/// Output-side H128 + scale vector, one 128-thread block per output block.
+struct FusedOutputH;
+
+impl CustomOp2 for FusedOutputH {
+    fn name(&self) -> &'static str {
+        "exlama_fused_output_h128"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        let t = s1.as_slice::<f32>()?;
+        let sv = s2.as_slice::<f32>()?;
+        let y = output_hadamard_scale_f32(
+            &t[l1.start_offset()..l1.start_offset() + l1.shape().elem_count()],
+            &sv[l2.start_offset()..l2.start_offset() + l2.shape().elem_count()],
+        )
+        .map_err(candle_core::Error::Msg)?;
+        Ok((CpuStorage::F32(y), l1.shape().clone()))
+    }
+
+    #[cfg(feature = "gpu-cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        let t = s1.as_cuda_slice::<f32>()?;
+        let sv = s2.as_cuda_slice::<f32>()?;
+        let len = l1.shape().elem_count();
+        let out = unsafe { s1.device.alloc::<f32>(len)? };
+        // Same butterfly kernel as the input side; `after = 1` applies the
+        // sign vector after H128 instead of before it.
+        let func = s1.device.get_or_load_custom_func(
+            "exl3_input_h128",
+            "exllama_exl3_h128",
+            INPUT_H_PTX,
+        )?;
+        let blocks = (len / 128) as u32;
+        let scale = 1.0f32 / (128.0f32).sqrt();
+        let (st, ss) = (l1.start_offset() as u32, l2.start_offset() as u32);
+        let after = 1u32;
+        let mut args = func.builder();
+        args.arg(t)
+            .arg(sv)
+            .arg(&out)
+            .arg(&blocks)
+            .arg(&scale)
+            .arg(&st)
+            .arg(&ss)
+            .arg(&after);
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 128 * 4,
+        };
+        unsafe {
+            args.launch(cfg)
+                .map_err(|e| candle_core::Error::Cuda(Box::new(e)))?
+        };
+        Ok((
+            candle_core::CudaStorage::wrap_cuda_slice(out, s1.device.clone()),
+            l1.shape().clone(),
+        ))
+    }
+}
+
 #[cfg(feature = "gpu-cuda")]
-const PACKED_DOT_PTX: &str = r#"
+const PACKED_SINGLE_PTX: &str = r#"
 .version 7.0
 .target sm_70
 .address_size 64
 
-.visible .entry exl3_packed_dot(
+.visible .entry exl3_packed_single(
     .param .u64 p_trellis,
     .param .u64 p_xr,
     .param .u64 p_lut,
@@ -2562,13 +3354,13 @@ const PACKED_DOT_PTX: &str = r#"
 )
 {
     .reg .u32 %j, %tn, %tk, %rr, %c, %i, %end, %s, %wi, %o;
-    .reg .u32 %w0, %w1, %idx, %base, %wo, %wi1, %sh, %xi, %nwn;
-    .reg .u32 %n, %ntk, %ntn, %nnw, %nbits, %nhalf, %nring;
+    .reg .u32 %w0, %w1, %idx, %base, %wo, %wi1, %sh, %sh2, %xi, %nwn;
+    .reg .u32 %n, %ntk, %ntn, %nnw, %nbits, %nhalf, %nring, %mask;
     .reg .u32 %ctaidv, %ntidv, %tidv;
     .reg .u32 %a0, %a1, %a2, %a3, %a4, %a5, %g, %q, %tmp;
     .reg .u64 %rd1, %rd2, %rd3, %rd4, %rd5, %rd6, %rd7, %rd8, %rd9;
     .reg .f32 %acc, %fv, %fx;
-    .reg .pred %p0, %p1, %p2, %p3, %p4, %p5;
+    .reg .pred %p0, %p1, %p2, %p3, %p4, %p5, %p6, %p7;
 
     ld.param.u64 %rd1, [p_trellis];
     ld.param.u64 %rd2, [p_xr];
@@ -2641,9 +3433,17 @@ int_end:
 
 calc_window:
     add.u32 %s, %end, 0xfffffff0;
+    sub.u32 %mask, %nring, 1;
+    and.b32 %tmp, %nring, %mask;
+    setp.eq.u32 %p6, %tmp, 0;
+    @%p6 bra wrap_pow2;
     rem.s32 %s, %s, %nring;
     setp.lt.s32 %p4, %s, 0;
     @%p4 add.u32 %s, %s, %nring;
+    bra wrap_done;
+wrap_pow2:
+    and.b32 %s, %s, %mask;
+wrap_done:
     shr.u32 %wi, %s, 5;
     and.b32 %o, %s, 31;
 
@@ -2661,14 +3461,17 @@ calc_window:
     add.u64 %rd6, %rd1, %rd6;
     ld.global.u32 %w1, [%rd6];
 
-    cvt.u64.u32 %rd7, %w0;
-    shl.b64 %rd7, %rd7, 32;
-    cvt.u64.u32 %rd8, %w1;
-    or.b64 %rd7, %rd7, %rd8;
     sub.u32 %sh, 48, %o;
-    shr.u64 %rd9, %rd7, %sh;
-    and.b64 %rd9, %rd9, 0x000000000000ffff;
-    cvt.u32.u64 %idx, %rd9;
+    setp.gt.u32 %p7, %sh, 31;
+    @%p7 bra wide_window;
+    shf.r.wrap.b32 %idx, %w1, %w0, %sh;
+    and.b32 %idx, %idx, 0x0000ffff;
+    bra window_done;
+wide_window:
+    sub.u32 %sh2, %sh, 32;
+    shr.u32 %idx, %w0, %sh2;
+    and.b32 %idx, %idx, 0x0000ffff;
+window_done:
 
     mul.wide.u32 %rd5, %idx, 4;
     add.u64 %rd5, %rd3, %rd5;
@@ -2701,6 +3504,46 @@ done:
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    #[test]
+    fn butterfly_h128_matches_exl3_reference() {
+        let vals: Vec<f32> = (0..256).map(|i| (i as f32 % 13.0) * 0.07 - 0.4).collect();
+        let mut got = vals.clone();
+        let mut want = vals.clone();
+        let scale = 1.0 / (128.0f32).sqrt();
+        for blk in 0..2 {
+            butterfly_h128(&mut got[blk * 128..(blk + 1) * 128]);
+            crate::exl3::hadamard128(&mut want, blk * 128, 1, scale);
+        }
+        for (a, b) in got.iter().zip(&want) {
+            assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+        }
+        let suh: Vec<f32> = (0..256).map(|i| 1.0 + (i % 5) as f32 * 0.1).collect();
+        let svh: Vec<f32> = (0..256).map(|i| 0.5 - (i % 3) as f32 * 0.05).collect();
+        let xr = input_hadamard_f32(&vals, &suh).unwrap();
+        let mut ref_xr = vals
+            .iter()
+            .zip(&suh)
+            .map(|(&a, &b)| a * b)
+            .collect::<Vec<_>>();
+        for blk in 0..2 {
+            crate::exl3::hadamard128(&mut ref_xr, blk * 128, 1, scale);
+        }
+        for (a, b) in xr.iter().zip(&ref_xr) {
+            assert!((a - b).abs() < 1e-6, "input: {a} vs {b}");
+        }
+        let y = output_hadamard_scale_f32(&vals, &svh).unwrap();
+        let mut ref_y = vals.clone();
+        for blk in 0..2 {
+            crate::exl3::hadamard128(&mut ref_y, blk * 128, 1, scale);
+        }
+        for (v, &s) in ref_y.iter_mut().zip(&svh) {
+            *v *= s;
+        }
+        for (a, b) in y.iter().zip(&ref_y) {
+            assert!((a - b).abs() < 1e-6, "output: {a} vs {b}");
+        }
+    }
 
     #[test]
     fn fused_rms_norm_matches_fallback_1d_and_2d() {
@@ -2787,13 +3630,13 @@ mod tests {
     }
 }
 
-/// Real-GPU numeric check for the EXL3 packed-trellis dequant-dot kernel.
+/// Real-GPU numeric check for the fused EXL3 packed-linear kernel.
 #[cfg(all(test, feature = "gpu-cuda"))]
 #[test]
-fn cuda_packed_dot_matches_cpu_reference() {
+fn cuda_packed_linear_matches_cpu_reference() {
     use crate::exl3::{codebook_lut_f32, packed_dot_host_impl, Codebook, PackedLayout};
     if !candle_core::utils::cuda_is_available() {
-        eprintln!("[fused] CUDA unavailable, skipping packed-dot check");
+        eprintln!("[fused] CUDA unavailable, skipping packed-linear check");
         return;
     }
     let dev = candle_core::Device::new_cuda(0).unwrap();
@@ -2821,23 +3664,35 @@ fn cuda_packed_dot_matches_cpu_reference() {
         .map(|i| ((i % 11) as f32) * 0.03 - 0.15)
         .collect();
     let lut = codebook_lut_f32(Codebook::Mcg);
-    let expect = packed_dot_host_impl(&words, layout, &lut, &xr).unwrap();
+    let svh: Vec<f32> = (0..layout.n).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+    let t = packed_dot_host_impl(&words, layout, &lut, &xr).unwrap();
+    let expect = output_hadamard_scale_f32(&t, &svh).unwrap();
 
     let wt = candle_core::Tensor::from_slice(&words, (layout.tiles_k, layout.tiles_n, nw), &dev)
         .unwrap();
     let xt = candle_core::Tensor::from_slice(&xr, (layout.k,), &dev).unwrap();
     let lt = candle_core::Tensor::from_slice(&lut, (65536,), &dev).unwrap();
-    let got = packed_dot(&wt, &xt, &lt, layout)
+    let (lut8, ws) = crate::exl3::codebook_lut_i8(Codebook::Mcg);
+    let lt_i8 = candle_core::Tensor::from_slice(&lut8, (65536,), &dev).unwrap();
+    let st = candle_core::Tensor::from_slice(&svh, (layout.n,), &dev).unwrap();
+    let got = packed_linear(&wt, &xt, &lt, &lt_i8, ws, &st, layout)
         .unwrap()
         .to_vec1::<f32>()
         .unwrap();
     for (i, (g, e)) in got.iter().zip(expect.iter()).enumerate() {
+        // The opt-in INT8 path is an approximation; keep a looser but still
+        // meaningful bound there, and the exact bound for the default path.
+        let tol = if dp4a_enabled() {
+            0.12 + 0.12 * e.abs()
+        } else {
+            5e-3 + 5e-3 * e.abs()
+        };
         assert!(
-            (g - e).abs() < 5e-3 + 5e-3 * e.abs(),
-            "packed dot row {i}: got {g}, expected {e}"
+            (g - e).abs() < tol,
+            "packed linear row {i}: got {g}, expected {e}"
         );
     }
-    eprintln!("[fused] CUDA packed-dot check passed");
+    eprintln!("[fused] CUDA packed-linear check passed");
 }
 
 /// Real-GPU numeric check: the PTX kernels must match the candle-op fallback.
